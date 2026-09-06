@@ -215,6 +215,26 @@ export const tasks = pgTable("tasks", {
   dueDate: date("due_date"),
   completedAt: timestamp("completed_at", { withTimezone: true }),
   progressPct: integer("progress_pct"),
+  // **THE QUANTITY OF WORK, ADDED IN v1.9.0 (Phase 10 Task 3), AND THE FIRST ONE
+  // THIS TABLE HAS EVER CARRIED.** Every column above it is a date or a
+  // percentage: start_date/due_date are elapsed time, progress_pct is a
+  // fraction of something whose size nobody wrote down. "Booked versus
+  // estimated" is the usual point of booking time against a task and it could
+  // not exist until this column did (spec).
+  //
+  // MINUTES, BECAUSE THE THING IT IS COMPARED WITH IS MINUTES. The booked half
+  // is SUM(time_entries.minutes) (integer minutes, bounded here and on the
+  // wire) and meetings.duration_minutes is the same unit -- so an estimate in
+  // hours would put a conversion, and a rounding, between a number and the
+  // number it exists to be read against. Hours-as-numeric was rejected for the
+  // reason time_entries.csv has no `hours` column: @conduit/shared's
+  // formatMinutes already renders 90 as "1h 30m", so a second stored
+  // representation buys nothing at the display end and costs correctness at the
+  // comparison end.
+  //
+  // NULL IS "NOT ESTIMATED", AND IT IS THE ONLY SPELLING OF IT -- which is what
+  // the `> 0` half of the CHECK below is for. See it for the bound's argument.
+  estimateMinutes: integer("estimate_minutes"),
   // One level of subtask grouping only -- the service rejects a parent that
   // itself already has a parent. Self-reference needs the explicit
   // AnyPgColumn return type (TypeScript can't infer a self-referential
@@ -242,6 +262,47 @@ export const tasks = pgTable("tasks", {
   ),
   check("tasks_completed_at_paired", sql`(completed_at IS NOT NULL) = (status = 'done')`),
   check("tasks_progress_range", sql`progress_pct IS NULL OR (progress_pct >= 0 AND progress_pct <= 100)`),
+  // **AN ESTIMATE IS AT LEAST A MINUTE AND AT MOST A YEAR, AND BOTH ENDS ARE
+  // ARGUED RATHER THAN ROUND.** Belt-and-braces with @conduit/shared's
+  // MAX_TASK_ESTIMATE_MINUTES, which schema.test.ts pins against this literal
+  // so the two cannot drift -- projects.color's and tasks_progress_range's
+  // arrangement, NOT meetings.duration_minutes' zod-only one.
+  //
+  //   `> 0`: NULL already says "nobody has estimated this". A zero would be a
+  //   SECOND spelling of it, and the one that reads as a claim rather than an
+  //   absence -- an estimate of no work, against which the first minute booked
+  //   is infinitely over. Two spellings of one absence is the mistake
+  //   normaliseDescription (services/time-entries.ts) avoids by storing "" as
+  //   null, and time_entries.minutes > 0 avoids for the same reason.
+  //
+  //   `<= 525600`, one year of wall clock, and DELIBERATELY NOT 1440. That
+  //   bound is definitional for time_entries.minutes because work_date is one
+  //   day; a task's dates are a SPAN (tasks_dates_paired, and the Gantt draws a
+  //   bar across it), so a task honestly holds more work than a day. The line
+  //   this bound actually draws is the one between the two entities this schema
+  //   already has: a work item estimated at more than a person-year is a
+  //   PROJECT, and project_id is the column that says so. Wall clock rather
+  //   than an eight-hour working day for MAX_TIME_ENTRY_MINUTES' reason --
+  //   Conduit does not know the operator's working day, and the one time this
+  //   schema would have had to guess at it (time_entries.billable) it refused.
+  //
+  // **WHY THERE IS A BOUND HERE WHEN meetings.duration_minutes HAS NONE.** That
+  // column's exposure is real and recorded (see it, and the Phase 10 plan):
+  // z.number().int().positive() accepts 999999999, which now dominates a week's
+  // total. It cannot be tightened, because a `.max()` would make the CLIENT
+  // refuse to parse rows that already exist. THIS COLUMN IS BEING CREATED WITH
+  // NO ROWS IN IT, which is the one moment a bound costs nothing -- and the
+  // only one. It is taken now precisely because Task 2 watched what the
+  // alternative costs later.
+  //
+  // REJECTED, so it is not revisited: bounding the estimate by the task's own
+  // start_date..due_date span. It is the tempting cross-column CHECK and it is
+  // wrong twice. A span is elapsed time and an estimate is effort -- different
+  // quantities, and eight hours of work inside a two-week window is the normal
+  // case, not an error. And it would make an ordinary reschedule that narrows
+  // the dates fail against an estimate already stored, leaving a row that
+  // cannot be patched out of its state one field at a time.
+  check("tasks_estimate_range", sql`estimate_minutes IS NULL OR (estimate_minutes > 0 AND estimate_minutes <= 525600)`),
 ]);
 export type TaskRow = typeof tasks.$inferSelect;
 

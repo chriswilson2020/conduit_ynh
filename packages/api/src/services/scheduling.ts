@@ -77,7 +77,7 @@ function toTask(row: TaskRow) {
     assigneeUserId: row.assigneeUserId,
     startDate: row.startDate, dueDate: row.dueDate,
     completedAt: row.completedAt?.toISOString() ?? null,
-    progressPct: row.progressPct,
+    progressPct: row.progressPct, estimateMinutes: row.estimateMinutes,
     parentTaskId: row.parentTaskId, position: row.position,
     companyId: row.companyId, contactId: row.contactId, dealId: row.dealId, projectId: row.projectId,
     archivedAt: row.archivedAt?.toISOString() ?? null,

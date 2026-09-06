@@ -3,8 +3,11 @@ import { randomUUID } from "node:crypto";
 import {
   CSV_IMPORT_FIELDS,
   DEFAULT_TIME_ZONE,
+  MAX_TASK_ESTIMATE_MINUTES,
   MAX_TIME_ENTRY_MINUTES,
   formatMinutes,
+  taskEffortSchema,
+  taskEffortSummary,
   timesheetSummary,
   timesheetTotalsSchema,
   timeEntryAtLeastOneLink,
@@ -648,7 +651,7 @@ describe("taskSchema / createTaskInputSchema date pairing", () => {
   const base = {
     id: uuid1, title: "Draft proposal", description: null, type: "task" as const,
     status: "todo" as const, assigneeUserId: null, startDate: null, dueDate: null,
-    completedAt: null, progressPct: null, parentTaskId: null, position: "a0",
+    completedAt: null, progressPct: null, estimateMinutes: null, parentTaskId: null, position: "a0",
     companyId: null, contactId: null, dealId: null, projectId: null,
     archivedAt: null, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
   };
@@ -785,7 +788,7 @@ describe("ganttPayloadSchema", () => {
   const projectTask = {
     id: uuid1, title: "Design phase", description: null, type: "task" as const, status: "todo" as const,
     assigneeUserId: null, startDate: "2026-09-01", dueDate: "2026-09-05",
-    completedAt: null, progressPct: null, parentTaskId: null, position: "a0",
+    completedAt: null, progressPct: null, estimateMinutes: null, parentTaskId: null, position: "a0",
     companyId: null, contactId: null, dealId: null, projectId: uuid1,
     archivedAt: null, createdAt: now, updatedAt: now,
     projectName: "Website relaunch", projectColor: "#1a2b3c",
@@ -2968,6 +2971,180 @@ describe("timesheetSummary", () => {
     };
     const sentence = timesheetSummary(totals);
     for (const fragment of ["1h 30m", "1h 5m", "1 entry", "25m", "1 meeting", "3 meetings", "4 meetings"]) {
+      expect(sentence, fragment).toContain(fragment);
+    }
+  });
+});
+
+/* ========================================================================== *
+ *  The estimate, and booked versus estimated (Phase 10 Task 3)
+ * ========================================================================== */
+
+describe("MAX_TASK_ESTIMATE_MINUTES", () => {
+  /**
+   * **THE VALUE, PINNED, BECAUSE THE MIGRATION CARRIES THE LITERAL.**
+   * `tasks_estimate_range` in 0022 says 525600 in SQL and this constant says
+   * `365 * 24 * 60`; nothing makes them the same number except this assertion and
+   * the schema test that probes the CHECK's own edges. MAX_TIME_ENTRY_MINUTES'
+   * arrangement.
+   */
+  it("is one year of wall-clock minutes, the number the CHECK carries", () => {
+    expect(MAX_TASK_ESTIMATE_MINUTES).toBe(525600);
+  });
+
+  /**
+   * **IT IS NOT `MAX_TIME_ENTRY_MINUTES`, AND THE DIFFERENCE IS THE ARGUMENT.**
+   * An entry's day-long bound is definitional -- `work_date` is one day. A task
+   * has no such day: its dates are a span, and the Gantt draws a bar across it,
+   * so the same bound here would refuse true rows in bulk. If somebody ever
+   * "tidies" these into one constant, this is what says no.
+   */
+  it("is not the entry bound, because a task is not a day", () => {
+    expect(MAX_TASK_ESTIMATE_MINUTES).toBeGreaterThan(MAX_TIME_ENTRY_MINUTES);
+    expect(MAX_TASK_ESTIMATE_MINUTES % MAX_TIME_ENTRY_MINUTES).toBe(0);
+    expect(MAX_TASK_ESTIMATE_MINUTES / MAX_TIME_ENTRY_MINUTES).toBe(365);
+  });
+});
+
+describe("taskSchema's estimate", () => {
+  const base = {
+    id: uuid1, title: "Draft proposal", description: null, type: "task" as const,
+    status: "todo" as const, assigneeUserId: null, startDate: null, dueDate: null,
+    completedAt: null, progressPct: null, estimateMinutes: null, parentTaskId: null, position: "a0",
+    companyId: null, contactId: null, dealId: null, projectId: null,
+    archivedAt: null, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+  };
+
+  it("accepts the exact edges of the range the database enforces", () => {
+    for (const estimateMinutes of [1, MAX_TASK_ESTIMATE_MINUTES]) {
+      expect(taskSchema.parse({ ...base, estimateMinutes }).estimateMinutes).toBe(estimateMinutes);
+    }
+  });
+
+  /**
+   * **ZERO IS REFUSED, AND THAT IS THE HALF PEOPLE ASSUME IS PERMISSIVE.** `null`
+   * already spells "nobody has estimated this"; a zero would be a second spelling
+   * of one absence, and the one that reads as a CLAIM -- an estimate of no work,
+   * against which the first minute booked is infinitely over.
+   */
+  it("refuses a zero, a negative and a fraction, because null is the only 'not estimated'", () => {
+    for (const estimateMinutes of [0, -1, 90.5]) {
+      expect(() => taskSchema.parse({ ...base, estimateMinutes }), String(estimateMinutes)).toThrow();
+    }
+    expect(taskSchema.parse({ ...base, estimateMinutes: null }).estimateMinutes).toBeNull();
+  });
+
+  /**
+   * **THE CEILING IS THE ONE `meetings.duration_minutes` HAS NOT GOT.** Task 2
+   * recorded what that costs: `z.number().int().positive()` accepts 999,999,999
+   * and one such row dominates a week. It cannot be tightened there without
+   * making the client refuse to parse rows that already exist; it is bounded here
+   * because this column shipped empty.
+   */
+  it("refuses the figure that dominates a total, on the wire and not only in the database", () => {
+    expect(() => taskSchema.parse({ ...base, estimateMinutes: 999999999 })).toThrow();
+    expect(() => createTaskInputSchema.parse({ title: "x", estimateMinutes: 999999999 })).toThrow();
+    expect(() => updateTaskInputSchema.parse({ estimateMinutes: MAX_TASK_ESTIMATE_MINUTES + 1 })).toThrow();
+  });
+
+  it("takes an estimate on create, and lets a patch clear one", () => {
+    expect(createTaskInputSchema.parse({ title: "x", estimateMinutes: 240 }).estimateMinutes).toBe(240);
+    expect(updateTaskInputSchema.parse({ estimateMinutes: null }).estimateMinutes).toBeNull();
+    // Absent means "leave it alone", which must stay distinguishable from null.
+    expect("estimateMinutes" in updateTaskInputSchema.parse({ title: "x" })).toBe(false);
+  });
+});
+
+describe("taskEffortSchema", () => {
+  const base = { taskId: uuid1, estimateMinutes: 240, bookedMinutes: 90, entryCount: 2 };
+
+  it("accepts a task with an estimate and hours booked against it", () => {
+    expect(taskEffortSchema.parse(base)).toEqual(base);
+  });
+
+  it("accepts nothing booked and no estimate, which is every task before v1.9.0", () => {
+    const empty = { taskId: uuid1, estimateMinutes: null, bookedMinutes: 0, entryCount: 0 };
+    expect(taskEffortSchema.parse(empty)).toEqual(empty);
+  });
+
+  /**
+   * **THE MINUTES AND THEIR COUNT MUST BE THE SAME POPULATION.** Every live entry
+   * has `minutes > 0` (`time_entries_minutes_range`), so minutes without entries
+   * or entries without minutes means the sum and the count came out of different
+   * queries -- which is exactly the drift Task 2 wrote one predicate to make
+   * unspellable in the timesheet's aggregate.
+   */
+  it("refuses minutes with no entries, and entries with no minutes", () => {
+    expect(() => taskEffortSchema.parse({ ...base, entryCount: 0 })).toThrow(/same population|zero together/);
+    expect(() => taskEffortSchema.parse({ ...base, bookedMinutes: 0 })).toThrow(/zero together/);
+  });
+
+  it("refuses an estimate the database would refuse", () => {
+    expect(() => taskEffortSchema.parse({ ...base, estimateMinutes: 0 })).toThrow();
+    expect(() => taskEffortSchema.parse({ ...base, estimateMinutes: 999999999 })).toThrow();
+  });
+});
+
+describe("taskEffortSummary", () => {
+  const base = { taskId: uuid1, estimateMinutes: 240, bookedMinutes: 90, entryCount: 2 };
+
+  it("puts the booked total, the estimate and the gap in one sentence", () => {
+    expect(taskEffortSummary(base)).toBe(
+      "1h 30m booked across 2 entries, against an estimate of 4h: 2h 30m left.",
+    );
+  });
+
+  it("says how far over, rather than going quiet once the estimate is passed", () => {
+    expect(taskEffortSummary({ ...base, bookedMinutes: 300, entryCount: 5 })).toBe(
+      "5h booked across 5 entries, against an estimate of 4h: 1h over.",
+    );
+  });
+
+  it("says so when the two are equal, rather than reading as 0m of something", () => {
+    expect(taskEffortSummary({ ...base, bookedMinutes: 240, entryCount: 3 })).toBe(
+      "4h booked across 3 entries, against an estimate of 4h: exactly on the estimate.",
+    );
+  });
+
+  /**
+   * **AN ESTIMATE ON A TASK NOBODY HAS STARTED IS REPORTED IN FULL, AND THIS IS
+   * THE TEST THAT SAYS SO.** Nothing in this function asks about status, dates or
+   * progress. Task 2 excluded meetings that have not happened because the
+   * timesheet sums time that HAPPENED and an arranged meeting is a plan -- but an
+   * estimate never claims anything happened, so "has it started" is not a
+   * question it has to answer. And a task estimated at four hours with nothing
+   * booked is the most informative row this comparison produces.
+   */
+  it("reports an estimate with nothing booked against it, and names the whole gap", () => {
+    expect(taskEffortSummary({ ...base, bookedMinutes: 0, entryCount: 0 })).toBe(
+      "No time booked yet, against an estimate of 4h: 4h left.",
+    );
+  });
+
+  it("is still a sentence for a task with neither an estimate nor an hour", () => {
+    expect(taskEffortSummary({
+      taskId: uuid1, estimateMinutes: null, bookedMinutes: 0, entryCount: 0,
+    })).toBe("No time booked yet, and no estimate.");
+  });
+
+  it("reports hours booked against no estimate without inventing one", () => {
+    const sentence = taskEffortSummary({
+      taskId: uuid1, estimateMinutes: null, bookedMinutes: 65, entryCount: 1,
+    });
+    expect(sentence).toBe("1h 5m booked across 1 entry, and no estimate.");
+    expect(sentence).not.toContain("0");
+  });
+
+  /**
+   * DERIVED FROM THE VALUE RATHER THAN FROM A SECOND COPY OF IT -- timesheetSummary's
+   * own guard, walked the same way: every figure has to move when the numbers move,
+   * or the prose is the stale half of a pair.
+   */
+  it("carries every figure it was given", () => {
+    const sentence = taskEffortSummary({
+      taskId: uuid1, estimateMinutes: 61, bookedMinutes: 1, entryCount: 1,
+    });
+    for (const fragment of ["1m booked", "1 entry", "1h 1m", "1h left"]) {
       expect(sentence, fragment).toContain(fragment);
     }
   });

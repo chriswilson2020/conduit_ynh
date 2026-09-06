@@ -556,6 +556,46 @@ export const TASK_STATUS_LABEL: Record<TaskStatus, string> = {
   todo: "To do", in_progress: "In progress", blocked: "Blocked", done: "Done",
 };
 
+/**
+ * **THE LONGEST A TASK MAY BE ESTIMATED AT: ONE YEAR, IN MINUTES.**
+ *
+ * Phase 10 Task 3. `tasks` carried no quantity of work at all until v1.9.0 --
+ * only dates and a percentage -- so "booked versus estimated", which is the
+ * usual point of booking time against a task, had nothing to compare against.
+ *
+ * MINUTES, BECAUSE THE OTHER HALF OF THE COMPARISON IS MINUTES:
+ * `time_entries.minutes` and `meetings.duration_minutes` are both integer
+ * minutes, and an estimate in hours would put a conversion and a rounding
+ * between a number and the number it exists to be read against. See db/schema.ts
+ * on `tasks.estimate_minutes` for the rest of the unit argument.
+ *
+ * **SPELLED HERE AND AS THE `tasks_estimate_range` DB CHECK**, with schema.test.ts
+ * probing the exact edges so the literal in the migration and this constant
+ * cannot come to mean different things -- MAX_TIME_ENTRY_MINUTES' arrangement.
+ *
+ * **NOT 1440, AND NOT UNBOUNDED, AND BOTH HALVES OF THAT ARE THE POINT.**
+ *
+ *   MAX_TIME_ENTRY_MINUTES is one day because `work_date` is one day: an entry
+ *   is work attributed to a calendar date and no date holds more than 24 hours.
+ *   A TASK HAS NO SUCH DAY. Its dates are a span (`tasks_dates_paired`) and the
+ *   Gantt draws a bar across it, so the same bound here would refuse true rows
+ *   in bulk. What a year draws instead is the line between two entities this
+ *   product already has: a work item estimated at more than a person-year is a
+ *   project, and `tasks.project_id` is the column that says so. Wall clock, not
+ *   an eight-hour working day, because Conduit does not know the operator's
+ *   working day -- the one place the schema would have had to guess at it
+ *   (`time_entries.billable`) it refused to.
+ *
+ *   AND UNBOUNDED IS `meetings.duration_minutes`' POSITION, WHOSE COST TASK 2
+ *   MEASURED. `meetingSchema.durationMinutes` is `z.number().int().positive()`
+ *   with no ceiling, so one meeting can carry 999,999,999 minutes and dominate a
+ *   week's total; it cannot be tightened NOW, because a `.max()` would make the
+ *   client refuse to parse rows that already exist -- turning a silly figure
+ *   into a broken page. A bound is free exactly once, on the day the column is
+ *   created empty, and for this column that day is today.
+ */
+export const MAX_TASK_ESTIMATE_MINUTES = 365 * 24 * 60;
+
 export const taskSchema = z.object({
   id: z.uuid(), title: z.string().min(1), description: nullableString,
   type: taskTypeSchema, status: taskStatusSchema,
@@ -563,6 +603,9 @@ export const taskSchema = z.object({
   startDate: z.iso.date().nullable(), dueDate: z.iso.date().nullable(),
   completedAt: z.iso.datetime().nullable(),
   progressPct: z.number().int().min(0).max(100).nullable(),
+  /** Minutes, or null for "nobody has estimated this" -- the ONE spelling of
+   * that, which is why the floor is 1 and not 0 (db/schema.ts's CHECK). */
+  estimateMinutes: z.number().int().min(1).max(MAX_TASK_ESTIMATE_MINUTES).nullable(),
   parentTaskId: z.uuid().nullable(), position: z.string().min(1),
   companyId: z.uuid().nullable(), contactId: z.uuid().nullable(), dealId: z.uuid().nullable(),
   projectId: z.uuid().nullable(),
@@ -602,6 +645,11 @@ const taskInputShape = z.object({
   startDate: z.iso.date().nullable().optional(),
   dueDate: z.iso.date().nullable().optional(),
   progressPct: z.number().int().min(0).max(100).nullable().optional(),
+  // An explicit null CLEARS the estimate, which is how a mis-typed one is
+  // withdrawn: the column has no zero to fall back to, deliberately (see
+  // MAX_TASK_ESTIMATE_MINUTES and the CHECK). Absent means "leave it alone", the
+  // three-state patch semantics every other field here has.
+  estimateMinutes: z.number().int().min(1).max(MAX_TASK_ESTIMATE_MINUTES).nullable().optional(),
   parentTaskId: z.uuid().nullable().optional(),
   companyId: z.uuid().nullable().optional(), contactId: z.uuid().nullable().optional(),
   dealId: z.uuid().nullable().optional(), projectId: z.uuid().nullable().optional(),
@@ -4868,6 +4916,10 @@ export type ImportOutcome = z.infer<typeof importOutcomeSchema>;
  * policy about how long anybody should work. What it catches in practice is a
  * missing decimal point: 90 minutes typed as 900 still lands, 6000 does not.
  *
+ * IT IS NOT THE BOUND A TASK'S ESTIMATE GETS, for exactly that reason: a task
+ * has no single day to be definitional about. See MAX_TASK_ESTIMATE_MINUTES,
+ * which is a year and argues the difference.
+ *
  * IT IS ALSO THE BOUND TASK 5 WILL MEET. The spec's "you left this running for
  * 62 hours" cannot be stored, so the timer's recovery interaction has to
  * produce a real answer rather than saving the elapsed time and moving on --
@@ -5195,4 +5247,103 @@ export function timesheetSummary(totals: TimesheetTotals): string {
     );
   }
   return uncounted.length === 0 ? head : `${head} Not counted: ${uncounted.join(", and ")}.`;
+}
+
+/* -------------------------------------------------------------------------- *
+ *  Booked versus estimated, for one task (Phase 10 Task 3)
+ * -------------------------------------------------------------------------- */
+
+/**
+ * **WHAT ONE TASK WAS ESTIMATED AT, AND WHAT HAS ACTUALLY BEEN BOOKED TO IT.**
+ *
+ * The spec's second fact about the schema was that `tasks` carries no quantity
+ * of work, and that "booked versus estimated is usually the point of tracking
+ * time against tasks, and it cannot exist until that column does".
+ * `tasks.estimate_minutes` (0022) is that column; this is the reading over it.
+ * api: services/timesheet.ts's `taskEffort`.
+ *
+ * **THE BOOKED HALF IS `time_entries` ALONE, AND THAT IS A FACT ABOUT THE
+ * SCHEMA RATHER THAN A CHOICE.** `meetings` has four record links and `task_id`
+ * is not one of them, so a meeting cannot be booked to a task and no meeting
+ * minute can reach this number. The tempting mistake is to reach for the
+ * `events.meeting_id` link that a meeting's follow-up TASK carries: Task 2
+ * settled that one -- an hour booked against a follow-up task is different work,
+ * not a second copy of the meeting's hour.
+ *
+ * **AN ARCHIVED ENTRY IS NOT BOOKED.** Archiving is the only way an hour leaves
+ * a total anywhere in this phase (an entry cannot be corrected to nothing --
+ * `time_entries_minutes_range` forbids zero), so an archived entry still
+ * counting here would make the correction for a mis-booked afternoon impossible
+ * on this reading while it worked on every other one.
+ *
+ * **AND NOTHING HERE REACHES `countedMinutes`.** An estimate is not time that
+ * happened; the week's total (above) does not read `tasks` at all and must not
+ * start. Booked-versus-estimated is a COMPARISON of two independent numbers, and
+ * adding an estimate into the sum would answer "where did the week go" with work
+ * nobody has done -- which is exactly what `meetingsNotYetOccurred` exists to
+ * refuse for arranged meetings.
+ */
+export const taskEffortSchema = z.object({
+  taskId: z.uuid(),
+  /** null means nobody has estimated this task. NOT a zero: see
+   * MAX_TASK_ESTIMATE_MINUTES, and `tasks_estimate_range`. */
+  estimateMinutes: z.number().int().min(1).max(MAX_TASK_ESTIMATE_MINUTES).nullable(),
+  /** Live (unarchived) `time_entries` minutes booked to this task. 0 is a real
+   * answer -- "nothing booked yet" -- and never an absent one. */
+  bookedMinutes: z.number().int().nonnegative(),
+  /** How many entries those minutes came from, so the sentence can say it and a
+   * reader can tell one long afternoon from nine scattered hours. */
+  entryCount: z.number().int().nonnegative(),
+}).superRefine((v, ctx) => {
+  // Minutes without entries, or entries without minutes, means the sum and its
+  // count came from different populations -- the failure Task 2 wrote ONE
+  // predicate to make unspellable in the timesheet's aggregate. Here they come
+  // out of one aggregate for the same reason, and this is what proves it stayed
+  // that way.
+  if ((v.bookedMinutes === 0) !== (v.entryCount === 0)) {
+    ctx.addIssue({
+      code: "custom",
+      message: `${String(v.bookedMinutes)} minutes booked across `
+        + `${String(v.entryCount)} entries: every live entry has minutes > 0, so these `
+        + "must be zero together or neither",
+    });
+  }
+});
+export type TaskEffort = z.infer<typeof taskEffortSchema>;
+
+/**
+ * The operator's sentence: what was booked, what was estimated, and the gap --
+ * in ONE string, so a surface cannot print half of a comparison.
+ *
+ * **THIS IS `timesheetSummary`'S ARRANGEMENT AND ITS REASON.** A `bookedMinutes`
+ * sitting beside an `estimateMinutes` in a payload is a comparison only if the
+ * page chooses to render both, and "5h booked" alone -- on a task estimated at
+ * two -- is a number that is wrong without looking wrong. Deriving the whole
+ * sentence is what makes the estimate impossible to drop; web:
+ * components/task-drawer.tsx renders this and composes nothing.
+ *
+ * **AN ESTIMATE ON A TASK NOBODY HAS STARTED IS REPORTED IN FULL, and that is a
+ * decision.** Nothing here asks about `status`, `progress_pct`, `start_date` or
+ * `completed_at`, and the "no time booked yet" phrasing exists precisely so the
+ * zero reads as a fact rather than as an empty answer. Task 2 excluded meetings
+ * that have not happened because the timesheet sums time that HAPPENED and an
+ * arranged meeting is a plan -- but an estimate never claims anything happened,
+ * so "has it started" is not a question it has to answer. Dropping unstarted
+ * tasks would also make the estimated side SHRINK as work went undone, which is
+ * backwards, and a task estimated at eight hours with nothing booked is the most
+ * informative row this comparison produces: either the work has not begun or the
+ * hours went somewhere else.
+ */
+export function taskEffortSummary(effort: TaskEffort): string {
+  const booked = effort.bookedMinutes === 0
+    ? "No time booked yet"
+    : `${formatMinutes(effort.bookedMinutes)} booked across `
+      + `${countOf(effort.entryCount, "entry", "entries")}`;
+  if (effort.estimateMinutes === null) return `${booked}, and no estimate.`;
+  const estimate = `${booked}, against an estimate of ${formatMinutes(effort.estimateMinutes)}`;
+  const gap = effort.bookedMinutes - effort.estimateMinutes;
+  if (gap === 0) return `${estimate}: exactly on the estimate.`;
+  return gap < 0
+    ? `${estimate}: ${formatMinutes(-gap)} left.`
+    : `${estimate}: ${formatMinutes(gap)} over.`;
 }

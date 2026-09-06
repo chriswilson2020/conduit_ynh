@@ -10,7 +10,7 @@ import {
   mailAuthMethodSchema, mailOAuthProviderOf, documentTypeSchema, documentTypeFreezes,
   documentTypeNumbered,
   CONTACT_FIELD_CAPS, DEFAULT_TIME_ZONE, MAX_LOGO_DATA_URI_CHARS, MAX_TEMPLATE_BYTES,
-  MAX_TIME_ENTRY_MINUTES,
+  MAX_TASK_ESTIMATE_MINUTES, MAX_TIME_ENTRY_MINUTES,
   type DocumentType,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
@@ -4487,5 +4487,181 @@ describe("time entries (0021)", () => {
         `${column} accepted an id that does not exist`,
       ).rejects.toMatchObject({ cause: { code: "23503" } });
     }
+  });
+});
+
+/**
+ * **THE TASK ESTIMATE (0022): THE FIRST QUANTITY OF WORK `tasks` HAS EVER
+ * CARRIED.** Every column beside it is a date or a percentage, which is the
+ * spec's second reading of this file and the reason "booked versus estimated"
+ * -- usually the point of booking time against a task -- could not exist.
+ */
+describe("the task estimate (0022)", () => {
+  async function seedTask(estimateMinutes: number | null = null): Promise<string> {
+    const [row] = await handle.db.insert(tasks)
+      .values({ title: "Draft the plan", position: "a0", estimateMinutes }).returning();
+    if (row === undefined) throw new Error("insert returned no row");
+    return row.id;
+  }
+
+  /**
+   * **THE EXACT EDGES**, `time_entries_minutes_range`'s pattern and its reason: a
+   * bound narrowed or widened by one is invisible to every test that inserts a
+   * plausible number, and this is the number a whole comparison is read against.
+   *
+   * The upper edge is MAX_TASK_ESTIMATE_MINUTES, imported rather than restated,
+   * so the constant in @conduit/shared and the literal 525600 in the migration
+   * cannot drift into meaning different things.
+   */
+  it("enforces tasks_estimate_range at the exact edges, and that edge is MAX_TASK_ESTIMATE_MINUTES", async () => {
+    expect(MAX_TASK_ESTIMATE_MINUTES).toBe(525600);
+
+    for (const estimateMinutes of [1, MAX_TASK_ESTIMATE_MINUTES]) {
+      const [row] = await handle.db.insert(tasks)
+        .values({ title: "t", position: "a0", estimateMinutes }).returning();
+      expect(row?.estimateMinutes, `${String(estimateMinutes)} was refused`).toBe(estimateMinutes);
+    }
+    for (const estimateMinutes of [0, -1, MAX_TASK_ESTIMATE_MINUTES + 1]) {
+      await expect(
+        handle.db.insert(tasks).values({ title: "t", position: "a0", estimateMinutes }),
+        `${String(estimateMinutes)} was accepted`,
+      ).rejects.toMatchObject({ cause: { constraint_name: "tasks_estimate_range" } });
+    }
+  });
+
+  /**
+   * **NULL IS THE ONE SPELLING OF "NOT ESTIMATED", AND THE ZERO ABOVE IS WHAT
+   * MAKES THAT TRUE.** Two spellings of one absence is what
+   * `normaliseDescription` avoids by storing "" as null; here the second
+   * spelling would also be the one that reads as a claim rather than a gap.
+   */
+  it("takes a null, which is how a task with no estimate is stored", async () => {
+    const [row] = await handle.db.insert(tasks)
+      .values({ title: "t", position: "a0" }).returning();
+    expect(row?.estimateMinutes).toBeNull();
+  });
+
+  /**
+   * AN INTEGER OF MINUTES, READ OUT OF THE CATALOGUE, because nothing else can
+   * see it: a `numeric` column would accept every value these tests insert and
+   * hand back something that formats identically in most of them. What it would
+   * change is the unit's meaning -- 1.5 would become storable, and the booked
+   * half it is compared against (`time_entries.minutes`, `integer`) could never
+   * produce such a number.
+   */
+  it("stores the estimate as an integer of minutes, matching what it is compared with", async () => {
+    const [column] = await handle.db.execute<{ data_type: string; is_nullable: string }>(sql`
+      SELECT data_type, is_nullable FROM information_schema.columns
+      WHERE table_name = 'tasks' AND column_name = 'estimate_minutes'
+    `);
+    expect(column?.data_type).toBe("integer");
+    expect(column?.is_nullable).toBe("YES");
+
+    const [entry] = await handle.db.execute<{ data_type: string }>(sql`
+      SELECT data_type FROM information_schema.columns
+      WHERE table_name = 'time_entries' AND column_name = 'minutes'
+    `);
+    expect(entry?.data_type).toBe(column?.data_type);
+  });
+
+  /**
+   * **NO CROSS-COLUMN COUPLING TO THE TASK'S OWN DATES**, which is the CHECK
+   * somebody will eventually propose. Eight hours of work inside a two-day
+   * window is the normal case, not an error -- a span is elapsed time and an
+   * estimate is effort -- and a CHECK of that shape would also make an ordinary
+   * reschedule fail against an estimate already stored.
+   */
+  it("lets a task be estimated at more work than its own span holds", async () => {
+    const [row] = await handle.db.insert(tasks).values({
+      title: "Write the report", position: "a0",
+      startDate: "2026-09-07", dueDate: "2026-09-08", estimateMinutes: 40 * 60,
+    }).returning();
+    expect(row?.estimateMinutes).toBe(2400);
+  });
+
+  /**
+   * **THE UPGRADE DRILL.** 0022 alters a table that is populated on every real
+   * install, so unlike 0021 there IS something to lose: what has to be proved is
+   * that the migration arrives at all (the journal trap, six for six now), that
+   * the CHECK arrives VALIDATED rather than merely declared, and that the tasks
+   * already in the database survive it and read back as unestimated.
+   *
+   * THE PREMISE IS PINNED FIRST. Without the catalogue check below, every
+   * assertion here would pass just as happily against a database that had been
+   * fully migrated all along -- the exact shape a skipped migration produces.
+   */
+  it("applies migration 0022 to a real pre-0022 database -- the column and its CHECK arrive, and existing tasks survive unestimated", async () => {
+    await withPreMigrationDatabase("0022", async (scratch) => {
+      // RAW SQL, NOT `insert(tasks)`: schema.ts describes TODAY's shape, and a
+      // drizzle insert would name the very column this database has not got.
+      await scratch.db.execute(sql`
+        INSERT INTO users (id, username) VALUES (${userId}::uuid, 'chris')
+      `);
+      await scratch.db.execute(sql`
+        INSERT INTO tasks (title, position, progress_pct) VALUES ('Existing work', 'a0', 40)
+      `);
+
+      const before = await scratch.db.execute<{ column_name: string }>(sql`
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'tasks' AND column_name = 'estimate_minutes'
+      `);
+      expect(before).toEqual([]);
+
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      // THE COLUMN IS HERE, which is the half the journal trap would have taken:
+      // a skipped 0022 raises no error anywhere, it just leaves this empty.
+      const after = await scratch.db.execute<{ column_name: string }>(sql`
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'tasks' AND column_name = 'estimate_minutes'
+      `);
+      expect(after).toHaveLength(1);
+
+      // THE ROW THAT PREDATES THE COLUMN. Unestimated, not zero -- an
+      // ALTER TABLE ... ADD COLUMN with a DEFAULT would have claimed an estimate
+      // for every task on the install, which is 0018's backfill hazard in
+      // reverse.
+      const [existing] = await scratch.db.execute<{ title: string; estimate_minutes: number | null; progress_pct: number }>(sql`
+        SELECT title, estimate_minutes, progress_pct FROM tasks
+      `);
+      expect(existing?.title).toBe("Existing work");
+      expect(existing?.estimate_minutes).toBeNull();
+      expect(existing?.progress_pct).toBe(40);
+
+      // The CHECK arrived VALIDATED rather than merely declared, which is only
+      // provable by exercising it.
+      await expect(scratch.db.execute(sql`
+        INSERT INTO tasks (title, position, estimate_minutes) VALUES ('t', 'a1', 0)
+      `)).rejects.toMatchObject({ cause: { constraint_name: "tasks_estimate_range" } });
+      await expect(scratch.db.execute(sql`
+        INSERT INTO tasks (title, position, estimate_minutes) VALUES ('t', 'a1', 525601)
+      `)).rejects.toMatchObject({ cause: { constraint_name: "tasks_estimate_range" } });
+      await expect(scratch.db.execute(sql`
+        INSERT INTO tasks (title, position, estimate_minutes) VALUES ('t', 'a1', 240)
+      `)).resolves.toBeDefined();
+    });
+  });
+
+  /**
+   * **A MEETING STILL CANNOT BE BOOKED TO A TASK**, which is what makes the
+   * booked half of this comparison `time_entries` alone. Asserted against the
+   * catalogue rather than argued: if `meetings` ever gains a `task_id`, the
+   * aggregate in services/timesheet.ts's `taskEffort` silently starts answering
+   * a question about one table while the sentence claims both.
+   */
+  it("gives meetings no task_id, so no meeting minute can reach a task's booked total", async () => {
+    const columns = await handle.db.execute<{ column_name: string }>(sql`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_name = 'meetings' AND column_name = 'task_id'
+    `);
+    expect(columns).toEqual([]);
+
+    // The premise: this really read the meetings table.
+    const links = await handle.db.execute<{ column_name: string }>(sql`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_name = 'meetings' AND column_name = 'project_id'
+    `);
+    expect(links).toHaveLength(1);
+    expect(await seedTask(240)).toBeDefined();
   });
 });

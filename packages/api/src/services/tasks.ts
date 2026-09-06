@@ -52,7 +52,7 @@ export function toTask(row: TaskRow): Task {
     assigneeUserId: row.assigneeUserId,
     startDate: row.startDate, dueDate: row.dueDate,
     completedAt: row.completedAt?.toISOString() ?? null,
-    progressPct: row.progressPct,
+    progressPct: row.progressPct, estimateMinutes: row.estimateMinutes,
     parentTaskId: row.parentTaskId, position: row.position,
     companyId: row.companyId, contactId: row.contactId, dealId: row.dealId, projectId: row.projectId,
     archivedAt: row.archivedAt?.toISOString() ?? null,
@@ -216,6 +216,7 @@ export async function createTask(
       startDate: input.startDate ?? null,
       dueDate: input.dueDate ?? null,
       progressPct: input.progressPct ?? null,
+      estimateMinutes: input.estimateMinutes ?? null,
       parentTaskId,
       position,
       companyId: input.companyId ?? null,
@@ -257,7 +258,7 @@ export async function createTask(
 // deals.ts's PATCHABLE_FIELDS convention.
 const PATCHABLE_FIELDS = [
   "title", "description", "type", "assigneeUserId", "startDate", "dueDate",
-  "progressPct", "parentTaskId", "companyId", "contactId", "dealId", "projectId",
+  "progressPct", "estimateMinutes", "parentTaskId", "companyId", "contactId", "dealId", "projectId",
 ] as const satisfies readonly (keyof UpdateTaskInput)[];
 
 export async function updateTask(db: Database, actorId: string, id: string, patch: UpdateTaskInput): Promise<Task> {
@@ -357,7 +358,8 @@ export async function updateTask(db: Database, actorId: string, id: string, patc
       .set({
         title: patch.title, description: patch.description, type: patch.type,
         assigneeUserId: patch.assigneeUserId, startDate: patch.startDate, dueDate: patch.dueDate,
-        progressPct: patch.progressPct, parentTaskId: patch.parentTaskId,
+        progressPct: patch.progressPct, estimateMinutes: patch.estimateMinutes,
+        parentTaskId: patch.parentTaskId,
         companyId: patch.companyId, contactId: patch.contactId, dealId: patch.dealId, projectId: patch.projectId,
         ...(position !== undefined ? { position } : {}),
         updatedAt: new Date(),
