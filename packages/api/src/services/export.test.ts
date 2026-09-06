@@ -1145,6 +1145,65 @@ describe("export documents", () => {
   });
 
   /**
+   * **THE THIRD TASK RUNNING TO FIND THIS SHEET A TYPE BEHIND, AND THE FAILURE
+   * WOULD HAVE BEEN THE QUIETEST YET.** Task 2 found an INNER JOIN dropping every
+   * meeting summary. Task 3 found no `company_id`/`contact_id`, so a letter named
+   * no record. A status report would have come out looking perfect and named no
+   * record either -- `project_id` was not a column of this sheet, so the ONE fact
+   * that says which project a report is about would have been absent from the
+   * archive entirely. Neither the spec nor the plan mentions the export, for the
+   * third task running.
+   *
+   * **AND ITS CONTENT COLUMNS ARE ALL BLANK, WHICH IS COMPLETE RATHER THAN
+   * LOSSY.** This type has no detail table because it holds nothing that was
+   * typed into the document: the project is in projects.csv, the tasks are in
+   * tasks.csv, and what the page SAID on the day it was made is the PDF at
+   * `file_archive_path`. That is the difference from the letter, whose body
+   * exists nowhere else and therefore had to become six columns.
+   */
+  itZip("exports a status report, with its project named and every content column blank", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme Ltd" });
+    const project = await createProject(handle.db, actorId, {
+      name: "Rye Lane rollout", companyId: company.id,
+    });
+    const { sha256, sizeBytes } = await saveBlob(dataDir, Readable.from([Buffer.from("%PDF-1.7 report")]));
+    const pdf = await attachFile(handle.db, actorId, {
+      originalName: "Status report - Rye Lane rollout - 2026-09-06.pdf",
+      mime: "application/pdf", sizeBytes, sha256, projectId: project.id,
+    });
+    await handle.db.insert(documentsTable).values({
+      number: null, type: "project_status_report", projectId: project.id, fileId: pdf.id,
+      issueDate: "2026-09-06", frozen: false, issuedByUserId: actorId,
+    });
+
+    const root = await extract(await writeArchive());
+    const sheet = await readSheet(root, "documents.csv");
+    expect(sheet.records).toHaveLength(1);
+    expect(cell(sheet, 0, "type")).toBe("project_status_report");
+    // THE TWO COLUMNS THIS TASK ADDED. Without them the row names no record.
+    expect(cell(sheet, 0, "project_id")).toBe(project.id);
+    expect(cell(sheet, 0, "project_name")).toBe("Rye Lane rollout");
+    expect(cell(sheet, 0, "frozen")).toBe("false");
+    for (const column of [
+      "number", "company_id", "contact_id", "deal_id", "meeting_id",
+      "currency", "subtotal", "tax", "total", "letter_subject", "letter_body_html",
+      "agreement_term_months",
+    ]) {
+      expect(cell(sheet, 0, column), column).toBe("");
+    }
+    // ...and its page is reachable from the row, which is where the content that
+    // is NOT derivable from projects.csv and tasks.csv actually lives.
+    expect(await readFile(path.join(root, cell(sheet, 0, "file_archive_path")), "utf8"))
+      .toBe("%PDF-1.7 report");
+
+    // files.csv names the project too, which it has done since Phase 3 -- unlike
+    // the meeting, which 0017 had to add.
+    const filesSheet = await readSheet(root, "files.csv");
+    expect(cell(filesSheet, 0, "project_id")).toBe(project.id);
+    expect(cell(filesSheet, 0, "project_name")).toBe("Rye Lane rollout");
+  });
+
+  /**
    * The order the sheet is written in, now that some rows have no number to order
    * by. PostgreSQL sorts NULLs last in ASC, so the numbered documents keep the
    * order a reader expects and created_at/id make the unnumbered tail

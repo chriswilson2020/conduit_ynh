@@ -10,7 +10,7 @@ import {
   pipelineSchema, pipelineWithStagesSchema, stageSchema, dealSchema, funnelRowSchema,
   projectSchema, taskSchema, taskDependencySchema, shiftResultSchema, ganttPayloadSchema,
   meetingSchema, meetingDetailSchema, meetingSummarySchema, documentSchema, orgProfileSchema,
-  agreementSchema, letterSchema, recordDocumentSchema,
+  agreementSchema, letterSchema, recordDocumentSchema, statusReportSchema,
   documentTemplateSchema, CONTACT_FIELD_CAPS, DEFAULT_TIME_ZONE,
   DOCUMENT_MAX_DESCRIPTION_CHARS, DOCUMENT_MAX_LINES, MAX_TEMPLATE_BYTES,
 } from "@conduit/shared";
@@ -18,6 +18,7 @@ import { openTestDatabase, truncateAll } from "../test/db.js";
 import { withPythonStub, writePythonStub } from "../test/python-stub.js";
 import {
   seededAgreementTemplate, seededLetterTemplate, seededMeetingSummaryTemplate, seededQuoteTemplate,
+  seededStatusReportTemplate,
 } from "../test/seed-template.js";
 import { buildApp, type BuildAppOptions } from "../app.js";
 import { listFiles } from "../services/files.js";
@@ -2546,6 +2547,115 @@ describe("documents routes", () => {
   });
 
   /* ---------------------------------------------------------------------- *
+   *  PHASE 9 TASK 4: the project status report
+   * ---------------------------------------------------------------------- */
+
+  /**
+   * **THE SECOND PAIR OF DOCUMENT ROUTES WITH NO REQUEST BODY**, and unlike the
+   * meeting summary's that is a finding rather than a given: the spec gave this
+   * type "possibly a date range" and it turned out to need nothing at all. What
+   * this test is really checking at the boundary is that a POST with no payload
+   * produces a document -- there is no schema to reject a body, so an empty one
+   * has to be the whole contract.
+   */
+  it("generates a project status report with no body at all, lists it, and serves its PDF", async () => {
+    await handle.db.insert(documentTemplates)
+      .values({ type: "project_status_report", bodyHtml: seededStatusReportTemplate() });
+    const a = await app();
+    const project = await makeProject(a, { startDate: "2026-08-01", dueDate: "2026-12-31" });
+    await makeTask(a, { title: "Groundwork", projectId: project.id });
+
+    const created = await withPythonStub(writePythonStub(dataDir, VARYING_PDF), async () =>
+      await a.inject({
+        method: "POST", url: `/api/projects/${project.id}/documents`, headers: authHeaders,
+      }));
+    expect(created.statusCode).toBe(201);
+    const report = statusReportSchema.parse(created.json());
+    expect(report).toMatchObject({
+      type: "project_status_report", projectId: project.id, frozen: false,
+    });
+    // The wire shape has no `number`, which is the type's decision made visible at
+    // the boundary rather than only in the row.
+    expect(created.json()).not.toHaveProperty("number");
+
+    const listed = await a.inject({
+      method: "GET", url: `/api/projects/${project.id}/documents`, headers: authHeaders,
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(z.array(statusReportSchema).parse(listed.json())).toEqual([report]);
+
+    // NO SECOND DOWNLOAD PATH, exactly as for a quote and a summary: the PDF is
+    // an ordinary files row -- on the PROJECT, which `files_exactly_one_entity`
+    // has admitted since Phase 3 -- and comes back through the route that already
+    // existed.
+    const download = await a.inject({
+      method: "GET", url: `/api/files/${report.fileId}/download`, headers: authHeaders,
+    });
+    expect(download.statusCode).toBe(200);
+    expect(download.headers["content-type"]).toContain("application/pdf");
+    expect(download.headers["content-disposition"]).toContain("Status report");
+    await a.close();
+  });
+
+  it("answers 404 for a project that does not exist, 409 with no template, and 400 for a bad id", async () => {
+    const a = await app();
+
+    // 409 BEFORE 404, for the meeting summary's reason: with no template row a
+    // real project is the only way to reach the template read, and an install
+    // whose seeded row was deleted must get a message an operator can act on.
+    const project = await makeProject(a);
+    const noTemplate = await withPythonStub(writePythonStub(dataDir, VARYING_PDF), async () =>
+      await a.inject({
+        method: "POST", url: `/api/projects/${project.id}/documents`, headers: authHeaders,
+      }));
+    expect(noTemplate.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(noTemplate.json()).error).toBe("template_missing");
+
+    const missing = await a.inject({
+      method: "POST", url: `/api/projects/${unknownId}/documents`, headers: authHeaders,
+    });
+    expect(missing.statusCode).toBe(404);
+
+    const bad = await a.inject({
+      method: "GET", url: "/api/projects/not-a-uuid/documents", headers: authHeaders,
+    });
+    expect(bad.statusCode).toBe(400);
+    await a.close();
+  });
+
+  /**
+   * **A REPORT IS NOT REDRAFTABLE, AND THE REFUSAL SAYS SO RATHER THAN SAYING IT
+   * IS FROZEN.** It is NOT frozen -- `documentTypeFreezes` answers false -- so a
+   * 409 `frozen` here would be wrong twice over: wrong about the row, and wrong
+   * about what the operator should do next. `redraftLetter`'s type check is what
+   * answers, exactly as it does for a meeting summary, and this is the second
+   * type to inherit that refusal without needing anything written for it.
+   */
+  it("refuses to redraft a status report as NOT A LETTER rather than as frozen", async () => {
+    await handle.db.insert(documentTemplates)
+      .values({ type: "project_status_report", bodyHtml: seededStatusReportTemplate() });
+    const a = await app();
+    const project = await makeProject(a);
+    const created = await withPythonStub(writePythonStub(dataDir, VARYING_PDF), async () =>
+      await a.inject({
+        method: "POST", url: `/api/projects/${project.id}/documents`, headers: authHeaders,
+      }));
+    const report = statusReportSchema.parse(created.json());
+
+    const redraft = await a.inject({
+      method: "PUT", url: `/api/documents/${report.id}`, headers: authHeaders,
+      payload: {
+        issueDate: "2026-09-06", recipientName: "Acme", bodyHtml: "<p>Nope</p>",
+      },
+    });
+    expect(redraft.statusCode).toBe(400);
+    const body = errorResponseSchema.parse(redraft.json());
+    expect(body.error).toBe("validation");
+    expect(body.message).toContain("is a project_status_report, not a letter");
+    await a.close();
+  });
+
+  /* ---------------------------------------------------------------------- *
    *  PHASE 9 TASK 3: the letter, the agreements, and the redraft
    * ---------------------------------------------------------------------- */
 
@@ -2651,6 +2761,36 @@ describe("documents routes", () => {
       method: "GET", url: `/api/companies/${company.id}/documents`, headers: authHeaders,
     });
     expect(onCompany.json()).toEqual([]);
+
+    /*
+     * **AND `?includeContacts=true` IS THE ANSWER TASK 3 RECOMMENDED, ADDED BY
+     * TASK 4 AS A VIEW AND NOT AS A SECOND OWNER.** The assertion above is
+     * unchanged, so the decision is still visible; this one is the other view of
+     * the same row. The letter comes back with `contactId` set and `companyId`
+     * null, which is the row as written -- nothing about "exactly one" moved.
+     */
+    const rolled = await a.inject({
+      method: "GET", url: `/api/companies/${company.id}/documents?includeContacts=true`,
+      headers: authHeaders,
+    });
+    expect(rolled.statusCode).toBe(200);
+    const rolledUp = z.array(recordDocumentSchema).parse(rolled.json());
+    expect(rolledUp).toHaveLength(1);
+    expect(rolledUp[0]).toMatchObject({ contactId, companyId: null });
+
+    // ANYTHING THAT IS NOT THE LITERAL "true" IS OFF, AND NOTHING IS REFUSED OVER
+    // IT. `z.coerce.boolean()` would answer TRUE for the string "false", which is
+    // exactly the value a client sends when it means the opposite -- so the route
+    // tests the string instead, and this is the assertion that says so.
+    for (const value of ["false", "1", "yes", ""]) {
+      const off = await a.inject({
+        method: "GET",
+        url: `/api/companies/${company.id}/documents?includeContacts=${value}`,
+        headers: authHeaders,
+      });
+      expect(off.statusCode, value).toBe(200);
+      expect(off.json(), value).toEqual([]);
+    }
     await a.close();
   });
 
@@ -2780,6 +2920,8 @@ describe("documents routes", () => {
       { method: "POST" as const, url: `/api/companies/${unknownId}/documents` },
       { method: "GET" as const, url: `/api/contacts/${unknownId}/documents` },
       { method: "POST" as const, url: `/api/contacts/${unknownId}/documents` },
+      { method: "GET" as const, url: `/api/projects/${unknownId}/documents` },
+      { method: "POST" as const, url: `/api/projects/${unknownId}/documents` },
       { method: "PUT" as const, url: `/api/documents/${unknownId}` },
       { method: "GET" as const, url: "/api/org-profile" },
       { method: "PUT" as const, url: "/api/org-profile" },
@@ -2790,6 +2932,8 @@ describe("documents routes", () => {
       { method: "GET" as const, url: "/api/document-templates/letter" },
       { method: "PUT" as const, url: "/api/document-templates/nda" },
       { method: "GET" as const, url: "/api/document-templates/mutual_nda" },
+      { method: "GET" as const, url: "/api/document-templates/project_status_report" },
+      { method: "PUT" as const, url: "/api/document-templates/project_status_report" },
     ];
     for (const call of calls) {
       const response = await a.inject({ ...call, payload: {} });

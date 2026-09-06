@@ -555,23 +555,31 @@ describe("redraftLetter rewrites the letter it was given", () => {
   });
 
   /**
-   * **A LETTER ATTACHED TO A DEAL, WHICH IS A SHAPE NO WRITER CAN PRODUCE AND THE
-   * DATABASE STILL ALLOWS.** `documents_exactly_one_entity` says exactly one of
+   * **THIS TEST USED TO MOVE A LETTER ONTO A DEAL BY HAND AND WATCH
+   * `redraftLetter` REFUSE IT. MIGRATION 0020 MADE THE MOVE IMPOSSIBLE, SO WHAT
+   * IT ASSERTS NOW IS THAT THE DATABASE REFUSES THE UPDATE.**
+   *
+   * What it said before: "`documents_exactly_one_entity` says exactly one of
    * five; it does not say WHICH one for a given type. So a psql session can put a
-   * letter on a deal, and `redraftLetter` then has a letter with neither a company
-   * nor a contact to hand back.
+   * letter on a deal... THE FIX IS A CHECK AND IT IS NOT IN 0019, deliberately --
+   * it is a rule about all five types and two of them are Task 4's."
    *
-   * IT THROWS RATHER THAN DEREFERENCING A NULL, and this test exists because the
-   * branch that does so was a SURVIVING MUTANT until it was written: replacing it
-   * with `existing.contactId as string` was green across both suites, because
-   * nothing in the product can build the row. Writing the row by hand is the only
-   * way to reach it, which is also the honest statement of the gap.
+   * Task 4 wrote that CHECK. `documents_entity_matches_type` refuses this UPDATE
+   * from a psql session exactly as it refuses it from a service, which is the
+   * whole reason it is a constraint and not a branch.
    *
-   * THE FIX IS A CHECK AND IT IS NOT IN 0019, deliberately -- see "which entity,
-   * per type" in the phase plan. It is a rule about all five types and two of
-   * them are Task 4's.
+   * **SO `redraftLetter`'S "attached to neither" BRANCH IS NOW UNREACHABLE, AND
+   * THAT IS SAID HERE RATHER THAN LEFT AS A SILENT SURVIVOR.** It was a surviving
+   * mutant before this test existed (`existing.contactId as string` was green
+   * across two suites) and it is one again -- deleting the branch is green,
+   * because no writer and no console can build the row any more. It stays: a
+   * guard at a dereference costs a line, the thing that makes it unreachable is
+   * a constraint that a later migration could widen, and "unreachable today
+   * because something else holds" is exactly the kind of claim this codebase has
+   * twice found to be wrong. The assertion moved to the layer that now does the
+   * refusing.
    */
-  it("throws on a letter that is attached to a deal, which only a psql session can make", async () => {
+  it("refuses a letter being moved onto a deal, which is what made redraftLetter's neither-branch reachable", async () => {
     const pipeline = await createPipeline(handle.db, actorId, { name: "Sales", scope: "global" });
     const stage = await createStage(handle.db, actorId, pipeline.id, { name: "New" });
     const deal = await createDeal(
@@ -579,14 +587,22 @@ describe("redraftLetter rewrites the letter it was given", () => {
       { title: "Big Deal", pipelineId: pipeline.id, stageId: stage.id, companyId }, "EUR",
     );
     const letter = await writeLetter();
-    // Straight past every writer, exactly as an import or a console would.
-    await handle.db.execute(sql`
+    // Straight past every writer, exactly as an import or a console would -- and
+    // that is now precisely what fails.
+    await expect(handle.db.execute(sql`
       UPDATE documents SET company_id = NULL, deal_id = ${deal.id} WHERE id = ${letter.id}
-    `);
+    `)).rejects.toMatchObject({
+      cause: {
+        code: "23514", message: expect.stringContaining("documents_entity_matches_type"),
+      },
+    });
 
-    await expect(withStub(OK_RENDER, async () => await redraftLetter(
+    // The row is untouched, so the letter is still redraftable -- the difference
+    // between a refusal and an error raised after the damage.
+    const redrafted = await withStub(OK_RENDER, async () => await redraftLetter(
       handle.db, { dataDir }, actorId, letter.id, { ...LETTER_INPUT },
-    ))).rejects.toThrow(/attached to neither a company nor a contact/);
+    ));
+    expect(redrafted).toMatchObject({ id: letter.id, companyId, contactId: null });
   });
 
   it("refuses a meeting summary as NOT A LETTER rather than as frozen", async () => {
@@ -904,6 +920,52 @@ describe("listRecordDocuments", () => {
       .toEqual([onCompany.id]);
     expect((await listRecordDocuments(handle.db, { contactId })).map((r) => r.id))
       .toEqual([onContact.id]);
+  });
+
+  /**
+   * **THE ROLLUP TASK 3 RECOMMENDED AND TASK 4 BUILT, AND THE TEST ABOVE IS WHY
+   * IT IS OPT-IN.** That one asserts a deliberate emptiness -- "it is the
+   * decision working rather than a bug" -- and it is still asserted, unchanged,
+   * a few lines up. This one asserts the other view of the same rows.
+   *
+   * **NOTHING ABOUT THE DATA MODEL MOVED.** Each document still names exactly one
+   * record: the rolled-up letter comes back with `contactId` set and `companyId`
+   * null, which is the row as written, and that is what a caller reads to tell
+   * the two apart. Task 3's warning about widening the CHECK -- "it would make
+   * every reader ask 'which of the two is this document really about'" -- is why
+   * the DTO is not touched either.
+   */
+  it("rolls a contact's documents up into their company's list, but only when asked", async () => {
+    const onCompany = await writeLetter({ companyId });
+    const onContact = await writeLetter({ contactId });
+    // A contact at a DIFFERENT company must not come along -- the subquery is
+    // `contacts.company_id = $1`, not "every contact".
+    const elsewhere = await createCompany(handle.db, actorId, { name: "Other BV" });
+    const stranger = await createContact(handle.db, actorId, {
+      firstName: "Sam", lastName: "Stranger", companyId: elsewhere.id,
+    });
+    const onStranger = await writeLetter({ contactId: stranger.id });
+
+    const rolled = await listRecordDocuments(
+      handle.db, { companyId }, { includeContacts: true },
+    );
+    // Newest first, over the WHOLE set -- which is what makes the subquery worth
+    // having instead of two reads merged in TypeScript.
+    expect(rolled.map((r) => r.id)).toEqual([onContact.id, onCompany.id]);
+    expect(rolled.map((r) => r.id)).not.toContain(onStranger.id);
+    // The rolled-up row still says which record it is really on.
+    expect(rolled[0]).toMatchObject({ contactId, companyId: null });
+    expect(rolled[1]).toMatchObject({ companyId, contactId: null });
+
+    // Explicitly OFF is the same answer as not asking, which is what makes the
+    // default a default rather than an accident of the parameter's shape.
+    expect((await listRecordDocuments(handle.db, { companyId }, { includeContacts: false }))
+      .map((r) => r.id)).toEqual([onCompany.id]);
+
+    // AND IT IS IGNORED FOR A CONTACT rather than refused: a contact has no
+    // contacts, so there is nothing to roll up and both answers are the same.
+    expect((await listRecordDocuments(handle.db, { contactId }, { includeContacts: true }))
+      .map((r) => r.id)).toEqual([onContact.id]);
   });
 
   it("reflects a redraft rather than adding a second row", async () => {

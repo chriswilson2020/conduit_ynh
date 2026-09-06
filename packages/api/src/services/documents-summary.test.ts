@@ -630,25 +630,43 @@ describe("listMeetingSummaries", () => {
   });
 
   /**
-   * FILTERED BY TYPE AS WELL AS BY MEETING, though only a summary attaches to a
-   * meeting through any service today. The other row is written directly, which
-   * is exactly the psql-session case the filter is for -- and is also what a
-   * future meeting-attached type will look like from this function's side.
+   * **THIS TEST USED TO PUT A QUOTE ON A MEETING AND WATCH THE FILTER DROP IT.
+   * MIGRATION 0020 MADE THAT ROW UNSPELLABLE, SO WHAT IT ASSERTS NOW IS THE
+   * REFUSAL.**
    *
-   * NOTE WHAT THE SCHEMA STILL DEMANDS OF IT: a quote is numbered and frozen, so
-   * the row below carries both. `documents_exactly_one_entity` is indifferent to
-   * the type, which is precisely why this state is reachable at all and why the
-   * predicate here is not decoration.
+   * The comment it replaces said: "`documents_exactly_one_entity` is indifferent
+   * to the type, which is precisely why this state is reachable at all and why
+   * the predicate here is not decoration." Both halves were true when they were
+   * written and the first is not any more. Task 3 recorded the gap -- "nothing in
+   * the database stops a letter carrying a `deal_id` or a quote carrying a
+   * `meeting_id`; only the writers do" -- and Task 4's
+   * `documents_entity_matches_type` closes it, from the database, for a psql
+   * session as much as for a service.
+   *
+   * **SO `listMeetingSummaries`' `eq(type, 'meeting_summary')` IS NOW
+   * UNEXERCISABLE, AND THAT IS SAID HERE RATHER THAN LEFT AS A SILENT SURVIVOR.**
+   * A mutation deleting it is green and will stay green for as long as a meeting
+   * can carry exactly one type. The predicate stays anyway, for the reason the
+   * function's own comment gives: it is what makes `toMeetingSummaryRecord`'s
+   * literal `type` a fact rather than an assumption, and the day a second
+   * meeting-attached type is added -- which means widening the very CHECK below
+   * -- this function keeps meaning what its name says instead of quietly
+   * returning something else as a summary.
    */
-  it("ignores a document on the meeting that is not a summary", async () => {
+  it("refuses a quote on a meeting outright, which is what replaced the filter this used to exercise", async () => {
     const summary = await issueWithStub();
     const [file] = await handle.db.select().from(files).where(eq(files.id, summary.fileId));
-    await handle.db.insert(documents).values({
+    await expect(handle.db.insert(documents).values({
       number: "QUO-2026-9999", type: "quote", meetingId, fileId: file!.id,
       issueDate: "2026-09-06", frozen: true, issuedByUserId: actorId,
+    })).rejects.toMatchObject({
+      cause: {
+        code: "23514", message: expect.stringContaining("documents_entity_matches_type"),
+      },
     });
-    expect(await handle.db.select().from(documents)).toHaveLength(2);
-
+    // Nothing was written, so the meeting still has exactly its summary -- the
+    // difference between a refusal and an error raised after the damage.
+    expect(await handle.db.select().from(documents)).toHaveLength(1);
     const listed = await listMeetingSummaries(handle.db, meetingId);
     expect(listed.map((row) => row.id)).toEqual([summary.id]);
   });
