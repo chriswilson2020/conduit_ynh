@@ -9,7 +9,7 @@ import {
   mailSecuritySchema, mailAccountStatusSchema, mailDirectionSchema, specialUseSchema, mailVisibilitySchema,
   mailAuthMethodSchema, mailOAuthProviderOf, documentTypeSchema, documentTypeFreezes,
   documentTypeNumbered,
-  CONTACT_FIELD_CAPS, MAX_LOGO_DATA_URI_CHARS, MAX_TEMPLATE_BYTES,
+  CONTACT_FIELD_CAPS, DEFAULT_TIME_ZONE, MAX_LOGO_DATA_URI_CHARS, MAX_TEMPLATE_BYTES,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import {
@@ -1530,7 +1530,16 @@ describe("documents schema (0009)", () => {
       // disturb. 43,715 characters is the old column bound to the character.
       const oldPrefix = "data:image/png;base64,";
       const oldLogo = oldPrefix + "A".repeat(43_715 - oldPrefix.length);
-      await scratch.db.insert(orgProfile).values({ name: "Listerdale", logoDataUri: oldLogo });
+      // RAW SQL, NOT `insert(orgProfile)`, and this line went red when 0018 added a
+      // column: a drizzle insert spells out EVERY column schema.ts knows about --
+      // `time_zone` included, as `default` -- against a database migrated only to
+      // 0009, which does not have it. Exactly the hazard the 0011 and 0017 drills
+      // already record; it reaches this one now because org_profile finally gained
+      // a column after 0010. The UPDATEs below need no such treatment, since an
+      // update names only what it sets.
+      await scratch.db.execute(
+        sql`INSERT INTO org_profile (id, name, logo_data_uri) VALUES (1, 'Listerdale', ${oldLogo})`,
+      );
 
       // Pin the premise: before the migration a 300KB logo cannot be stored at all,
       // so every assertion after it is about the ALTER rather than about a database
@@ -3075,5 +3084,107 @@ describe("the meeting summary (0017)", () => {
     )).rejects.toMatchObject({
       cause: { code: "23514", message: expect.stringContaining("documents_exactly_one_entity") },
     });
+  });
+});
+
+describe("the organisation's timezone (0018)", () => {
+  /**
+   * **THE UPGRADE DRILL, AND ITS ONE QUESTION IS THE BACKFILL.**
+   *
+   * 0018 adds a column and a CHECK and moves no rows, so unlike 0016 it needs no
+   * pre-migration fixture. What it does need proving is 0014's distinction, which
+   * is the one that has caught something before: a DEFAULT that fires on INSERT
+   * says nothing whatever about a row that already exists. `org_profile` has
+   * exactly one row on Chris's install, that row was written before this column
+   * was declared, and 'UTC' can only have reached it from the ALTER.
+   *
+   * THE PREMISE IS PINNED FIRST. Without the catalogue check below, every
+   * assertion here would pass just as happily against a database that had been
+   * fully migrated all along, which is the failure mode a drill exists for.
+   */
+  it("applies migration 0018 to a real pre-0018 database -- the row that already existed gains UTC", async () => {
+    await withPreMigrationDatabase("0018", async (scratch) => {
+      // RAW SQL, NOT `insert(orgProfile)`, and it is this file's standing hazard:
+      // schema.ts describes TODAY's shape, so a drizzle insert would name
+      // `time_zone` against a database that does not have it yet. The 0011 and
+      // 0017 drills both went red on exactly that.
+      await scratch.db.execute(sql`
+        INSERT INTO org_profile (id, name, address_lines, vat_number)
+        VALUES (1, 'Listerdale Life Sciences', '1 High St', 'NL001234567B01')
+      `);
+
+      const before = await scratch.db.execute<{ column_name: string }>(sql`
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'org_profile' AND column_name = 'time_zone'
+      `);
+      expect(before).toEqual([]);
+
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      // THE BACKFILL, ON A ROW THAT PREDATES THE COLUMN. This is the whole drill.
+      const [row] = await scratch.db.select().from(orgProfile);
+      expect(row?.timeZone).toBe(DEFAULT_TIME_ZONE);
+      // ...and the rest of the profile is untouched, which is the other half of
+      // "an existing install survives".
+      expect(row?.name).toBe("Listerdale Life Sciences");
+      expect(row?.vatNumber).toBe("NL001234567B01");
+
+      // The CHECK really arrived, and it validated rather than being declared NOT
+      // VALID over the existing row.
+      await expect(scratch.db.execute(
+        sql`UPDATE org_profile SET time_zone = '+02:00' WHERE id = 1`,
+      )).rejects.toMatchObject({ cause: { constraint_name: "org_profile_time_zone_shape" } });
+    });
+  }, 30000);
+
+  /**
+   * **THE COLUMN'S DEFAULT AND THE CODE'S CONSTANT ARE THE SAME STRING, AND
+   * NOTHING BUT THIS SAYS SO.** schema.ts cannot import from `@conduit/shared`
+   * (drizzle-kit reads it outside the workspace's resolution), so `'UTC'` is
+   * written out there and `DEFAULT_TIME_ZONE` here. A drift between them is
+   * invisible in every other test: `emptyProfile` would hand back one value and a
+   * freshly defaulted row the other, and the difference surfaces as a document
+   * whose time moved by hours after somebody first saved the Settings form.
+   *
+   * READ OUT OF THE CATALOGUE rather than by inserting a row and looking, so it is
+   * the DECLARED default being compared and not the outcome of some path that
+   * might have supplied a value of its own.
+   */
+  it("declares the same default the code believes in", async () => {
+    const [column] = await handle.db.execute<{ column_default: string | null }>(sql`
+      SELECT column_default FROM information_schema.columns
+      WHERE table_name = 'org_profile' AND column_name = 'time_zone'
+    `);
+    expect(column?.column_default).toBe(`'${DEFAULT_TIME_ZONE}'::text`);
+  });
+
+  /**
+   * WHAT A SHAPE CHECK CAN AND CANNOT DO, asserted rather than described. It
+   * cannot know whether a name is a real zone -- that is `timeZoneProblem`'s job,
+   * over tzdata a `text` column has no access to -- so this pins the two things it
+   * CAN refuse, and that it refuses no real name.
+   */
+  it("refuses the shapes that are wrong by inspection and admits every real name", async () => {
+    for (const bad of ["", " ", "+02:00", "-05:00", "Europe/Amsterdam ", "x".repeat(65)]) {
+      await expect(handle.db.execute(
+        sql`INSERT INTO org_profile (id, name, time_zone) VALUES (1, 'X', ${bad})`,
+      ), JSON.stringify(bad)).rejects.toMatchObject({
+        cause: { constraint_name: "org_profile_time_zone_shape" },
+      });
+    }
+    // EVERY zone the platform lists, plus the default, against the CHECK's own
+    // predicate -- so a regex tightened by one character cannot make a value the
+    // picker offers unstorable. One round trip rather than 419.
+    const all = [DEFAULT_TIME_ZONE, ...Intl.supportedValuesOf("timeZone")];
+    expect(all.length).toBeGreaterThan(100);
+    // ONE TEXT PARAMETER SPLIT IN THE DATABASE, not a JS array bound directly:
+    // drizzle turns an array parameter into a record tuple, and `unnest` then
+    // fails with "cannot cast type record to text[]". No zone name contains a
+    // comma, and the count below would fall short if one ever did.
+    const [ok] = await handle.db.execute<{ n: number }>(sql`
+      SELECT count(*)::int AS n FROM unnest(string_to_array(${all.join(",")}, ',')) AS z
+      WHERE z ~ '^[A-Za-z][A-Za-z0-9_+/-]*$' AND char_length(z) <= 64
+    `);
+    expect(ok?.n).toBe(all.length);
   });
 });

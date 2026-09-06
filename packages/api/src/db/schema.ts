@@ -884,9 +884,45 @@ export const orgProfile = pgTable("org_profile", {
   // render rather than fetch anything, but a column that can only hold what
   // the page can print is worth more than a comment saying so.
   logoDataUri: text("logo_data_uri").notNull().default(""),
+  // THE ORGANISATION'S CLOCK -- the whole of v1.8.0's answer to "Conduit stores no
+  // timezone anywhere", which is what Phase 9 Task 2 reported when the meeting
+  // summary had to print `13:30 UTC` for a meeting the operator held at 15:30.
+  //
+  // ONE COLUMN, ON THE ISSUER, AND NOT ON `users`. A document is printed by the
+  // organisation and sent outward: two people in one Conduit issuing summaries of
+  // the same meeting must produce the same page, which a per-user zone could not
+  // promise. (A per-user zone is a separate and defensible thing for the SCREEN;
+  // the rail already has it, from the browser, for free.)
+  //
+  // '' IS NOT THE ABSENCE HERE, which is where this column differs from every text
+  // field above it. Those are optional on a printed page and the seeded template
+  // wraps each in a conditional; there is no such thing as formatting an instant
+  // in no zone, so the default is a real value.
+  //
+  // 'UTC' RATHER THAN THE SERVER'S ZONE, and 0018 backfills the same. It is the
+  // only value that leaves an existing install's documents printing exactly what
+  // they printed before -- `formatDocumentInstant` with this zone emits the v1.7.x
+  // string byte for byte. See DEFAULT_TIME_ZONE in @conduit/shared, which this
+  // literal duplicates because schema.ts imports nothing from that package (it is
+  // read by drizzle-kit outside the workspace's resolution); schema.test.ts asserts
+  // the two are the same string, which is the codebase's usual answer to a
+  // duplicated constant.
+  //
+  // THE CHECK IS A SHAPE AND CANNOT BE MORE. PostgreSQL has no tzdata opinion a
+  // `text` column can consult, so "is this a real zone" is answered by
+  // `timeZoneProblem` in the service, with this as the backstop -- the standing
+  // Zod-is-the-gate split. What it CAN do is refuse the two shapes that are wrong
+  // by inspection: nothing at all, and a fixed offset (`+02:00`), which `Intl`
+  // accepts and which cannot observe daylight saving. Anchored to a leading letter
+  // rather than listing the sign characters, so an offset in any spelling is out.
+  timeZone: text("time_zone").notNull().default("UTC"),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
   check("org_profile_singleton", sql`id = 1`),
+  check(
+    "org_profile_time_zone_shape",
+    sql`${t.timeZone} ~ '^[A-Za-z][A-Za-z0-9_+/-]*$' AND char_length(${t.timeZone}) <= 64`,
+  ),
   check("org_profile_logo_size", sql`char_length(${t.logoDataUri}) <= 409623`),
   // THE `\073` IS A SEMICOLON, AND IT HAS TO BE ONE. drizzle-kit's generator
   // splits a CHECK expression on `;` without regard for string literals, so

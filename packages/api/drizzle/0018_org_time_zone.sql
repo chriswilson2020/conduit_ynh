@@ -1,0 +1,58 @@
+-- THE ORGANISATION GETS A CLOCK.
+--
+-- Phase 9's third task, and the smallest migration in the phase: one column and
+-- one CHECK. Task 2 reported that Conduit stores no timezone anywhere -- not on
+-- `org_profile`, not on `users`, and not in any request -- so a document rendered
+-- on the server could not reproduce the wall clock the operator saw and printed
+-- `1 September 2026 at 13:30 UTC` for a meeting held at half past three in
+-- Amsterdam. This is the field that answers it, added before Tasks 3 and 4 rather
+-- than after them, because those add three more types that print dates.
+--
+-- 'UTC' IS THE BACKFILL AND IT IS A DECISION, NOT A DEFAULT'S SIDE EFFECT.
+-- `org_profile` has exactly one row on any install that has ever opened Settings,
+-- and Chris's has one. The ADD COLUMN's DEFAULT is what fills it, and UTC is the
+-- only value that leaves every already-issued document rendering to the same
+-- bytes: `formatDocumentInstant` with this zone emits the v1.7.x string verbatim,
+-- trailing "UTC" and all, because en-GB's short zone name for UTC is "UTC".
+-- Rejected: reading the SERVER's zone at migration time (Etc/UTC on the YunoHost
+-- box, so no better there, and elsewhere the zone of a machine in a datacentre,
+-- which is not evidence about where the operator sits) and leaving it NULL for
+-- the code to guess later (a nullable column whose absence means "UTC" is the
+-- same decision spelled so that every reader has to know it).
+--
+-- NO TABLE REWRITE. PostgreSQL 11+ stores the default in the catalogue and
+-- materialises it on read, so this is metadata-only on a one-row table either
+-- way. The CHECK that follows validates that one row under ACCESS EXCLUSIVE;
+-- 0013's header has the general argument about migrations running before the
+-- server listens and it applies here unchanged.
+--
+-- THE ROLLBACK IS FREE, which is not something the other two migrations in this
+-- phase could say. v1.7.x never selects this column, so a database carrying it is
+-- one the previous release reads without noticing. Nothing depends on it existing
+-- except the code that formats a date.
+--
+-- WHAT THE CHECK CAN AND CANNOT DO. It is a SHAPE and nothing more: PostgreSQL
+-- has no tzdata to consult, so "is this a real zone" is `timeZoneProblem`'s
+-- question and this is the backstop -- the standing "Zod is the gate, the CHECK
+-- is the backstop" split (see org_profile_logo_size for the same pairing on the
+-- logo). What a shape CAN refuse is the two values that are wrong by inspection:
+-- the empty string, which is a legitimate absence for every other column on this
+-- table and is not one here, and a fixed offset such as '+02:00' -- which `Intl`
+-- accepts, which cannot know when daylight saving starts, and which would
+-- therefore print an hour out for half the year with a plausible label beside it.
+-- Anchoring to a leading LETTER refuses an offset in any spelling rather than
+-- listing the signs. The length bound matches MAX_TIME_ZONE_LENGTH against a
+-- longest real name of 30 characters (America/Argentina/Rio_Gallegos).
+--
+-- GENERATED AND THEN CORRECTED, and the correction is the one this phase keeps
+-- having to make. `drizzle-kit generate` produced the two statements below
+-- unchanged -- they are right this time, unlike 0016's data-destroying rewrite and
+-- 0017's out-of-order foreign key -- but it stamped the journal `when` as
+-- 1788674737914, which falls between 0013's 1788600000000 and 0014's
+-- 1788700000000. drizzle applies a migration only when the newest applied row's
+-- created_at is BELOW it, so 0018 would have been skipped, silently and without
+-- error, on every install that already has 0014. That is the third time in three
+-- migrations. Hand-set to 1789100000000; schema.test.ts pins the whole journal as
+-- strictly increasing.
+ALTER TABLE "org_profile" ADD COLUMN "time_zone" text DEFAULT 'UTC' NOT NULL;--> statement-breakpoint
+ALTER TABLE "org_profile" ADD CONSTRAINT "org_profile_time_zone_shape" CHECK ("org_profile"."time_zone" ~ '^[A-Za-z][A-Za-z0-9_+/-]*$' AND char_length("org_profile"."time_zone") <= 64);
