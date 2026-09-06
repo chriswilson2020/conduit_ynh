@@ -356,17 +356,23 @@ export async function listTimeEntries(
   };
 }
 
-// NO SUM FUNCTION HERE, AND THE ABSENCE IS FOR TASK 4 TO READ.
+// NO SUM FUNCTION HERE, AND IT IS services/timesheet.ts (Task 2).
 //
 // A first draft of this file exported `sumTimeEntryMinutes` -- one query
 // returning the total and the billable total for the same filters. It was
-// removed unshipped, because nothing in this task reads it and a function with
-// no reader is the same cost as an index with none (0017/0019/0020's rule).
+// removed unshipped, because nothing in Task 1 read it and a function with no
+// reader is the same cost as an index with none (0017/0019/0020's rule).
 //
-// WHAT IT WAS GUARDING AGAINST IS REAL, THOUGH, so the warning is left where the
-// next author will be standing: the week's total MUST be summed in SQL over the
-// same filters as the list, not added up over a page. `listTimeEntries` caps at
+// THE WARNING IT LEFT HAS BEEN ANSWERED RATHER THAN INHERITED. The week's total
+// MUST be summed in SQL, not added up over a page: `listTimeEntries` caps at
 // MAX_LIMIT, so a JavaScript sum over `items` is correct until somebody logs 101
-// entries in a week and then is silently SHORT -- which is this phase's own
-// failure mode, arriving through the one number the phase exists to produce.
-// COALESCE it, too: SUM over no rows is NULL, and an empty week is 0 hours.
+// entries in a week and then is silently SHORT -- this phase's own failure mode,
+// arriving through the one number the phase exists to produce. And COALESCE it,
+// because SUM over no rows is NULL while an empty week is 0 hours. Both are done
+// in `timesheetTotals`, and a test there logs 101 entries and asks the list for
+// five hundred to prove the cap is real.
+//
+// IT LIVES IN A THIRD MODULE BECAUSE IT READS TWO TABLES AND BELONGS TO NEITHER:
+// the timesheet sums these minutes together with `meetings.duration_minutes`,
+// which has held tracked time since Phase 5 and was never aggregated until
+// v1.9.0. A function here would make this file import `meetings`.

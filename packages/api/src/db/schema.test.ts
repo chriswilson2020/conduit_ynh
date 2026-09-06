@@ -4362,10 +4362,14 @@ describe("time entries (0021)", () => {
    * `undefined_column`), which is a refusal no constraint can be dropped to get
    * around.
    *
-   * TASK 2 OWNS THE DECISION, and this test is here so that task starts from
-   * what is standing rather than from an empty column it then has to forbid. If
-   * Task 2 adds the column for the sake of a nameable error message, this test
-   * is what will tell it that it has traded impossible for illegal.
+   * **TASK 2 CONFIRMED IT AND ADDED NOTHING.** The plan told that task to make
+   * the refusal "a CHECK, not a convention"; a CHECK needs a column to name, so
+   * following it literally would have made the impossible merely illegal. What
+   * Task 2 built instead is services/timesheet.ts, which sums the two tables
+   * together and closes the INDIRECT routes this absence does not close -- a
+   * join that fans a meeting out over its attendees or its links, a meeting in
+   * two buckets, an archived row still contributing. This test stays as the
+   * guard on the direct one.
    */
   it("cannot express a time entry that names a meeting, because there is no column to name one with", async () => {
     const company = await createCompany(handle.db, userId, { name: "Acme" });

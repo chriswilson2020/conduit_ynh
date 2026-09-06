@@ -736,6 +736,34 @@ export const meetings = pgTable("meetings", {
   occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
   // NULL is honest, not missing data: not every logged meeting has a known
   // length (spec's data model).
+  //
+  // **SINCE v1.9.0 THIS COLUMN IS SUMMED**, by services/timesheet.ts, which is
+  // Phase 10's decision that the timesheet reads meetings and time entries
+  // together -- a logged meeting with a duration is a recorded hour, and it had
+  // held one since Phase 5 with nothing ever adding it up. Two consequences
+  // that are decisions rather than side effects:
+  //
+  //   THE NULL IS STILL NOT A ZERO, AND IS REPORTED AS ITSELF. The timesheet
+  //   answers a count of meetings with no recorded length beside its total,
+  //   because a report that silently treats "unknown" as "none" is the spec's
+  //   own named failure. That count is in the operator's sentence
+  //   (`timesheetSummary`), not merely in the payload.
+  //
+  //   **THERE IS STILL NO CHECK ON THE VALUE, AND THE REASON HAS CHANGED.** The
+  //   old reason was "nothing sums it", which this release made false;
+  //   time_entries.minutes cites that contrast and has been corrected too. The
+  //   reason now is that a meeting has no definitional bound to CHECK against.
+  //   `time_entries.minutes <= 1440` follows from `work_date` being one day; a
+  //   meeting's `occurred_at` is a START, and an offsite logged as one meeting
+  //   can legitimately run longer than a day. A 1440 here would refuse a true
+  //   row to catch a mistyped one, and it would not catch the mistype that
+  //   actually happens (60 typed as 600 passes any bound this column could
+  //   carry). WHAT IS GENUINELY EXPOSED is that the zod shape has no upper bound
+  //   either -- `z.number().int().positive()` accepts 999999999, which is now a
+  //   number that can dominate a week's total. Adding a max to `meetingSchema`
+  //   would make the CLIENT refuse to parse any meeting already carrying such a
+  //   value, turning a silly figure into a broken page, so it is written down
+  //   here and in the plan rather than changed in passing.
   durationMinutes: integer("duration_minutes"),
   // Rich-text HTML, sanitized on write by services/meetings.ts (Task 2)
   // through the system's ONE shared sanitizer profile -- sanitizeMailHtml in
@@ -1662,10 +1690,15 @@ export type DocumentTemplateRow = typeof documentTemplates.$inferSelect;
 // for that to be impossible rather than discouraged. There is no meeting_id
 // column here, so an INSERT naming one does not violate a CHECK, it fails to
 // parse against the table at all (42703, "column meeting_id does not exist").
-// That is Task 2's decision to confirm rather than this task's to make; it is
-// recorded here so that task starts from "the strongest form of the refusal is
-// already standing" rather than from "add a column and then forbid it", which
-// would make the impossible merely illegal.
+//
+// **TASK 2 CONFIRMED IT AND ADDED NOTHING**, which is the outcome this note was
+// written for. The plan's instruction to Task 2 was "a CHECK, not a convention";
+// a CHECK needs a column to name, and adding one so that an error message could
+// name it would have traded impossible for illegal. What Task 2 built instead is
+// services/timesheet.ts, whose header enumerates the INDIRECT routes to a double
+// count that the absent column does not close -- a join that fans a meeting out
+// over its attendees or its links, a meeting counted in two buckets, and an
+// archived row still contributing -- and closes each of them with a test.
 export const timeEntries = pgTable("time_entries", {
   id: uuid("id").primaryKey().defaultRandom(),
   // THE DAY, NOT AN INSTANT. `date`, like tasks.start_date and
@@ -1733,12 +1766,19 @@ export const timeEntries = pgTable("time_entries", {
     "time_entries_has_link",
     sql`num_nonnulls(company_id, contact_id, deal_id, project_id, task_id) >= 1`,
   ),
-  // BELT AND BRACES, unlike meetings.duration_minutes, whose bound is zod-only
-  // by an explicit decision recorded on that column. The difference is what
-  // this column is FOR: nothing sums a meeting's duration, and this number IS
-  // the week's total, so a value no report could explain is precisely the
-  // silent wrongness the link CHECK above exists to prevent, arriving through
-  // the other field.
+  // BELT AND BRACES, unlike meetings.duration_minutes, which carries no bound in
+  // the database at all.
+  //
+  // **THE CONTRAST IS NO LONGER "NOTHING SUMS A MEETING'S DURATION".** That was
+  // the reason when this was written and v1.9.0's timesheet made it false: both
+  // columns are now summed, by services/timesheet.ts, into one number. What
+  // still differs is that THIS column has a definitional bound and that one has
+  // not. An entry is a quantity of work attributed to a calendar date and no
+  // date holds more than 24 hours, so 1440 follows from what the row IS. A
+  // meeting's `occurred_at` is a start instant, and an offsite logged as one
+  // meeting can honestly run longer than a day -- so the same number there would
+  // refuse a true row, and would still not catch the mistype that happens (60
+  // typed as 600 passes any bound). See that column for the exposure this leaves.
   //
   // The upper bound is one DAY because work_date is one day, and it is
   // MAX_TIME_ENTRY_MINUTES in @conduit/shared spelled a second time;

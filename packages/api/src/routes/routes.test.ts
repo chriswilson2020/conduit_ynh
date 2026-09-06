@@ -10,6 +10,7 @@ import {
   pipelineSchema, pipelineWithStagesSchema, stageSchema, dealSchema, funnelRowSchema,
   projectSchema, taskSchema, taskDependencySchema, shiftResultSchema, ganttPayloadSchema,
   meetingSchema, meetingDetailSchema, meetingSummarySchema, timeEntrySchema,
+  timesheetSummary, timesheetTotalsSchema,
   documentSchema, orgProfileSchema,
   agreementSchema, letterSchema, recordDocumentSchema, statusReportSchema,
   documentTemplateSchema, CONTACT_FIELD_CAPS, DEFAULT_TIME_ZONE,
@@ -2257,6 +2258,121 @@ describe("time entries routes", () => {
       expect(response.statusCode).toBe(401);
       expect(errorResponseSchema.parse(response.json()).error).toBe("unauthenticated");
     }
+    await a.close();
+  });
+});
+
+/**
+ * **THE TIMESHEET'S TOTALS OVER HTTP (Phase 10 Task 2).** The one endpoint that
+ * reads meetings and time entries together. Task 4's page renders what this
+ * answers and computes none of it.
+ */
+describe("timesheet route", () => {
+  /**
+   * **DATES RELATIVE TO THE SERVER'S OWN CLOCK, AND THIS IS THE ONE PLACE THEY
+   * HAVE TO BE.** `timesheetTotals` takes `now` and the service tests pin it, but
+   * the ROUTE deliberately does not offer a test override -- a report whose "has
+   * this meeting happened yet" could be told what time it is from a querystring
+   * would be a report that could be asked the wrong question. So the fixture
+   * moves instead: a hard-coded meeting date would sit in the future today and in
+   * the past next week, and this test would silently change what it proves.
+   * Caught by exactly that -- the first draft used 2026-09-08 and both meetings
+   * came back as not-yet-happened.
+   */
+  const today = todayDateOnly();
+  const yesterday = addDays(today, -1);
+
+  async function seedWeek(a: Awaited<ReturnType<typeof app>>): Promise<void> {
+    const project = projectSchema.parse((await a.inject({
+      method: "POST", url: "/api/projects", headers: authHeaders, payload: { name: "Rollout" },
+    })).json());
+    for (const payload of [
+      { workDate: yesterday, minutes: 120, billable: true, projectId: project.id },
+      { workDate: today, minutes: 45, billable: false, projectId: project.id },
+    ]) {
+      const created = await a.inject({
+        method: "POST", url: "/api/time-entries", headers: authHeaders, payload,
+      });
+      expect(created.statusCode, created.body).toBe(201);
+    }
+    for (const payload of [
+      // Counted: it has a duration and it is in the past.
+      { title: "Kickoff", occurredAt: `${yesterday}T09:00:00.000Z`, durationMinutes: 60, projectId: project.id },
+      // Unmeasured: nobody recorded how long it ran.
+      { title: "Corridor", occurredAt: `${yesterday}T15:00:00.000Z`, durationMinutes: null, projectId: project.id },
+    ]) {
+      const created = await a.inject({
+        method: "POST", url: "/api/meetings", headers: authHeaders, payload,
+      });
+      expect(created.statusCode, created.body).toBe(201);
+    }
+  }
+
+  it("answers a contract-shaped total over entries and meetings together", async () => {
+    const a = await app();
+    await seedWeek(a);
+    const response = await a.inject({
+      method: "GET", url: `/api/timesheet?from=${yesterday}&to=${today}`, headers: authHeaders,
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    // Parsed, which is where the invariants bite: the schema refuses a total that
+    // is not its own halves and meeting buckets that do not account for the
+    // range, so this is not merely a shape assertion.
+    const totals = timesheetTotalsSchema.parse(response.json());
+    expect(totals).toMatchObject({
+      from: yesterday, to: today, timeZone: DEFAULT_TIME_ZONE,
+      entryMinutes: 165, entryCount: 2,
+      meetingMinutes: 60, meetingsCounted: 1, meetingsUnmeasured: 1, meetingsNotYetOccurred: 0,
+      meetingsInRange: 2, countedMinutes: 225,
+    });
+    // The operator's sentence names the meeting nobody timed, in the same string
+    // as the figure -- which is the whole reason it is one string.
+    expect(timesheetSummary(totals))
+      .toBe(`3h 45m counted from ${yesterday} to ${today}: 2h 45m across 2 entries, `
+        + "and 1h across 1 meeting. Not counted: 1 meeting with no recorded length.");
+    await a.close();
+  });
+
+  /** Both bounds are required: a total over every hour ever logged is a different
+   * question from "where did the week go", and a caller that forgot the range
+   * would get the second answer looking like the first. */
+  it("400s a range with a missing, malformed or backwards bound", async () => {
+    const a = await app();
+    for (const query of [
+      "", "?from=2026-09-07", "?to=2026-09-13",
+      "?from=2026-09&to=2026-09-13",
+      "?from=2026-09-07T00:00:00.000Z&to=2026-09-13",
+      // Backwards: answered with zeroes it would look exactly like a quiet week.
+      "?from=2026-09-13&to=2026-09-07",
+    ]) {
+      const response = await a.inject({
+        method: "GET", url: `/api/timesheet${query}`, headers: authHeaders,
+      });
+      expect(response.statusCode, query).toBe(400);
+      expect(errorResponseSchema.parse(response.json()).error).toBe("validation");
+    }
+    await a.close();
+  });
+
+  it("answers an empty week with zero rather than with nothing", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "GET", url: `/api/timesheet?from=${yesterday}&to=${today}`, headers: authHeaders,
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    const totals = timesheetTotalsSchema.parse(response.json());
+    expect(totals.countedMinutes).toBe(0);
+    expect(timesheetSummary(totals)).toContain("0m counted");
+    await a.close();
+  });
+
+  it("returns 401 without an identity header", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "GET", url: `/api/timesheet?from=${yesterday}&to=${today}`,
+    });
+    expect(response.statusCode).toBe(401);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("unauthenticated");
     await a.close();
   });
 });
