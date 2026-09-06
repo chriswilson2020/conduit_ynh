@@ -217,7 +217,13 @@ function wireFile(seed: Seed, companyId: string) {
     sizeBytes: 1024,
     sha256: "0".repeat(64),
     uploaderUserId: ACTOR_ID,
-    companyId, contactId: null, dealId: null, projectId: null,
+    // FIVE PARENTS SINCE PHASE 9, not four: `files_exactly_one_entity` gained
+    // meeting_id so a rendered meeting summary can live on its meeting, and
+    // `fileMetaSchema` gained the field with it. This stub IS the wire shape, so
+    // omitting it makes `parseWith` throw and the Files tab render nothing --
+    // which is exactly how CI reported the widening, as two rail-live tests
+    // finding zero file rows.
+    companyId, contactId: null, dealId: null, projectId: null, meetingId: null,
     createdAt: seed.at,
   };
 }
