@@ -60,7 +60,27 @@ export function RecordDocumentsSection({
   defaultRecipientSalutation: string;
   defaultRecipientAddress: string;
 }) {
-  const { data: documents = [], isLoading, error } = useRecordDocuments(target);
+  /*
+   * **THE ROLLUP TASK 3 RECOMMENDED, AS A SWITCH ON THE VIEW.** Its finding: "A
+   * letter to Jane at Acme is raised on JANE, so it does not appear on ACME's
+   * Documents list... For CORRESPONDENCE it is real friction -- six months later,
+   * somebody opening Acme's record sees no letters, because every letter went to
+   * a person. THE RECOMMENDATION IS A READ, NOT A COLUMN."
+   *
+   * OFF BY DEFAULT, so the page still shows what the data model says: this
+   * company's own documents. Turning it on asks a wider question and the label
+   * says which. Chris's "a document belongs to exactly one thing" is untouched --
+   * no second owner column, no widened CHECK -- and reversing the default later
+   * is one line here rather than a migration.
+   *
+   * COMPANY ONLY. A contact has no contacts, so there is nothing to roll up and
+   * the control would be a switch that did nothing.
+   */
+  const [includeContacts, setIncludeContacts] = useState(false);
+  const rollupAvailable = "companyId" in target;
+  const { data: documents = [], isLoading, error } = useRecordDocuments(
+    target, rollupAvailable && includeContacts,
+  );
   const [open, setOpen] = useState<"letter" | "nda" | "mutual_nda" | null>(null);
   const [redrafting, setRedrafting] = useState<LetterRecord | null>(null);
 
@@ -169,6 +189,21 @@ export function RecordDocumentsSection({
           <p className="mb-2 text-xs text-slate-500">
             Unarchive this record to write a letter or raise an agreement.
           </p>
+        )}
+        {rollupAvailable && (
+          // A `<label>` WRAPPING THE INPUT, so the words are the hit target too
+          // -- a bare checkbox is 13px square and below every touch floor this
+          // codebase measures against.
+          <label className="mb-2 flex items-center gap-2 text-xs text-slate-500 max-md:min-h-11">
+            <input
+              type="checkbox"
+              data-testid="record-documents-include-contacts"
+              checked={includeContacts}
+              onChange={(event) => setIncludeContacts(event.target.checked)}
+              className="h-4 w-4"
+            />
+            Include documents raised on this company&apos;s contacts
+          </label>
         )}
         {isLoading && <p className="text-sm text-slate-400">Loading...</p>}
         {error && (

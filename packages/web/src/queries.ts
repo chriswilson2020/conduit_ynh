@@ -45,6 +45,7 @@ import {
   searchResultsSchema,
   shiftResultSchema,
   stageSchema,
+  statusReportSchema,
   taskDependencySchema,
   taskSchema,
   usersResponseSchema,
@@ -106,6 +107,7 @@ import {
   type SendMailInput,
   type ShiftResult,
   type Stage,
+  type StatusReportRecord,
   type Task,
   type TaskStatus,
   type UpdateCompanyInput,
@@ -2169,6 +2171,58 @@ export function useIssueMeetingSummary() {
   });
 }
 
+const statusReportListSchema = statusReportSchema.array();
+
+/**
+ * The status reports produced for one project, newest first.
+ *
+ * `useMeetingSummaries`' twin, and a third key rather than a widening of either
+ * of the other two for its reason: the route returns a shape of its own -- no
+ * money, no lines, no letter body -- so pooling it under an existing key would
+ * put two shapes in one cache entry and leave the parse guessing which.
+ */
+export function useProjectDocuments(projectId: string) {
+  return useQuery({
+    queryKey: ["project-documents", projectId],
+    queryFn: async () => parseWith(
+      statusReportListSchema,
+      await getJson<unknown>(`/projects/${projectId}/documents`),
+      "status reports",
+    ),
+    enabled: projectId !== "",
+  });
+}
+
+/**
+ * Produce the status report of a project. NO INPUT, for `useIssueMeetingSummary`'s
+ * reason and one more of its own: everything printed is on the project and its
+ * tasks, and the date range the spec floated turned out not to be a thing this
+ * type can usefully have (see the API's `issueStatusReport`).
+ *
+ * INVALIDATES FILES AND EVENTS FOR useIssueQuote's REASON: a report writes a
+ * `files` row against the project and stamps a `file_attached` entry, so the
+ * rail's Files and Timeline tabs are stale the instant this returns.
+ *
+ * NOTHING STOPS A SECOND CALL, which is the per-type freezing rule showing
+ * through again -- and for this type regenerating is not merely permitted, it is
+ * the intended use.
+ */
+export function useIssueStatusReport() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (projectId: string) => parseWith(
+      statusReportSchema,
+      await postJson<unknown>(`/projects/${projectId}/documents`, {}),
+      "status report",
+    ),
+    onSuccess: (_document: StatusReportRecord, projectId) => {
+      void queryClient.invalidateQueries({ queryKey: ["project-documents", projectId] });
+      void queryClient.invalidateQueries({ queryKey: ["files"] });
+      void queryClient.invalidateQueries({ queryKey: ["events"] });
+    },
+  });
+}
+
 const recordDocumentListSchema = recordDocumentSchema.array();
 
 /**
@@ -2178,10 +2232,14 @@ const recordDocumentListSchema = recordDocumentSchema.array();
  */
 export type DocumentRecordTarget = { companyId: string } | { contactId: string };
 
-function targetPath(target: DocumentRecordTarget): string {
-  return "companyId" in target
-    ? `/companies/${target.companyId}/documents`
-    : `/contacts/${target.contactId}/documents`;
+function targetPath(target: DocumentRecordTarget, includeContacts = false): string {
+  if ("contactId" in target) return `/contacts/${target.contactId}/documents`;
+  // THE ROLLUP IS A QUERY PARAMETER AND IT IS ONLY EVER SENT WHEN IT IS ON, so
+  // the ordinary request is byte for byte the one this route has always
+  // received. See the API route for why the server tests for the literal
+  // "true" rather than coercing.
+  const base = `/companies/${target.companyId}/documents`;
+  return includeContacts ? `${base}?includeContacts=true` : base;
 }
 
 function targetKey(target: DocumentRecordTarget): string {
@@ -2201,12 +2259,22 @@ function targetKey(target: DocumentRecordTarget): string {
  * that already mixes them, so the guessing is `type`'s job and the parser does
  * it.
  */
-export function useRecordDocuments(target: DocumentRecordTarget) {
+export function useRecordDocuments(target: DocumentRecordTarget, includeContacts = false) {
   const id = targetKey(target);
   return useQuery({
-    queryKey: ["record-documents", id],
+    // **THE FLAG IS PART OF THE KEY, WHICH IS NOT OPTIONAL.** The two requests
+    // return different lists from the same route, so a shared key would serve
+    // the rolled-up list to the plain view and back again on every toggle --
+    // with the wrong one showing until the refetch landed. It also means
+    // flipping the switch twice is instant rather than two more round trips.
+    //
+    // The INVALIDATION key stays `["record-documents", id]`, which is a prefix
+    // of both, so a new document still refreshes whichever view is open.
+    queryKey: ["record-documents", id, includeContacts],
     queryFn: async () => parseWith(
-      recordDocumentListSchema, await getJson<unknown>(targetPath(target)), "documents list",
+      recordDocumentListSchema,
+      await getJson<unknown>(targetPath(target, includeContacts)),
+      "documents list",
     ),
     enabled: id !== "",
   });

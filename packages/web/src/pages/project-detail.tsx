@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import type { FormEvent } from "react";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
+import { PROJECT_STATUS_LABEL } from "@conduit/shared";
 import type { ProjectStatus, UpdateProjectInput } from "@conduit/shared";
 import { ApiError } from "../api";
 import {
@@ -9,13 +10,17 @@ import {
 } from "../queries";
 import { FieldCard, type FieldCardField } from "../components/field-card";
 import { OwnerSelect } from "../components/owner-select";
+import { ProjectDocumentsSection } from "../components/project-documents";
 import { Rail } from "../components/rail/rail";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "../components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select";
 
-const STATUS_LABEL: Record<ProjectStatus, string> = { active: "Active", completed: "Completed" };
+// IN @conduit/shared SINCE PHASE 9 TASK 4, because the status report prints
+// these same two words into a PDF from the server. Aliased rather than renamed
+// at every use so the diff that moved it is the move and nothing else.
+const STATUS_LABEL = PROJECT_STATUS_LABEL;
 const DEFAULT_COLOR = "#64748b";
 
 function buildProjectPatch(name: string, value: string): UpdateProjectInput {
@@ -400,6 +405,12 @@ export function ProjectDetailPage() {
             )}
           </ul>
         </section>
+
+        {/* AFTER Tasks AND Pipelines, because a status report is ABOUT both of
+            them: a reader who wants to know what the report will say is looking
+            at the two sections above it. The deal's Documents section sits last
+            on its page for the same reason. */}
+        <ProjectDocumentsSection projectId={project.id} archived={archived} />
       </div>
       <aside className="min-w-0 lg:w-1/3">
         <Rail projectId={projectId} />

@@ -3,6 +3,7 @@ import type { FormEvent, MouseEvent as ReactMouseEvent, RefObject } from "react"
 import { DndContext, DragOverlay } from "@dnd-kit/core";
 import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
+import { TASK_STATUS_LABEL } from "@conduit/shared";
 import type { Task, TaskStatus, TaskType } from "@conduit/shared";
 import { useBoardMoveTask, useCreateTask, useProject, useSetTaskStatus, useTasks, useUsers } from "../queries";
 import { Button } from "../components/ui/button";
@@ -21,9 +22,13 @@ import { todayLocalIso, userLabel } from "../lib";
 // badges rather than redefining them, so a status/type's wording only ever
 // lives in one place.
 export const STATUSES: TaskStatus[] = ["todo", "in_progress", "blocked", "done"];
-export const STATUS_LABEL: Record<TaskStatus, string> = {
-  todo: "To do", in_progress: "In progress", blocked: "Blocked", done: "Done",
-};
+// **THE WORDING ITSELF MOVED TO @conduit/shared IN PHASE 9 TASK 4**, and the
+// comment above is why: "so a status/type's wording only ever lives in one
+// place". The project status report is the fourth reader and the first outside a
+// browser -- it prints these words into a PDF, from the server -- so "one place"
+// had to stop meaning "one place in packages/web". Re-exported under the old
+// name so nothing that imported `STATUS_LABEL` from here had to change.
+export const STATUS_LABEL: Record<TaskStatus, string> = TASK_STATUS_LABEL;
 export const TYPE_BADGE: Record<TaskType, string> = { task: "T", call: "C", meeting: "M", email: "E", deadline: "D" };
 export const TYPE_LABEL: Record<TaskType, string> = {
   task: "Task", call: "Call", meeting: "Meeting", email: "Email", deadline: "Deadline",

@@ -26,7 +26,17 @@ export function SettingsTemplatesPage() {
   return (
     <SettingsLayout title="Templates">
       <div className="flex flex-col gap-3">
-        <div className="flex gap-2" role="tablist" aria-label="Document type">
+        {/*
+          `flex-wrap` SINCE THE SIXTH TAB. Six labels -- Quote, Meeting summary,
+          Letter, NDA, Mutual NDA, Status report -- are wider than a phone, and
+          this strip is not the record rail's: it has no `overflow-x-auto`, so
+          without wrapping it would push `main` sideways rather than scrolling
+          inside itself. Settings is not in e2e/mobile.spec.ts's 320px overflow
+          sweep (that sweeps the contact and deal pages), so this is reasoned
+          rather than measured -- and it was already the wrong shape at five
+          tabs, which is why the fix is the wrap and not one fewer word.
+        */}
+        <div className="flex flex-wrap gap-2" role="tablist" aria-label="Document type">
           {documentTypeSchema.options.map((option) => (
             <Button
               key={option}
@@ -204,6 +214,50 @@ const TEMPLATE_HELP: Record<DocumentType, TemplateHelp> = {
       + " the one-way version only in wording: the obligations bind each party in respect"
       + " of the other." + AGREEMENT_CAVEAT,
     fields: AGREEMENT_FIELDS,
+  },
+  project_status_report: {
+    label: "Status report",
+    blurb: "The HTML a project status report is rendered from. Everything on it comes"
+      + " from the project, its tasks and their dependencies; there is no form to fill"
+      + " in, and it is produced again whenever you want a fresh one.",
+    fields: [
+      ...ORG_FIELDS,
+      ["document.projectName", "The project's name"],
+      ["document.projectStatus", "Active or Completed"],
+      ["document.company", "The client the project is for, or empty"],
+      ["document.owner", "Who owns the project, or empty"],
+      ["document.startDate", "The project's start date, or empty"],
+      ["document.dueDate", "The project's due date, or empty"],
+      ["document.issueDate", "The day the report was produced"],
+      // THE SEVEN COUNTS. Listed one by one rather than described as a group,
+      // because the field list is what somebody building their own template reads
+      // instead of the source -- and two of them are not derivable from the other
+      // five. `overdueCount` carries a rule (due strictly before today, and not
+      // done) and `undatedCount` carries another (no due date at all), so their
+      // descriptions say what they mean rather than what they are called.
+      ["document.taskCount", "How many tasks the report lists"],
+      ["document.doneCount", "How many are done"],
+      ["document.inProgressCount", "How many are in progress"],
+      ["document.blockedCount", "How many are blocked"],
+      ["document.todoCount", "How many are still to do"],
+      ["document.overdueCount", "How many are past their due date and not done"],
+      ["document.undatedCount", "How many have no dates at all"],
+    ],
+    collection: {
+      title: "Inside a task block",
+      note: "Wrap a row in {{#tasks}} ... {{/tasks}} and it repeats once per task, in the"
+        + " order the Gantt draws them. {{#after}} ... {{/after}} inside that block prints"
+        + " only for a task that waits on another.",
+      fields: [
+        ["title", "The task's title"],
+        ["status", "To do, In progress, Blocked or Done"],
+        ["startDate", "Its start date, or empty"],
+        ["dueDate", "Its due date, or empty"],
+        ["progress", "Its progress, e.g. 40%, or empty"],
+        ["assignee", "Who it is assigned to, or empty"],
+        ["after", "The tasks it waits on, comma-separated, or empty"],
+      ],
+    },
   },
 };
 
