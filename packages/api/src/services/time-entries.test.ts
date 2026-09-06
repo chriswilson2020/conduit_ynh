@@ -493,6 +493,112 @@ describe("time entries archive", () => {
   });
 });
 
+/**
+ * **THE TASK KEY (v1.9.0), WHICH IS THE RIPPLE TASK 3'S ESTIMATE PRODUCED.**
+ *
+ * `GET /api/tasks/:id/effort` answers a booked figure whose ONLY source is a
+ * write in this file, and until v1.9.0 nothing on a task surface listened to
+ * `["time-entries"]` at all. Without these keys the drawer's
+ * booked-versus-estimated sentence stands still while the hours behind it change
+ * -- one half of a comparison going stale, which is the failure mode this whole
+ * phase is about arriving through a cache.
+ *
+ * `["task", id]` IS THE SAME KEY `publishTaskHint` USES, so TanStack's
+ * prefix-matched invalidation reaches the deeper `["task", id, "effort"]` cache
+ * without a key of its own -- exactly how the drawer's dependency list already
+ * works.
+ */
+describe("time entries: the task an hour was booked to hears about it", () => {
+  async function taskId(): Promise<string> {
+    return (await createTask(handle.db, actorId, { title: "Draft the plan" })).id;
+  }
+
+  it("publishes the task's key when an entry names one, and does not invent one when it does not", async () => {
+    const id = await taskId();
+    const projectId = await seedProject();
+
+    const hints: SseHint[] = [];
+    const stop = subscribe((hint) => hints.push(hint));
+    try {
+      await createTimeEntry(handle.db, actorId, {
+        workDate: "2026-09-08", minutes: 60, billable: true, taskId: id,
+      });
+      expect(hints[0]?.keys).toContainEqual(["task", id]);
+
+      // An entry on a project and no task has no task key to publish -- and a
+      // key for a null id would be one every drawer in the app would refetch on.
+      await createTimeEntry(handle.db, actorId, {
+        workDate: "2026-09-08", minutes: 60, billable: true, projectId,
+      });
+      expect(hints[1]?.keys.map((k) => k[0])).not.toContain("task");
+    } finally {
+      stop();
+    }
+  });
+
+  /**
+   * **RE-LINKING AN ENTRY CHANGES TWO TASKS' TOTALS**, and a drawer open on the
+   * task the hour LEFT is exactly as stale as one open on the task it arrived
+   * at. `publishTaskHint`'s `extraAssigneeIds` shape, one table over.
+   */
+  it("publishes BOTH tasks when an entry is moved from one to the other", async () => {
+    const from = await taskId();
+    const to = await taskId();
+    const entry = await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-08", minutes: 60, billable: true, taskId: from,
+    });
+
+    const hints: SseHint[] = [];
+    const stop = subscribe((hint) => hints.push(hint));
+    try {
+      await updateTimeEntry(handle.db, actorId, entry.id, { taskId: to });
+      const keys = hints[hints.length - 1]?.keys.map((k) => k.join(":")) ?? [];
+      expect(keys).toContain(`task:${from}`);
+      expect(keys).toContain(`task:${to}`);
+    } finally {
+      stop();
+    }
+  });
+
+  it("publishes the task's key when an hour is archived out of its total", async () => {
+    const id = await taskId();
+    const entry = await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-08", minutes: 60, billable: true, taskId: id,
+    });
+
+    const hints: SseHint[] = [];
+    const stop = subscribe((hint) => hints.push(hint));
+    try {
+      await archiveTimeEntry(handle.db, actorId, entry.id);
+      expect(hints[0]?.keys).toContainEqual(["task", id]);
+      await unarchiveTimeEntry(handle.db, actorId, entry.id);
+      expect(hints[1]?.keys).toContainEqual(["task", id]);
+    } finally {
+      stop();
+    }
+  });
+
+  /** One key per task, not one per mention: the ordinary patch names the same
+   * task twice (pre- and post-), and a client asked to refetch the same query
+   * twice is a request nobody needed. */
+  it("names a task once when a patch leaves its link alone", async () => {
+    const id = await taskId();
+    const entry = await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-08", minutes: 60, billable: true, taskId: id,
+    });
+
+    const hints: SseHint[] = [];
+    const stop = subscribe((hint) => hints.push(hint));
+    try {
+      await updateTimeEntry(handle.db, actorId, entry.id, { minutes: 90 });
+      const keys = hints[hints.length - 1]?.keys.filter((k) => k[0] === "task") ?? [];
+      expect(keys).toEqual([["task", id]]);
+    } finally {
+      stop();
+    }
+  });
+});
+
 describe("time entries list", () => {
   /** Entries on consecutive days, oldest first, all on one project. */
   async function seedWeek(projectId: string, days: readonly string[]): Promise<string[]> {

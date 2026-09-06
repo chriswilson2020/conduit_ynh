@@ -1,9 +1,13 @@
 import { describe, it, expect, beforeEach, afterAll } from "vitest";
 import { sql } from "drizzle-orm";
-import { timesheetSummary, timesheetTotalsSchema } from "@conduit/shared";
+import {
+  taskEffortSchema, taskEffortSummary, timesheetSummary, timesheetTotalsSchema,
+} from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
-import { timesheetTotals } from "./timesheet.js";
+import { taskEffort, timesheetTotals } from "./timesheet.js";
+import { createTask, archiveTask } from "./tasks.js";
+import { NotFoundError } from "./errors.js";
 import { createTimeEntry, archiveTimeEntry, listTimeEntries } from "./time-entries.js";
 import { createMeeting, archiveMeeting, updateMeeting, createMeetingTask } from "./meetings.js";
 import { createCompany } from "./companies.js";
@@ -532,5 +536,215 @@ describe("timesheetTotals: the shape it answers with", () => {
   it("refuses a range that is not made of calendar days", async () => {
     await expect(timesheetTotals(handle.db, { from: "2026-09", to: "2026-09-13" }, NOW))
       .rejects.toThrow(/calendar day/);
+  });
+});
+
+/**
+ * **PHASE 10 TASK 3: BOOKED VERSUS ESTIMATED, FOR ONE TASK.**
+ *
+ * The spec's second reading of `schema.ts` was that `tasks` carries no quantity
+ * of work -- "dates and a percentage, never a quantity" -- and that this
+ * comparison could not exist until a column did. `tasks.estimate_minutes` (0022)
+ * is that column; `taskEffort` is the whole of the reading over it.
+ *
+ * WHAT THESE ARE FOR, in the order the task states them:
+ *
+ *   1. The estimate and the booked total come back together, in the unit they
+ *      are compared in, out of ONE aggregate rather than two agreeing queries.
+ *   2. An hour that has left a total has left this one: an archived entry is not
+ *      booked, and archiving is the only way an hour leaves anything in this
+ *      phase.
+ *   3. An estimate on a task nobody has started counts in full, and an estimate
+ *      never reaches the week's total at all.
+ */
+describe("taskEffort: booked versus estimated", () => {
+  async function task(extra: Record<string, unknown> = {}): Promise<string> {
+    return (await createTask(handle.db, actorId, { title: "Draft the plan", ...extra })).id;
+  }
+  async function bookedTo(taskId: string, minutes: number, workDate = "2026-09-08"): Promise<string> {
+    return (await createTimeEntry(handle.db, actorId, {
+      workDate, minutes, billable: true, taskId,
+    })).id;
+  }
+
+  it("answers the estimate and the hours booked against it, in the same unit", async () => {
+    const id = await task({ estimateMinutes: 240 });
+    await bookedTo(id, 60);
+    await bookedTo(id, 30, "2026-09-09");
+
+    const effort = await taskEffort(handle.db, id);
+    expect(effort).toEqual({
+      taskId: id, estimateMinutes: 240, bookedMinutes: 90, entryCount: 2,
+    });
+    // The refine is the guarantee that the sum and the count came out of one
+    // population; the sentence is what a surface renders.
+    expect(taskEffortSchema.parse(effort)).toEqual(effort);
+    expect(taskEffortSummary(effort))
+      .toBe("1h 30m booked across 2 entries, against an estimate of 4h: 2h 30m left.");
+  });
+
+  /**
+   * **NUMBERS, NOT THE STRINGS POSTGRES WOULD OTHERWISE HAND BACK** --
+   * `timesheetTotals`' `::int` argument, at a second aggregate. Uncast,
+   * `bookedMinutes` is the string "90", and `taskEffortSchema` would be the only
+   * thing between it and a page that concatenated it into a comparison.
+   */
+  it("answers numbers, so a comparison is arithmetic and not string concatenation", async () => {
+    const id = await task({ estimateMinutes: 240 });
+    await bookedTo(id, 90);
+    const effort = await taskEffort(handle.db, id);
+    expect(typeof effort.bookedMinutes).toBe("number");
+    expect(typeof effort.entryCount).toBe("number");
+    expect(effort.bookedMinutes + 1).toBe(91);
+  });
+
+  it("answers nought for a task with no entries, not an absent figure", async () => {
+    const effort = await taskEffort(handle.db, await task());
+    expect(effort.bookedMinutes).toBe(0);
+    expect(effort.entryCount).toBe(0);
+    expect(effort.estimateMinutes).toBeNull();
+  });
+
+  /**
+   * **AN ARCHIVED ENTRY IS AN HOUR WITHDRAWN.** It cannot be corrected to nothing
+   * -- `time_entries_minutes_range` forbids zero -- so archiving is the only way
+   * a mis-booked afternoon leaves a total. If it still counted here, the
+   * correction would work on the timesheet and silently fail on this reading.
+   */
+  it("drops an archived entry out of the booked total, and out of its count", async () => {
+    const id = await task({ estimateMinutes: 240 });
+    await bookedTo(id, 60);
+    await archiveTimeEntry(handle.db, actorId, await bookedTo(id, 120));
+
+    const effort = await taskEffort(handle.db, id);
+    expect(effort.bookedMinutes).toBe(60);
+    expect(effort.entryCount).toBe(1);
+  });
+
+  /**
+   * **AN ENTRY BOOKED SOMEWHERE ELSE IS NOT BOOKED HERE**, which is the filter
+   * this whole reading is, and the failure it would have is silent: a missing
+   * `task_id` predicate answers every task with the same number and every one of
+   * them looks plausible.
+   */
+  it("counts only the entries booked to this task", async () => {
+    const mine = await task({ estimateMinutes: 240 });
+    const theirs = await task();
+    await bookedTo(mine, 60);
+    await bookedTo(theirs, 300);
+    // And an entry attached to the project but to no task at all: legal (the
+    // link rule is at-least-one of five), and not this task's.
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-08", minutes: 480, billable: true, projectId,
+    });
+
+    expect((await taskEffort(handle.db, mine)).bookedMinutes).toBe(60);
+    expect((await taskEffort(handle.db, theirs)).bookedMinutes).toBe(300);
+  });
+
+  /**
+   * **NO MEETING MINUTE REACHES A TASK'S BOOKED TOTAL**, and the schema is what
+   * guarantees it: `meetings` has no `task_id`. This is the reading that proves
+   * the guarantee holds through the one link that DOES exist between the two
+   * halves -- a meeting's follow-up task. Task 2 settled that an hour booked
+   * against a follow-up task is different work rather than a second copy of the
+   * meeting's hour; here that is a number rather than a paragraph.
+   */
+  it("counts a follow-up task's own hours and none of the meeting's", async () => {
+    const meetingId = await meeting("2026-09-08T09:00:00.000Z", 90);
+    const followUp = await createMeetingTask(
+      handle.db, actorId, meetingId, { title: "Send the summary" },
+    );
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-08", minutes: 30, billable: true, taskId: followUp.id,
+    });
+
+    const effort = await taskEffort(handle.db, followUp.id);
+    expect(effort.bookedMinutes).toBe(30);
+    expect(effort.entryCount).toBe(1);
+    // The meeting's own 90 minutes are in the WEEK, and in neither of the two
+    // numbers above -- which is the whole shape of "counted once".
+    const totals = await timesheetTotals(handle.db, WEEK, NOW);
+    expect(totals.meetingMinutes).toBe(90);
+    expect(totals.entryMinutes).toBe(30);
+    expect(totals.countedMinutes).toBe(120);
+  });
+
+  /**
+   * **AN ESTIMATE ON A TASK NOBODY HAS STARTED COUNTS IN FULL, AND THIS IS THE
+   * TEST THAT SAYS SO.** The task below is `todo`, undated, unprogressed and has
+   * no entries -- and it still reports its four hours. Task 2 excluded meetings
+   * that have not happened because the timesheet sums time that HAPPENED; an
+   * estimate never claims anything happened, so there is no bucket for it and no
+   * question of whether the work has begun. Dropping it would make the estimated
+   * side SHRINK as work went undone.
+   */
+  it("reports the estimate of a task nobody has started, in full", async () => {
+    const id = await task({ estimateMinutes: 240 });
+    const effort = await taskEffort(handle.db, id);
+    expect(effort.estimateMinutes).toBe(240);
+    expect(effort.bookedMinutes).toBe(0);
+    expect(taskEffortSummary(effort))
+      .toBe("No time booked yet, against an estimate of 4h: 4h left.");
+  });
+
+  /**
+   * **AND AN ESTIMATE NEVER REACHES THE WEEK'S TOTAL.** `countedMinutes` is time
+   * that happened; an estimate is time that is expected to. Nothing in
+   * `timesheetTotals` reads `tasks` at all, and this is the test that would go
+   * red the day somebody "improved" it by adding estimates in -- which would
+   * answer "where did the week go" with work nobody has done.
+   */
+  it("changes no week's total, however large the estimate", async () => {
+    const before = await timesheetTotals(handle.db, WEEK, NOW);
+    const id = await task({ estimateMinutes: 525600 });
+    const after = await timesheetTotals(handle.db, WEEK, NOW);
+    expect(after).toEqual(before);
+    expect(after.countedMinutes).toBe(0);
+
+    // And once an hour IS booked to it, the week counts the HOUR and not the
+    // estimate: 60, never 525660.
+    await bookedTo(id, 60);
+    expect((await timesheetTotals(handle.db, WEEK, NOW)).countedMinutes).toBe(60);
+  });
+
+  /**
+   * AN ARCHIVED TASK STILL ANSWERS, unlike an archived entry, and the asymmetry
+   * is deliberate: the drawer opens on an archived task, and the hours booked to
+   * it are exactly what somebody looking at one wants accounted for.
+   */
+  it("answers for an archived task, because that is what its drawer is asking", async () => {
+    const id = await task({ estimateMinutes: 240 });
+    await bookedTo(id, 60);
+    await archiveTask(handle.db, actorId, id);
+
+    const effort = await taskEffort(handle.db, id);
+    expect(effort.bookedMinutes).toBe(60);
+    expect(effort.estimateMinutes).toBe(240);
+  });
+
+  /** A task that does not exist is a 404 rather than an honest-looking zero --
+   * which is what a bare aggregate over `time_entries` would answer. */
+  it("refuses a task id that does not exist, rather than answering nothing booked", async () => {
+    await expect(taskEffort(handle.db, "3f2504e0-4f89-41d3-9a0c-0305e82c3301"))
+      .rejects.toThrow(NotFoundError);
+  });
+
+  /**
+   * **SUMMED IN SQL, NOT OVER A PAGE.** `listTimeEntries` caps at 100 rows, so a
+   * JavaScript sum over a page is right until somebody books 101 entries to one
+   * task and is then silently SHORT -- this phase's own failure mode, arriving
+   * through the comparison the phase exists to make possible.
+   */
+  it("sums every entry on the task, past any page size the list would answer with", async () => {
+    const id = await task({ estimateMinutes: 525600 });
+    for (let i = 0; i < 101; i += 1) await bookedTo(id, 1);
+
+    const listed = await listTimeEntries(handle.db, { taskId: id, limit: 500 });
+    expect(listed.items.length).toBeLessThanOrEqual(100);
+
+    const effort = await taskEffort(handle.db, id);
+    expect(effort.entryCount).toBe(101);
+    expect(effort.bookedMinutes).toBe(101);
   });
 });

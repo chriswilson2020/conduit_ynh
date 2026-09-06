@@ -2,7 +2,9 @@ import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import type { Company, Contact, Deal, Project, Task, TaskStatus, TaskType } from "@conduit/shared";
-import { taskDatesPaired } from "@conduit/shared";
+import {
+  MAX_TASK_ESTIMATE_MINUTES, formatMinutes, taskDatesPaired, taskEffortSummary,
+} from "@conduit/shared";
 import { ApiError } from "../api";
 import {
   useAddDependency,
@@ -15,6 +17,7 @@ import {
   useSetTaskStatus,
   useTask,
   useTaskDependencies,
+  useTaskEffort,
   useTasks,
   useUnarchiveTask,
   useUpdateTask,
@@ -89,6 +92,10 @@ function TaskDrawerBody({ taskId, returnFocus }: { taskId: string; returnFocus: 
   const { data: linkedCompany } = useCompany(task?.companyId ?? "");
   const { data: linkedContact } = useContact(task?.contactId ?? "");
   const { data: linkedDeal } = useDeal(task?.dealId ?? "");
+  // Keyed under ["task", id, "effort"], so both halves of the comparison refresh
+  // on their own sources of change -- a task PATCH for the estimate, a
+  // time-entry write for the booked minutes (queries.ts's useTaskEffort).
+  const { data: effort } = useTaskEffort(taskId);
 
   const updateTask = useUpdateTask();
   const setTaskStatus = useSetTaskStatus();
@@ -108,12 +115,18 @@ function TaskDrawerBody({ taskId, returnFocus }: { taskId: string; returnFocus: 
   // (e.g. the moment "1" is typed on the way to "15"), a needless write of a
   // value the user hasn't finished entering.
   const [progressDraft, setProgressDraft] = useState("");
+  // Same blur-commit reasoning as progress above, and the same three-state
+  // handling: blank clears the estimate, which is the only way to withdraw a
+  // mis-typed one -- the column has no zero to fall back on (api: db/schema.ts's
+  // tasks_estimate_range, and @conduit/shared's MAX_TASK_ESTIMATE_MINUTES).
+  const [estimateDraft, setEstimateDraft] = useState("");
 
   useEffect(() => {
     setStartDraft(task?.startDate ?? "");
     setDueDraft(task?.dueDate ?? "");
     setProgressDraft(task?.progressPct?.toString() ?? "");
-  }, [task?.id, task?.startDate, task?.dueDate, task?.progressPct]);
+    setEstimateDraft(task?.estimateMinutes?.toString() ?? "");
+  }, [task?.id, task?.startDate, task?.dueDate, task?.progressPct, task?.estimateMinutes]);
 
   // Mirrors deal-detail.tsx/project-detail.tsx's reportError: ApiError.code
   // is the server's machine-readable field, branched on so an "archived" 409
@@ -194,6 +207,44 @@ function TaskDrawerBody({ taskId, returnFocus }: { taskId: string; returnFocus: 
     }
     const progressPct = Math.max(0, Math.min(100, Math.round(parsed)));
     if (progressPct !== task.progressPct) updateTask.mutate({ id: task.id, patch: { progressPct } }, { onError: reportError });
+  }
+
+  /**
+   * The estimate commits on blur, exactly as progress does and for its reason.
+   *
+   * CLAMPED TO [1, MAX_TASK_ESTIMATE_MINUTES] RATHER THAN SENT AND REFUSED,
+   * which is handleProgressBlur's arrangement at [0, 100]: the server's bound is
+   * the real one (a CHECK and a zod max, api: db/schema.ts), and this is the
+   * control agreeing with it so a slip on a number pad is corrected in front of
+   * the operator instead of coming back as a 400 they have to translate.
+   *
+   * **A BLANK CLEARS IT, AND A ZERO DOES NOT BECOME ONE.** `null` is the single
+   * spelling of "not estimated"; a typed 0 clamps up to 1 minute rather than
+   * silently meaning "no estimate", because those are different claims and the
+   * schema refuses to hold both in one value.
+   */
+  function handleEstimateBlur() {
+    if (!task) return;
+    const trimmed = estimateDraft.trim();
+    if (trimmed === "") {
+      if (task.estimateMinutes !== null) {
+        updateTask.mutate({ id: task.id, patch: { estimateMinutes: null } }, { onError: reportError });
+      }
+      return;
+    }
+    const parsed = Number(trimmed);
+    if (Number.isNaN(parsed)) {
+      setEstimateDraft(task.estimateMinutes?.toString() ?? "");
+      return;
+    }
+    const estimateMinutes = Math.max(1, Math.min(MAX_TASK_ESTIMATE_MINUTES, Math.round(parsed)));
+    // The clamp can differ from what was typed ("0" becomes "1"), so the draft
+    // is put back in step with what was actually sent -- otherwise the field
+    // goes on showing a number the task does not have.
+    setEstimateDraft(estimateMinutes.toString());
+    if (estimateMinutes !== task.estimateMinutes) {
+      updateTask.mutate({ id: task.id, patch: { estimateMinutes } }, { onError: reportError });
+    }
   }
 
   // Both dates cleared, or both set with start <= due -- taskDatesPaired is
@@ -376,6 +427,49 @@ function TaskDrawerBody({ taskId, returnFocus }: { taskId: string; returnFocus: 
         />
         <span className="ml-2 text-sm text-slate-400">%</span>
       </Field>
+
+      {/*
+        BOOKED VERSUS ESTIMATED -- the comparison the spec says is "usually the
+        point of tracking time against tasks", and which could not exist before
+        v1.9.0 gave `tasks` a quantity of work at all.
+
+        THE FIGURES ARE NOT LAID OUT SIDE BY SIDE, THEY ARE ONE SENTENCE FROM
+        @conduit/shared. `taskEffortSummary` composes the estimate, the booked
+        total and the gap together precisely so this card cannot render half of a
+        comparison -- "5h booked" on a task estimated at two hours is a number
+        that is wrong without looking wrong. It is EXPORT_ARCHIVE_SUMMARY's
+        arrangement (pages/settings-data.tsx) and timesheetSummary's, and
+        task-effort-render.test.ts reads this file off disk and fails if the
+        sentence is composed here instead.
+
+        MINUTES IN THE INPUT, matching what is stored and what it is compared
+        with, with formatMinutes echoing it back in hours beside the box: an
+        hours input would put a conversion and a rounding between what the
+        operator types and the number the booked half is measured in, which is
+        the whole argument for the column's unit (api: db/schema.ts).
+      */}
+      <div className="rounded-lg border border-slate-200 bg-white px-4 py-3">
+        <span className="text-sm font-medium text-slate-500">Estimate</span>
+        <div data-testid="field-estimateMinutes" className="mt-2 flex items-center gap-2">
+          <input
+            type="number"
+            aria-label="Estimate in minutes"
+            min={1}
+            max={MAX_TASK_ESTIMATE_MINUTES}
+            value={estimateDraft}
+            onChange={(event) => setEstimateDraft(event.target.value)}
+            onBlur={handleEstimateBlur}
+            disabled={archived}
+            className="w-28 rounded-md border border-slate-300 px-2 py-1.5 text-sm text-slate-900 disabled:cursor-not-allowed disabled:bg-slate-50 max-md:min-h-11"
+          />
+          <span className="text-sm text-slate-400">
+            {task.estimateMinutes === null ? "minutes" : `minutes (${formatMinutes(task.estimateMinutes)})`}
+          </span>
+        </div>
+        <p data-testid="task-effort" className="mt-2 text-sm text-slate-600">
+          {effort === undefined ? "…" : taskEffortSummary(effort)}
+        </p>
+      </div>
 
       <Field label="Project" testId="projectId">
         <ProjectLink id={task.projectId} project={linkedProject} />

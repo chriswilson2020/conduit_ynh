@@ -8,7 +8,8 @@ import {
   companySchema, contactSchema, noteSchema, fileMetaSchema, eventSchema,
   errorResponseSchema, listResponseSchema, searchResultsSchema,
   pipelineSchema, pipelineWithStagesSchema, stageSchema, dealSchema, funnelRowSchema,
-  projectSchema, taskSchema, taskDependencySchema, shiftResultSchema, ganttPayloadSchema,
+  projectSchema, taskSchema, taskDependencySchema, taskEffortSchema,
+  shiftResultSchema, ganttPayloadSchema,
   meetingSchema, meetingDetailSchema, meetingSummarySchema, timeEntrySchema,
   timesheetSummary, timesheetTotalsSchema,
   documentSchema, orgProfileSchema,
@@ -1391,6 +1392,79 @@ describe("tasks routes", () => {
     const unarchived = await a.inject({ method: "POST", url: `/api/tasks/${task.id}/unarchive`, headers: authHeaders });
     expect(unarchived.statusCode).toBe(200);
     expect(taskSchema.parse(unarchived.json()).archivedAt).toBeNull();
+    await a.close();
+  });
+
+  /**
+   * **BOOKED VERSUS ESTIMATED, OVER HTTP.** The estimate goes in through the
+   * ordinary task PATCH; the comparison comes back from a second endpoint under
+   * the same `:id` -- deliberately not a field on the task, so the board and the
+   * Gantt do not each run an aggregate per rendered card (services/timesheet.ts).
+   */
+  it("answers a task's effort: the estimate patched in, and the hours booked against it", async () => {
+    const a = await app();
+    const task = await makeTask(a, { title: "Write the spec" });
+
+    const before = await a.inject({
+      method: "GET", url: `/api/tasks/${task.id}/effort`, headers: authHeaders,
+    });
+    expect(before.statusCode).toBe(200);
+    expect(taskEffortSchema.parse(before.json())).toEqual({
+      taskId: task.id, estimateMinutes: null, bookedMinutes: 0, entryCount: 0,
+    });
+
+    const patched = await a.inject({
+      method: "PATCH", url: `/api/tasks/${task.id}`,
+      headers: authHeaders, payload: { estimateMinutes: 240 },
+    });
+    expect(patched.statusCode).toBe(200);
+    expect(taskSchema.parse(patched.json()).estimateMinutes).toBe(240);
+
+    const booked = await a.inject({
+      method: "POST", url: "/api/time-entries", headers: authHeaders,
+      payload: { workDate: "2026-09-08", minutes: 90, billable: true, taskId: task.id },
+    });
+    expect(booked.statusCode).toBe(201);
+
+    const after = await a.inject({
+      method: "GET", url: `/api/tasks/${task.id}/effort`, headers: authHeaders,
+    });
+    expect(taskEffortSchema.parse(after.json())).toEqual({
+      taskId: task.id, estimateMinutes: 240, bookedMinutes: 90, entryCount: 1,
+    });
+    await a.close();
+  });
+
+  /** The bound is on the wire as well as in the database, so a figure that would
+   * dominate every comparison it appears in is a 400 naming the field rather
+   * than a 500 from a CHECK -- which is what `meetings.duration_minutes` has NOT
+   * got, and what Task 2 recorded the cost of. */
+  it("refuses an estimate outside the range, and a zero, with a 400", async () => {
+    const a = await app();
+    const task = await makeTask(a);
+    for (const estimateMinutes of [0, -1, 999999999, 90.5]) {
+      const response = await a.inject({
+        method: "PATCH", url: `/api/tasks/${task.id}`, headers: authHeaders, payload: { estimateMinutes },
+      });
+      expect(response.statusCode, String(estimateMinutes)).toBe(400);
+    }
+    // The premise: the exact edges of the same range go through.
+    for (const estimateMinutes of [1, 525600]) {
+      const ok = await a.inject({
+        method: "PATCH", url: `/api/tasks/${task.id}`, headers: authHeaders, payload: { estimateMinutes },
+      });
+      expect(ok.statusCode, String(estimateMinutes)).toBe(200);
+    }
+    await a.close();
+  });
+
+  it("returns 404 asking for the effort of a task that does not exist", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "GET", url: "/api/tasks/3f2504e0-4f89-41d3-9a0c-0305e82c3301/effort", headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(404);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("not_found");
     await a.close();
   });
 

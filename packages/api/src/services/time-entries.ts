@@ -46,12 +46,35 @@ import { publish } from "./sse.js";
  * comment on the column.
  */
 
-/** Invalidation keys every mutator publishes after its transaction commits.
+/**
+ * Invalidation keys every mutator publishes after its transaction commits.
  * No `events` key, unlike meetings.ts's -- this file writes no timeline rows
  * (see the header), so a client refetching a timeline on a time-entry write
- * would be refetching something that provably did not change. */
-function publishTimeEntryHint(id: string): void {
-  publish({ keys: [["time-entries"], ["time-entry", id]] });
+ * would be refetching something that provably did not change.
+ *
+ * **`["task", id]` SINCE v1.9.0, AND IT IS NOT A TIDY-UP.** Task 3 gave `tasks`
+ * an estimate, so `GET /api/tasks/:id/effort` now answers a BOOKED figure that
+ * this file's writes are the only source of -- and nothing on a task surface
+ * listened to `["time-entries"]`. Without this key the drawer's
+ * booked-versus-estimated sentence stands still while the hours behind it change,
+ * which is the one number in the comparison a stale cache can get wrong without
+ * looking wrong. The key is the exact one `publishTaskHint` uses
+ * (services/tasks.ts), so TanStack's prefix match reaches the deeper
+ * `["task", id, "effort"]` cache the same way it already reaches the drawer's
+ * dependency list.
+ *
+ * `taskIds` IS A LIST FOR `extraAssigneeIds`' REASON, one table over: an update
+ * that re-links an entry from task A to task B changes the booked total of BOTH,
+ * so the caller passes the pre-patch and post-patch ids and the Set collapses
+ * them when they are the same. Nulls are dropped here rather than at each call
+ * site -- an entry linked to a project and no task has no task key to publish.
+ */
+function publishTimeEntryHint(id: string, taskIds: (string | null)[] = []): void {
+  const keys: string[][] = [["time-entries"], ["time-entry", id]];
+  for (const taskId of new Set(taskIds.filter((t): t is string => t !== null))) {
+    keys.push(["task", taskId]);
+  }
+  publish({ keys });
 }
 
 function toTimeEntry(row: TimeEntryRow): TimeEntry {
@@ -180,7 +203,7 @@ export async function createTimeEntry(
   }).returning();
   if (row === undefined) throw new Error("insert returned no row");
 
-  publishTimeEntryHint(row.id);
+  publishTimeEntryHint(row.id, [row.taskId]);
   return toTimeEntry(row);
 }
 
@@ -253,7 +276,12 @@ export async function updateTimeEntry(
     throw recheck === undefined ? new NotFoundError("time entry", id) : new ArchivedError("time entry", id);
   }
 
-  publishTimeEntryHint(id);
+  // BOTH TASKS, pre-patch and post-patch: re-linking an entry from one task to
+  // another moves its minutes out of one booked total and into another, and a
+  // drawer open on the task it LEFT is exactly as stale as one open on the task
+  // it arrived at. Passed unconditionally; the Set collapses the ordinary case
+  // where the link did not change.
+  publishTimeEntryHint(id, [existing.taskId, row.taskId]);
   return toTimeEntry(row);
 }
 
@@ -285,7 +313,9 @@ async function setArchived(db: Database, actorId: string, id: string, archived: 
     if (recheck === undefined) throw new NotFoundError("time entry", id);
     return toTimeEntry(recheck);
   }
-  publishTimeEntryHint(id);
+  // Archiving is how an hour leaves a booked total, so the task it left has to
+  // hear about it -- the same key, for the same reason, as a create.
+  publishTimeEntryHint(id, [updated.taskId]);
   return toTimeEntry(updated);
 }
 export const archiveTimeEntry = (db: Database, a: string, id: string) => setArchived(db, a, id, true);

@@ -47,6 +47,7 @@ import {
   stageSchema,
   statusReportSchema,
   taskDependencySchema,
+  taskEffortSchema,
   taskSchema,
   usersResponseSchema,
   type BulkThreadActionInput,
@@ -926,6 +927,30 @@ export function useTaskDependencies(id: string) {
     queryKey: ["task", id, "dependencies"],
     queryFn: async () =>
       parseWith(taskDependencyListSchema, await getJson<unknown>(`/tasks/${id}/dependencies`), "task dependencies"),
+    enabled: id !== "",
+  });
+}
+
+/**
+ * Booked versus estimated for one task -- GET /api/tasks/:id/effort
+ * (api: services/timesheet.ts's taskEffort).
+ *
+ * SCOPED UNDER ["task", id] FOR useTaskDependencies' REASON, and here it earns
+ * that placement twice over: the estimate changes through a task PATCH (which
+ * publishes ["task", id]) and the booked minutes change through a time-entry
+ * write, which since v1.9.0 publishes the same key when the entry names a task
+ * (api: services/time-entries.ts's publishTimeEntryHint). Two independent
+ * sources of change, one key, and neither of them has to know about this hook.
+ *
+ * A SEPARATE REQUEST RATHER THAN A FIELD ON THE TASK, which is a deliberate
+ * round trip: putting the booked figure on `taskSchema` would make the board and
+ * the Gantt run an aggregate per rendered card. See taskEffort's doc comment.
+ */
+export function useTaskEffort(id: string) {
+  return useQuery({
+    queryKey: ["task", id, "effort"],
+    queryFn: async () =>
+      parseWith(taskEffortSchema, await getJson<unknown>(`/tasks/${id}/effort`), "task effort"),
     enabled: id !== "",
   });
 }

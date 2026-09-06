@@ -1,8 +1,9 @@
-import { and, gte, isNull, lt, lte, sql } from "drizzle-orm";
+import { and, eq, gte, isNull, lt, lte, sql } from "drizzle-orm";
 import { usableTimeZone, zonedDayRange } from "@conduit/shared";
-import type { TimesheetTotals } from "@conduit/shared";
+import type { TaskEffort, TimesheetTotals } from "@conduit/shared";
 import type { Database } from "../db/client.js";
-import { meetings, timeEntries } from "../db/schema.js";
+import { meetings, tasks, timeEntries } from "../db/schema.js";
+import { NotFoundError } from "./errors.js";
 import { getOrgProfile } from "./org-profile.js";
 
 /**
@@ -203,5 +204,117 @@ export async function timesheetTotals(
     // describes. `timesheetSummary` in @conduit/shared is the sentence that
     // cannot leave them out.
     countedMinutes: entryRow.minutes + meetingRow.minutes,
+  };
+}
+
+/**
+ * **BOOKED VERSUS ESTIMATED, FOR ONE TASK (Phase 10 Task 3).**
+ *
+ * The spec's second reading of `schema.ts` was that `tasks` carries no quantity
+ * of work -- "dates and a percentage, never a quantity" -- and that this
+ * comparison, which is usually the point of booking time against a task, could
+ * not exist until a column did. `tasks.estimate_minutes` (0022) is that column
+ * and this is the whole of the reading over it. `GET /api/tasks/:id/effort`
+ * serves it; the task drawer renders `taskEffortSummary` and computes nothing.
+ *
+ * **IT LIVES HERE AND NOT IN services/tasks.ts FOR THIS MODULE'S FOUNDING
+ * REASON**, one table further along: it reads `tasks` AND `time_entries` and
+ * belongs to neither. tasks.ts would have to import `timeEntries` to hold it,
+ * and time-entries.ts would have to grow a reader keyed on somebody else's row.
+ * This module exists precisely because "what has been booked" is a question
+ * about two tables, and the whole of Phase 10's summing lives in it.
+ *
+ * **NOT ON `toTask`, AND THAT IS THE RIPPLE THAT WAS MEASURED AND REFUSED.** The
+ * obvious place for a booked figure is the `Task` payload itself, and it would
+ * be wrong: `taskSchema` is rendered by the board, the Gantt, My Tasks, search
+ * and a meeting's follow-up list, so a field on it makes EVERY producer of a
+ * task run an aggregate -- a board of forty cards becomes forty scans of
+ * `time_entries` to draw something nobody put on a card. So this is a second
+ * endpoint under the same `:id`, exactly as the drawer's dependency list is
+ * (`GET /api/tasks/:id/dependencies`), and the board and the Gantt pay nothing.
+ *
+ * **NO MEETING MINUTE CAN REACH THIS NUMBER, and that is the schema's doing
+ * rather than a filter here.** `meetings` carries four record links and
+ * `task_id` is not among them, so a meeting cannot be booked to a task at all.
+ * The one join that does exist between the two halves is `events.meeting_id` on
+ * the event a follow-up task's creation writes, and Task 2 settled what it
+ * means: an hour booked against a follow-up task is different work, not a second
+ * copy of the meeting's hour.
+ *
+ * **ONE AGGREGATE, SO THE MINUTES AND THE COUNT ARE THE SAME POPULATION** --
+ * `timesheetTotals`' rule above, and `taskEffortSchema`'s refine is what proves
+ * it did not stop being true. `::int` for that function's reason: `SUM`/`COUNT`
+ * over an `integer` are `bigint`, which postgres.js hands back as a STRING, and
+ * `sql<number>` is a claim TypeScript takes on trust.
+ *
+ * **THE INDEX THIS READER WANTS DOES NOT EXIST, AND THE PLAN NAMES THE WRONG
+ * TASK AS ITS FIRST READER.** `time_entries`' five record foreign keys are
+ * deliberately unindexed -- 0021 builds only `(work_date DESC, id DESC)` -- and
+ * the Phase 10 plan assigns all five to Task 4 as "the first task with readers
+ * for them". THAT IS NO LONGER TRUE: this is a reader for `task_id`, it arrives
+ * a task early, and it runs on every task drawer open rather than a few times a
+ * day. Measured on the dev server against a database built by the real
+ * migrations, entries spread over 200 tasks and a tenth of them archived;
+ * EXPLAIN (ANALYZE, BUFFERS) on the aggregate below, warm, without and then with
+ * a partial index on `(task_id) WHERE archived_at IS NULL`:
+ *
+ *     5,000 entries,  22 live on the task:   0.42ms /    73 buffers  ->  0.04ms /  24, index  56kB / 584kB heap
+ *   200,000 entries, 907 live on the task:  18.80ms / 2,881 buffers  ->  0.78ms / 910, index 1.2MB /  23MB heap
+ *
+ * Five thousand entries is a decade of a single operator logging two entries a
+ * working day, and the difference there is four tenths of a millisecond on a
+ * request that already costs a network round trip. **Not built** --
+ * 0017/0019/0020's rule, and Task 2's decision on `meetings(occurred_at)`
+ * against the same shape of evidence at the same scale. Note that even at 200k
+ * the index saves only two thirds of the buffers: one entry per heap page,
+ * because a task's hours are scattered across years of insert order, so the
+ * bitmap heap scan still visits 907 pages. The figures are written down so Task
+ * 4, which builds the other four record indexes for its filters, can add this
+ * one beside them without re-measuring.
+ *
+ * THE MEASUREMENT'S FIRST DRAFT WAS A BAD INSTRUMENT AND SAID SO: it spread
+ * entries over tasks with `g % 200` and archived them with `g % 10`, and 10
+ * divides 200, so every entry on the target task had the same `g mod 10` and ALL
+ * of them were archived. It reported nought rows on the task, which is the only
+ * reason it was caught rather than recorded as a fast query.
+ */
+export async function taskEffort(db: Database, taskId: string): Promise<TaskEffort> {
+  // THE TASK IS READ FIRST AND ON ITS OWN, so a missing id is a 404 rather than
+  // an honest-looking "no estimate, nothing booked" -- which is what a bare
+  // aggregate over time_entries answers for a task that does not exist, and is
+  // this phase's failure mode in miniature: a number that is wrong without
+  // looking wrong.
+  const [task] = await db.select({ estimateMinutes: tasks.estimateMinutes })
+    .from(tasks).where(eq(tasks.id, taskId));
+  if (task === undefined) throw new NotFoundError("task", taskId);
+
+  const [booked] = await db.select({
+    minutes: sql<number>`COALESCE(SUM(${timeEntries.minutes}), 0)::int`,
+    count: sql<number>`COUNT(*)::int`,
+  }).from(timeEntries).where(and(
+    eq(timeEntries.taskId, taskId),
+    // ARCHIVING IS THE ONLY WAY AN HOUR LEAVES A TOTAL in this phase -- an entry
+    // cannot be corrected to nothing, `time_entries_minutes_range` forbids zero
+    // -- so an archived entry still counted here would make the correction for a
+    // mis-booked afternoon work everywhere except on this reading.
+    isNull(timeEntries.archivedAt),
+  ));
+  if (booked === undefined) {
+    // An aggregate with no GROUP BY always returns exactly one row; this is the
+    // type narrowing, not a case that can happen.
+    throw new Error("taskEffort: an aggregate returned no row");
+  }
+
+  return {
+    taskId,
+    // AN ARCHIVED TASK STILL ANSWERS, deliberately, and it is the opposite case
+    // from an archived ENTRY: the drawer opens on an archived task (read-only,
+    // with an unarchive button), and a comparison that went blank there would
+    // hide the hours somebody opened the task to account for. An archived entry
+    // is an hour withdrawn; an archived task is a task somebody is still asking
+    // about.
+    estimateMinutes: task.estimateMinutes,
+    bookedMinutes: booked.minutes,
+    entryCount: booked.count,
   };
 }
