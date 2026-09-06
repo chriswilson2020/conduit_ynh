@@ -320,12 +320,12 @@ putting the raw value back is killed by it.
 
 ## Task 2: Meetings count, and the same hour cannot be counted twice
 
-- [ ] **`meetings.duration_minutes` already holds tracked time** and has never been aggregated.
+- [x] **`meetings.duration_minutes` already holds tracked time** and has never been aggregated.
       The timesheet reads meetings and entries together.
-- [ ] **A time entry naming a meeting is refused BY THE DATABASE.** Chris's decision, and the
+- [x] **A time entry naming a meeting is refused BY THE DATABASE.** Chris's decision, and the
       backlog's requirement in as many words: the other possibility must be **impossible rather
       than discouraged**. A CHECK, not a convention.
-- [ ] **READ THIS BEFORE ADDING A COLUMN TO FORBID.** Task 1 shipped `time_entries` with **no
+- [x] **READ THIS BEFORE ADDING A COLUMN TO FORBID.** Task 1 shipped `time_entries` with **no
       `meeting_id` column at all**, so the refusal already exists and is stronger than a CHECK:
       an INSERT naming one does not violate a constraint, it fails to resolve against the table
       (42703, `undefined_column`) — a refusal that cannot be got around by dropping a
@@ -336,8 +336,170 @@ putting the raw value back is killed by it.
       wants a nameable refusal for the API's sake, that belongs in the service and the wire
       schema, where a 400 can say something useful — not in a column the database would then
       have to be told to hate.
-- [ ] **A meeting with no duration contributes nothing, and that must be visible.** A report that
+- [x] **A meeting with no duration contributes nothing, and that must be visible.** A report that
       silently treats "unknown length" as zero is the same failure in a smaller costume.
+
+### Task 2 as built — `services/timesheet.ts`, and no migration at all
+
+**NO COLUMN WAS ADDED AND NO CHECK WAS WRITTEN.** Task 1's warning was followed: the
+refusal that already stands is the strongest available, and a `meeting_id` column added
+so a constraint could name it would have made the impossible merely illegal. The
+`db/schema.test.ts` case that pins 42703 is unchanged apart from its comment, which now
+records the decision instead of anticipating it. **This task ships no migration** —
+`drizzle/` is untouched, so there is no journal entry, no snapshot and no stamper run.
+
+**THE READING LAYER IS A THIRD MODULE.** `timesheetTotals(db, {from, to}, now)` reads
+`time_entries` and `meetings` and belongs to neither, so it is `services/timesheet.ts`
+rather than a function in either file. `GET /api/timesheet?from=&to=` is its one caller;
+Task 4's page renders what it answers and computes none of it. The "NO SUM FUNCTION HERE"
+note Task 1 left at the foot of `services/time-entries.ts` is now a pointer here.
+
+**SUMMED IN SQL, COALESCED, AND CAST.** Two aggregates, no GROUP BY, no join. A test logs
+**101 entries in one week and asks the list for five hundred** — the list still returns
+100, so there is no page size at which a JavaScript sum is right. `::int` on every
+aggregate is load-bearing rather than cosmetic: `SUM`/`COUNT` over an `integer` are
+`bigint`, which postgres.js hands back as a **string**, and `sql<number>` is a claim
+TypeScript takes on trust — uncast, `entryMinutes + meetingMinutes` is `"120" + "45"` =
+`"12045"`. The test asserts the runtime type of every numeric field.
+
+### What the operator sees for a meeting with no duration
+
+**A NUMBER IN THE ANSWER, INSIDE THE SAME SENTENCE AS THE TOTAL.** The payload carries
+`meetingsUnmeasured` and `timesheetSummary` (in `@conduit/shared`) renders:
+
+> `7h 30m counted from 2026-09-07 to 2026-09-13: 5h across 4 entries, and 2h 30m across 3
+> meetings. Not counted: 2 meetings with no recorded length, and 1 meeting that has not
+> happened yet.`
+
+**ONE STRING, BECAUSE A PAGE CANNOT DROP A CLAUSE IT NEVER HAD.** A count sitting beside a
+total in a payload is visible only to a UI that chooses to render it, which is the same
+silence in a different place. This is `EXPORT_ARCHIVE_SUMMARY`'s arrangement and its
+reason. The headline field is called **`countedMinutes`, never `totalMinutes`**, so a page
+that prints it alone and labels it the week's total reads as a lie in its own source.
+**Task 4 renders this sentence.**
+
+### THREE THINGS THE SPEC AND THE PLAN ARE WRONG OR SILENT ABOUT
+
+**1. THE SPEC AND PLAN NEVER ASK WHICH CALENDAR DAY A MEETING FELL ON, AND THE TIMESHEET
+CANNOT BE BUILT WITHOUT AN ANSWER.** `time_entries.work_date` is a `date` and
+`meetings.occurred_at` is a `timestamptz`. `2026-09-06T23:30Z` is Sunday in UTC and Monday
+in Amsterdam — not a different day but a different **week**. The answer taken here is the
+organisation's clock (`org_profile.time_zone`, 0018), because that field exists for exactly
+this class of question and already decides what day a document is dated; UTC would
+reintroduce the bug 0018 was built to remove, in the one report where an hour out moves an
+hour between weeks. `zonedDayRange` in `@conduit/shared` converts the closed day range into
+a **half-open instant range**, and the closed form is deliberately unspellable there: an
+upper bound of the last day's own start drops that day, and "start plus 86,399,999ms" is an
+hour wrong on both of Amsterdam's 23- and 25-hour days.
+
+**2. THE SPEC'S PREMISE THAT "A LOGGED MEETING WITH A DURATION IS A RECORDED HOUR" IS FALSE
+FOR HALF THE TABLE, AND NOTHING SAYS WHICH HALF.** Phase 5 decided `occurred_at` is free in
+both directions because "noting a meeting you have just had and one you have just arranged
+are the same act", and **no column distinguishes them**. So the current week contains
+Friday's arranged meetings on Wednesday morning, and counting them answers "where did the
+week go" with work nobody has done. A third bucket, `meetingsNotYetOccurred`, reports them
+and does not count them — the same treatment an unmeasured meeting gets, for the same
+reason: an hour excluded in silence is this task's own failure mode, whether it is excluded
+for being unknown or for being in the future. **This is not in the spec. If Chris wants
+arranged meetings counted, it is one filter to change.**
+
+**3. THE STATED REASON FOR LEAVING `meetings.duration_minutes` UNBOUNDED HAS JUST EXPIRED,
+AND THE EXPOSURE IT LEAVES IS REAL.** `db/schema.ts` and `MAX_TIME_ENTRY_MINUTES` both
+argued that `time_entries.minutes` gets a CHECK and that column does not because **"nothing
+sums a meeting's duration"**. This task makes that false. Both comments are corrected in
+place. **No CHECK was added and that is argued rather than deferred**: `minutes <= 1440`
+follows from `work_date` being one day, while `occurred_at` is a *start* and an offsite
+logged as one meeting can honestly run longer than a day — so the same bound there would
+refuse a true row, and would still not catch the mistype that happens (60 typed as 600
+passes any bound). **What IS exposed: `meetingSchema.durationMinutes` is
+`z.number().int().positive()` with NO upper bound**, so one meeting can carry 999,999,999
+minutes and now dominate a week's total. Adding a `.max()` would make the CLIENT refuse to
+parse any meeting already carrying such a value, turning a silly figure into a broken page,
+so it is written down here rather than changed in passing. **A decision for Chris.**
+
+### How double-counting is made impossible, and the indirect route that was open
+
+The direct route is unspellable and stays that way. Every indirect one was enumerated and
+tested:
+
+| route | what closes it |
+|---|---|
+| a time entry naming a meeting | no `meeting_id` column: 42703, not a constraint (Task 1, pinned) |
+| **a JOIN that fans a meeting out over its attendees** | the aggregate has NO join; a mutation adding `leftJoin(meetingAttendees)` is killed by "counts a meeting once however many attendees it had" |
+| a meeting summed once per linked record | same: the aggregate is over `meetings` alone |
+| a meeting in two of the three buckets | the three are `FILTER` clauses over one population from one predicate, and `timesheetTotalsSchema` refuses a payload where they do not add up to `COUNT(*)` |
+| **a boundary meeting counted in two consecutive weeks** | **THIS ONE WAS OPEN.** `occurred_at <= endExclusive` survived every test in the file — a meeting at 00:30 local cannot tell `<` from `<=`. Closed by a test that puts a meeting on the **stroke of midnight** at each end and asserts the three weeks around it sum to two meetings |
+| an archived meeting still contributing | `archived_at IS NULL` on both sides — and on the meeting side that is **part of the rule, not tidiness**: the correction for a wrongly-recorded meeting length is to archive it and log the hour by hand, so an archived meeting that still counted would BE the double count |
+
+An hour booked against a follow-up task the meeting produced is **not** a double count and
+is tested as a reading rather than left for somebody to "fix": a follow-up task is different
+work. That `events.meeting_id` link is the only real join between the two halves.
+
+### The index that was measured and not built
+
+`meetings` carries no index on `occurred_at` at all — 0008 built none and `listMeetings` has
+sorted the whole table since Phase 5. Measured on the dev server against a database built by
+the real migrations, EXPLAIN (ANALYZE, BUFFERS) on this week's aggregate, without and then
+with a partial index on `(occurred_at) WHERE archived_at IS NULL`:
+
+```
+  5,000 rows,  13 in the week:   0.462ms /    81 buffers  ->  0.043ms /  3, index 120kB / 648kB heap
+200,000 rows, 493 in the week:   19.2ms  / 3,226 buffers  ->  0.187ms / 15, index 3.9MB / 25MB heap
+```
+
+Five thousand meetings is a decade of heavy single-operator use and the difference there is
+four tenths of a millisecond. **Not built** (0017/0019/0020's rule); the 200k figure is
+recorded so Task 4 can add it alongside the five `time_entries` record indexes if its
+filters change the query's shape.
+
+### Mutation evidence
+
+**Thirty-three mutations plus a control. Thirty-one killed on the first run, TWO SURVIVED
+AND ARE NOW CLOSED, two were refused by the harness before they could lie, and one was a
+bad instrument caught and re-run.** The harness reads vitest's exit status from
+`spawnSync`'s `status` **before any output is piped anywhere** (Phase 9 lost a result to a
+`| tail`) and refuses to edit unless its search string occurs exactly once.
+
+**THE CONTROL RAN FIRST AND WAS WATCHED GREEN**, so a red result afterwards means something.
+
+| mutation | answered by |
+|---|---|
+| the range's upper bound is the last day itself; `nextDay` does not advance; the boundary search compares `>` not `>=`; the bracket narrows to 12h | `zonedDayRange`'s own tests, including the exhaustive one over all 419 zones |
+| the zone is used unresolved, with no UTC fallback | "falls back to UTC when the stored zone no longer resolves" |
+| an inverted range is answered instead of refused | the shared test and the service's |
+| **the calendar round trip is dropped, so `2026-13-01` is a day** | **SURVIVOR.** `toThrow()` with no pattern was green because `"2026-13-01"` sorts after the `to` bound and the BACKWARDS check threw instead — a test certifying whichever refusal it happened to get. Now `toThrow(/calendar day/)`, with `2026-02-30` and `0026-09-07` added |
+| the total need not be its own halves; the buckets need not account for the range | `timesheetTotalsSchema`'s refines |
+| **the sentence drops its uncounted clause**; names not-yet-happened only above one; always uses the plural | `timesheetSummary`'s tests, the service's, and the route's |
+| `formatMinutes` rounds instead of flooring | the shared tests |
+| `durationLabel` loses its null branch, so an untimed meeting reads "0m" | `meetings-lib.test.ts` — the two contracts really do differ at zero |
+| archived entries / archived meetings still summed | "drops an archived meeting and an archived entry out of every bucket" |
+| the entries sum is not COALESCEd | "answers an empty range with nought, not with nothing" |
+| **the `::int` cast dropped, so the driver returns bigint strings** | 8 tests, including `entryMinutes + meetingMinutes` coming back as `"12045"` |
+| the last day of the entry range is excluded; the meeting range's lower bound made exclusive | the inclusive-bounds tests |
+| **the meeting range's upper bound made inclusive** | **SURVIVOR.** Closed by the stroke-of-midnight test above |
+| a meeting starting exactly now counted as future; the not-yet filter inverted; `unmeasured` stops requiring the meeting to have started; the counted predicate forgets its null test | the bucket tests |
+| the organisation's clock ignored and UTC assumed | the three timezone tests |
+| the total forgets the meetings; `entryCount` answers minutes; `meetingsInRange` derived in JS from two buckets | the totals tests and the schema's refine |
+| **the aggregate gains `leftJoin(meetingAttendees)`** | "counts a meeting once however many attendees it had" |
+| the route accepts a backwards range; makes both bounds optional; is never registered | the route tests |
+| a comment-only change (**the control**) | green, watched first |
+
+**TWO REFUSED BEFORE THEY COULD LIE.** `const zone = usableTimeZone(timeZone);` occurs
+twice in `time-zone.ts` (the other is in `timeZoneLabel`), and the first control's search
+string occurred zero times. Both were errors here rather than results.
+
+**ONE BAD INSTRUMENT.** Swapping `gte` for `gt` in the meetings range "killed" 20 tests on
+its first run — because `gt` was not imported, so it was a ReferenceError rather than a
+wrong answer. Re-run with the import added, it is killed by one test, which is the honest
+figure.
+
+**AND ONE MORE INSTRUMENT FAILED IN THE OPPOSITE DIRECTION, BEFORE ANY MUTATION RAN.** The
+exhaustive zone test took **19.7s against a 20s `testTimeout`** on the dev server and
+0.109s on a laptop, because the first `zonedDayStart` built an `Intl.DateTimeFormat` inside
+its search loop. A green run one scheduling hiccup from a flake, invisible to the machine it
+was written on. Hoisting the formatter took it to 1.6s — and, incidentally, made
+`todayInZone` an independent oracle in that test rather than a restatement of the
+implementation.
 
 ## Task 3: `tasks` gets an estimate, and booked-versus-estimated exists
 
@@ -347,6 +509,29 @@ putting the raw value back is killed by it.
       tasks today. **If adding an estimate ripples further than expected, report it.**
 
 ## Task 4: The timesheet
+
+### What Task 2 built for this task, and the three rules that come with it
+
+- [ ] **THE SUM IS ALREADY WRITTEN.** `GET /api/timesheet?from=&to=` →
+      `services/timesheet.ts`'s `timesheetTotals`. It is summed in SQL, COALESCEd and cast;
+      **do not compute a total on the page.** The bullet below is answered, not pending.
+- [ ] **RENDER `timesheetSummary`, NOT `countedMinutes`.** The uncounted meetings — the ones
+      with no recorded length and the ones that have not happened yet — are in the same string
+      as the figure precisely so a page cannot print the figure without them. A page that
+      renders `countedMinutes` and calls it the week's total is the failure the spec names,
+      and the field is named `countedMinutes` so that page reads as a lie in its own source.
+      **Nothing tests a page that does not exist yet: this bullet is the guard.** If the design
+      wants the numbers laid out rather than a sentence, the uncounted ones are not optional
+      furniture — see `settings-data-lib.test.ts` for the shape of a test that reads a page off
+      disk and fails if it typed out what it should have derived.
+- [ ] **IF YOU ADD A CONTACT FILTER, USE AN EXISTS AND NOT A JOIN.** `listMeetings` widens its
+      contact filter to attendance, and as a JOIN to `meeting_attendees` a meeting with three
+      attendees is summed three times. The aggregate deliberately has no join; a mutation
+      adding one is killed by a test, and that test is why it is worth reading before editing
+      the query.
+- [ ] The record filters and the billable split are still this task's, and the five record
+      indexes with them. `meetings(occurred_at)` was measured and not built — see Task 2's
+      figures; if your filters change the query's shape, that index joins yours.
 
 - [ ] **A list, not a weekly grid.** The grid is the classic and is the hardest thing in this
       product to operate on a phone, which is where Chris is. No approval workflow — single user.
