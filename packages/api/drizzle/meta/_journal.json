@@ -134,6 +134,13 @@
       "when": 1789100000000,
       "tag": "0018_org_time_zone",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1789200000000,
+      "tag": "0019_letter_and_agreements",
+      "breakpoints": true
     }
   ]
 }

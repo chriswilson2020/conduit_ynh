@@ -1047,6 +1047,31 @@ export const documents = pgTable("documents", {
   // policy from the type at each call site is a guard that can be written wrong
   // once per call site; one that reads a fact off the row cannot.
   //
+  // **AND IT IS READ NOW, IN THREE PLACES, WHICH IS WHAT TASK 3 BUILT.** Task 1
+  // shipped this column with the note "nothing READS the column yet". The three
+  // readers, weakest first:
+  //
+  //   1. `redraftLetter`'s UPDATE carries `AND frozen = false` in its WHERE, so
+  //      the test and the write are ONE statement and there is no window between
+  //      them. Zero rows updated is the refusal.
+  //   2. That function is the ONLY thing in this codebase that UPDATEs a row in
+  //      `documents` or in any detail table, so there is one call site to get
+  //      right rather than one per type.
+  //   3. **`conduit_document_frozen_guard`, A TRIGGER, WHICH IS THE ONE THAT
+  //      MAKES THE RULE A PROPERTY OF THE DATABASE.** Added by 0019 on
+  //      `documents` and on all three detail tables, BEFORE UPDATE OR DELETE, it
+  //      refuses any change to a row whose document is frozen -- including from
+  //      a psql session, an import, and a call site nobody has written yet.
+  //
+  // WHY A TRIGGER AND NOT A CHECK: a CHECK sees only the row being written, and
+  // this rule is about the row that is ALREADY THERE. `frozen` is not "this
+  // value must be legal", it is "this row may not change", and OLD is a thing
+  // only a trigger has. It is declared in the migration and NOT in this file --
+  // drizzle-kit has no vocabulary for a trigger, exactly as it has none for
+  // 0013's `conduit_lower_emails` -- so 0013's consequence stands here too:
+  // `drizzle-kit push` must never be introduced, because it would drop objects
+  // it has no schema.ts record of.
+  //
   // NO DEFAULT, AND THAT IS DELIBERATE. 0016 adds the column WITH `DEFAULT true`
   // -- a metadata-only ADD COLUMN that fills every pre-existing row with the
   // only value that was ever true of it, the same arrangement 0014's
@@ -1066,7 +1091,10 @@ export const documents = pgTable("documents", {
   // document_quotes below for what the key buys and why 0017 is where it
   // arrives rather than 0016.
   unique("documents_id_type_unique").on(t.id, t.type),
-  check("documents_type_valid", sql`type IN ('quote','meeting_summary')`),
+  check(
+    "documents_type_valid",
+    sql`type IN ('quote','meeting_summary','letter','nda','mutual_nda')`,
+  ),
   // WHETHER THIS TYPE IS NUMBERED, IN THE DATABASE, so `documents.number` and
   // @conduit/shared's documentTypeNumbered() cannot drift apart -- the same
   // arrangement documents_frozen_matches_type has with documentTypeFreezes(),
@@ -1079,7 +1107,16 @@ export const documents = pgTable("documents", {
   // declared rule -- which is not hypothetical, since `formatDocumentNumber`
   // has a `?? "DOC"` fallback that would happily mint `DOC-2026-0001` for any
   // type that reached it.
-  check("documents_number_matches_type", sql`(number IS NOT NULL) = (type IN ('quote'))`),
+  //
+  // WIDENED IN 0019 FOR THE TWO AGREEMENTS, which are numbered for the reasons
+  // documentTypeNumbered gives -- a handle somebody else's legal team holds, an
+  // auditable per-year sequence, and no way for the number to come loose from
+  // its content because an agreement is frozen. The letter is deliberately not
+  // in the list.
+  check(
+    "documents_number_matches_type",
+    sql`(number IS NOT NULL) = (type IN ('quote','nda','mutual_nda'))`,
+  ),
   // Spelled exactly like notes'/files' `exactlyOne` above, one column wider.
   check(
     "documents_exactly_one_entity",
@@ -1100,9 +1137,12 @@ export const documents = pgTable("documents", {
   // clause is unchanged -- which is exactly why the equality had to be written
   // both ways round in 0016. An implication (`type IN ('quote') -> frozen`)
   // would have admitted a frozen meeting summary in silence, and with one type
-  // in existence nothing could have told the two spellings apart. The list
-  // widens for the NDA, which is Task 3's.
-  check("documents_frozen_matches_type", sql`frozen = (type IN ('quote'))`),
+  // in existence nothing could have told the two spellings apart.
+  //
+  // **IT WIDENED IN 0019, WHICH IS WHERE THE PREVIOUS SENTENCE SAID IT WOULD.**
+  // The letter joins the summary on the FALSE side; the NDA and the mutual NDA
+  // are the second and third TRUE members this column has ever had.
+  check("documents_frozen_matches_type", sql`frozen = (type IN ('quote','nda','mutual_nda'))`),
 ]);
 export type DocumentRow = typeof documents.$inferSelect;
 
@@ -1240,6 +1280,170 @@ export const documentQuotes = pgTable("document_quotes", {
 ]);
 export type DocumentQuoteRow = typeof documentQuotes.$inferSelect;
 
+// THE LETTER'S OWN COLUMNS -- Phase 9 Task 3, migration 0019.
+//
+// **THE ONE TABLE IN THIS SCHEMA WHOSE ROWS ARE MEANT TO CHANGE.** Everything
+// else about a document is written once: Phase 7's "a row here means a PDF
+// exists, and nothing ever rewrites either" was unconditional until this table,
+// and `documents.frozen` is what made it conditional. A letter is redrafted --
+// Chris, 6 Sep: "a letter wants redrafting before it goes" -- so `body_html`,
+// the subject and the addressee are all editable, and services/documents.ts's
+// redraftLetter is the only writer that may touch them. The guard that stops it
+// touching an NDA is `conduit_document_frozen_guard`, which lives in 0019 and
+// nowhere in this file -- drizzle-kit has no vocabulary for a trigger. It is
+// documented at `documents.frozen` above.
+//
+// ============================ WHY NOT `document_parties` ====================
+//
+// Task 1 moved the quote's four recipient columns here from `documents` and
+// wrote: "Tasks 3 and 4 have the two further types that would have to agree with
+// it; if they do, a common `document_parties` is a migration they can make with
+// three examples in front of them instead of one." **This task has the three
+// examples -- the quote, the letter and the two agreements -- and did not make
+// that migration.** Three reasons, in the order they weigh:
+//
+//  1. **IT WOULD BE A SECOND MIGRATION OVER CHRIS'S LIVE QUOTE ROWS IN ONE
+//     RELEASE, FOR A REFACTOR RATHER THAN A FEATURE.** 0016 is the one migration
+//     in this project that has ever moved real data, and the spec calls it the
+//     phase's highest-consequence item; proving it safe took a fixture written by
+//     the pre-migration code and the whole of Task 1's mutation budget. Doing
+//     that again to spare some duplication -- in the same release, with three
+//     new types and a new guard also landing -- spends the risk in the wrong
+//     place. Nothing about the split gets harder later: a fourth type is the
+//     moment to move all four column groups together, in a migration that does
+//     nothing else.
+//  2. **THE FOUR COLUMNS DO NOT ACTUALLY AGREE.** `recipient_salutation` exists
+//     because a quote PRINTS A GREETING, and so does a letter. An agreement does
+//     not: an NDA has no "Dear Ms Smith" in it, it has parties. So a common
+//     table either carries a column that is structurally empty for two of its
+//     four types -- 0016's rejected "one table, several shapes, no guarantees",
+//     in miniature and in the table built to avoid it -- or it holds three
+//     columns while the salutation stays behind on two of them, which is a
+//     shared table that shares most of a group.
+//  3. **"RECIPIENT" IS THE QUOTE'S NOUN.** A quote has a recipient; an agreement
+//     has PARTIES, and a MUTUAL NDA has two of them symmetrically. A table
+//     called `document_parties` holding one recipient row per document is the
+//     quote's model wearing a general name, which is precisely how `documents`
+//     became a quote table. A real parties table is one row PER PARTY -- and
+//     nothing here motivates one, because even a mutual NDA stores exactly one:
+//     the other party is the issuer, which is `org_profile` and is already on
+//     the letterhead. Building the general shape for a second row that no type
+//     has is how the first mistake gets made again.
+//
+// So the party columns are spelled out per detail table, deliberately, and the
+// two spellings are deliberately NOT identical: a letter has a salutation and a
+// subject, an agreement has neither and has a term and a jurisdiction instead.
+// @conduit/shared's DOCUMENT_PARTY_CAPS shares the LENGTHS, which is the only
+// part of the duplication that can silently drift into a bug.
+export const documentLetters = pgTable("document_letters", {
+  documentId: uuid("document_id").primaryKey().references(() => documents.id),
+  // document_quotes.type's twin, and the composite foreign key below is why it
+  // exists. A constant: NOT NULL DEFAULT 'letter' with a CHECK pinning it, so no
+  // writer mentions it and none can change it.
+  type: text("type").notNull().default("letter"),
+  // The `Re:` line. Optional, because a letter without one is ordinary and a
+  // subject invented by the software would be worse than none.
+  subject: text("subject").notNull().default(""),
+  // THE ADDRESSEE, SNAPSHOT AT ISSUE for document_quotes' reason, with one
+  // difference worth stating: a quote is frozen so its snapshot can never be
+  // refreshed, while a letter's IS refreshed -- by a redraft, from the form, by
+  // a person who is looking at it. That is the correct lifetime for a letter:
+  // you are about to send this, so it should say where you are sending it now.
+  // What it must NOT be is a live join, or a company that moved office would
+  // silently change the address on a letter already posted.
+  recipientName: text("recipient_name").notNull(),
+  recipientContactName: text("recipient_contact_name").notNull().default(""),
+  recipientSalutation: text("recipient_salutation").notNull().default(""),
+  recipientAddress: text("recipient_address").notNull().default(""),
+  // TIPTAP HTML, exactly as `meetings.notes` is, and it reaches the page as a
+  // MergeHtml rather than as escaped text -- the second value in Conduit ever to
+  // do so. Sanitised on write with the DOCUMENT profile (services/documents.ts),
+  // and again as part of the merged page.
+  bodyHtml: text("body_html").notNull(),
+}, (t) => [
+  foreignKey({
+    name: "document_letters_document_id_type_fk",
+    columns: [t.documentId, t.type],
+    foreignColumns: [documents.id, documents.type],
+  }),
+  check("document_letters_type_is_letter", sql`type = 'letter'`),
+]);
+export type DocumentLetterRow = typeof documentLetters.$inferSelect;
+
+// THE NDA AND THE MUTUAL NDA -- one table, two types.
+//
+// **ONE TABLE BECAUSE THEY DIFFER IN WHAT THEY OBLIGE, NOT IN WHAT THEY NEED.**
+// Both are with one party, effective from one date, for one term, under one
+// jurisdiction. The whole difference between a one-way and a mutual NDA is which
+// side may disclose, and that is wording -- so it lives in the TEMPLATE, which is
+// editable in Settings, and not in a column. Two tables would have been two
+// identical column lists and two readers.
+//
+// WHICH MAKES THE COMPOSITE FOREIGN KEY DIFFERENT FROM THE OTHER TWO, and it is
+// the first one that is not a constant. `document_quotes.type` is pinned to
+// 'quote' and `document_letters.type` to 'letter'; this one is pinned to a SET,
+// so the CHECK reads `type IN ('nda','mutual_nda')` and the key then says "the
+// document this row describes is one of these two". It still cannot disagree with
+// the row it describes -- that is what the key enforces -- but unlike the other
+// two it is a field a writer has to supply, because the writer is the only thing
+// that knows which of the two this is.
+//
+// **AND THAT IS WHAT THE KEY BUYS HERE**, in the shape 0017's comment set out:
+// without it, `INSERT INTO document_agreements` naming a LETTER's id succeeds,
+// and the row is not inert -- the record's document list reads agreements by
+// joining on document_id, so the letter would come back as an NDA with a term and
+// a jurisdiction, from code that never asked what it was.
+export const documentAgreements = pgTable("document_agreements", {
+  documentId: uuid("document_id").primaryKey().references(() => documents.id),
+  type: text("type").notNull(),
+  // WHEN THE OBLIGATIONS START, WHICH IS NOT WHEN THE PDF WAS MADE. Routinely
+  // backdated (the conversation started before the paperwork) and sometimes
+  // forward-dated (a project that begins next month), so there is deliberately no
+  // CHECK relating it to documents.issue_date: the ordering that looks obvious
+  // would refuse the common case.
+  effectiveDate: date("effective_date").notNull(),
+  // How long confidentiality lasts, in whole months. An integer rather than free
+  // text because "which agreements expire this year" is a question about a date
+  // computed from this and effective_date, and `'3 yrs (auto-renewing)'` answers
+  // it for nobody. The page prints "36 months" -- see formatAgreementTerm for why
+  // it is not converted to years.
+  termMonths: integer("term_months").notNull(),
+  // The governing law, as the page states it. Free text because there is no list:
+  // "the Netherlands", "England and Wales", "the State of Delaware" and "the
+  // courts of Amsterdam" are all things an NDA says, and an enum here would be a
+  // guess about somebody else's legal practice.
+  jurisdiction: text("jurisdiction").notNull(),
+  // THE COUNTERPARTY, SNAPSHOT AND PERMANENTLY SO -- an agreement is frozen, so
+  // unlike the letter's addressee this can never be corrected. That is the point:
+  // the row records the legal entity the signed page names, and a company renamed
+  // next year has not changed what was agreed this year.
+  partyName: text("party_name").notNull(),
+  // **CHRIS'S "EXACTLY ONE" DECISION, AS A COLUMN.** The spec: an NDA naming a
+  // contact at a company "attaches to the company and names the contact in its
+  // content". This is that content. Empty when the agreement is with an
+  // individual, because then the party IS the person and there is no second name.
+  partyContactName: text("party_contact_name").notNull().default(""),
+  partyAddress: text("party_address").notNull().default(""),
+}, (t) => [
+  foreignKey({
+    name: "document_agreements_document_id_type_fk",
+    columns: [t.documentId, t.type],
+    foreignColumns: [documents.id, documents.type],
+  }),
+  check("document_agreements_type_valid", sql`type IN ('nda','mutual_nda')`),
+  // A TERM IS A POSITIVE NUMBER OF MONTHS AND THE UPPER BOUND IS NOT COSMETIC.
+  // @conduit/shared's AGREEMENT_MAX_TERM_MONTHS is the gate and this is the
+  // backstop, the standing split. `integer` alone would let 2147483647 into a
+  // column whose value gets printed on a legal document as a word.
+  check("document_agreements_term_range", sql`term_months BETWEEN 1 AND 1200`),
+  // The two fields an agreement cannot be missing. Unlike the party's address and
+  // the named contact -- both legitimately absent -- an agreement with no party
+  // and no governing law is not an agreement, and '' is how a writer that dropped
+  // a field would spell it.
+  check("document_agreements_stated", sql`party_name <> '' AND jurisdiction <> ''`),
+]);
+export type DocumentAgreementRow = typeof documentAgreements.$inferSelect;
+
 // Frozen at issue, in the units packages/shared/src/money.ts defines: quantity
 // in THOUSANDTHS, price in CENTS, tax in BASIS POINTS. The stored
 // line_total_cents is what was printed.
@@ -1322,13 +1526,20 @@ export const documentNumberSequences = pgTable("document_number_sequences", {
   //
   // The original sentence's point survives unchanged: a typo'd type here would
   // silently start a private numbering series rather than failing.
-  check("document_number_sequences_type_valid", sql`type IN ('quote')`),
+  //
+  // **0019 WIDENS IT BY TWO AND NOT BY THREE**, which is the whole of what makes
+  // it a narrower list than documents_type_valid rather than the same list
+  // written twice. Task 3 added three types; `nda` and `mutual_nda` are numbered
+  // and `letter` is not, so a writer that called allocateNumber for a letter
+  // still fails on this INSERT instead of minting `DOC-2026-0001`.
+  check("document_number_sequences_type_valid", sql`type IN ('quote','nda','mutual_nda')`),
 ]);
 export type DocumentNumberSequenceRow = typeof documentNumberSequences.$inferSelect;
 
 // One editable template per document type, seeded with a working default in the
 // migration that adds the type -- drizzle/0009_*.sql for the quote, 0017 for the
-// meeting summary -- so a document renders before anyone has opened Settings.
+// meeting summary, 0019 for the letter and the two agreements -- so a document
+// renders before anyone has opened Settings.
 // NOT sanitised with the mail profile: mail's exists to defang HTML written by
 // strangers, and it strips exactly the page-layout CSS a printed document is
 // made of. See services/documents-template.ts for the profile this one uses.
@@ -1342,6 +1553,9 @@ export const documentTemplates = pgTable("document_templates", {
   // documents_type_valid's list exactly, and this one really is the same set:
   // every type Conduit can produce has an editable template, which is what makes
   // `documentTypeSchema` the right parser for the :type route param.
-  check("document_templates_type_valid", sql`type IN ('quote','meeting_summary')`),
+  check(
+    "document_templates_type_valid",
+    sql`type IN ('quote','meeting_summary','letter','nda','mutual_nda')`,
+  ),
 ]);
 export type DocumentTemplateRow = typeof documentTemplates.$inferSelect;

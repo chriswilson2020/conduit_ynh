@@ -26,6 +26,13 @@ import { migrationsFolder } from "../db/client.js";
 const TEMPLATE_MIGRATIONS: Record<string, string[]> = {
   quote: ["0009_calm_rhodey.sql", "0011_sharp_skullbuster.sql"],
   meeting_summary: ["0017_meeting_summary.sql"],
+  // THREE TYPES OUT OF ONE MIGRATION, which is what broke the reader below. 0009
+  // and 0017 each seed exactly one template and each does it in the file's LAST
+  // statement, so the anchor could be the end of the file; 0019 seeds three, and
+  // two of them are not last. See the pattern in seededTemplate.
+  letter: ["0019_letter_and_agreements.sql"],
+  nda: ["0019_letter_and_agreements.sql"],
+  mutual_nda: ["0019_letter_and_agreements.sql"],
 };
 
 /**
@@ -93,10 +100,28 @@ export function seededTemplate(type: string): string {
   for (const file of files) {
     const sql = readFileSync(join(migrationsFolder(), file), "utf8");
     if (body === null) {
-      // Anchored on the INSERT's own literal and on the end of the file, so the
-      // long prose header every one of these migrations carries -- apostrophes
-      // and all -- cannot be mistaken for a template body.
-      const match = new RegExp(`VALUES \\('${type}', '([\\s\\S]*)'\\);\\s*$`).exec(sql);
+      // Anchored on the INSERT's own literal, and on the end of its STATEMENT
+      // rather than the end of the file -- so the long prose header every one of
+      // these migrations carries, apostrophes and all, cannot be mistaken for a
+      // template body.
+      //
+      // **THE ANCHOR USED TO BE `\\);\\s*$` AND THAT WAS AN ACCIDENT OF THERE
+      // BEING ONE SEED PER FILE.** 0009 and 0017 each end with their INSERT, so
+      // "the end of the file" and "the end of this statement" were the same
+      // place. 0019 seeds three templates, and the letter's and the NDA's are
+      // followed by two more statements -- so the old greedy pattern would have
+      // matched from the letter's opening quote all the way to the mutual NDA's
+      // closing one and handed back three templates concatenated, silently. Now
+      // it is non-greedy and stops at a `');` that is followed by drizzle's own
+      // statement separator or by the end of the file.
+      //
+      // WHAT THAT COSTS: a template body containing the literal text `');`
+      // followed by a newline would terminate the match early. None does, and one
+      // that did would announce itself as a template that stopped matching the
+      // migrated database -- which is the assertion in schema.test.ts's drill.
+      const match = new RegExp(
+        `VALUES \\('${type}', '([\\s\\S]*?)'\\);(?=--> statement-breakpoint|\\s*$)`,
+      ).exec(sql);
       if (match?.[1] === undefined) {
         throw new Error(`could not find the seeded ${type} template in ${file}`);
       }
@@ -142,6 +167,16 @@ export function seededQuoteTemplate(): string {
 /** The meeting summary template a fresh install has (Phase 9, migration 0017). */
 export function seededMeetingSummaryTemplate(): string {
   return seededTemplate("meeting_summary");
+}
+
+/** The letter template a fresh install has (Phase 9 Task 3, migration 0019). */
+export function seededLetterTemplate(): string {
+  return seededTemplate("letter");
+}
+
+/** The NDA and mutual NDA templates a fresh install has (migration 0019). */
+export function seededAgreementTemplate(type: "nda" | "mutual_nda"): string {
+  return seededTemplate(type);
 }
 
 /**

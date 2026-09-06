@@ -8,8 +8,23 @@ import { documentNumberSequences } from "../db/schema.js";
  * allows -- two formatted numbers can only collide if two types share a prefix. If a
  * future type is ever given one that collides, the unique constraint rejects the
  * second document loudly at issue rather than minting a duplicate.
+ *
+ * **THE TWO AGREEMENTS ARRIVED IN PHASE 9 TASK 3, AND THE COLLISION SENTENCE ABOVE
+ * IS WHY THEY ARE `NDA` AND `MNDA` RATHER THAN `NDA` AND `NDA-M`.** The prefixes
+ * have to be distinct as STRINGS and not merely as names: `NDA` and `NDA-M` would
+ * produce `NDA-2026-0001` and `NDA-M-2026-0001`, which do not collide either, but
+ * the second reads as a malformed first and sorts among them. Two separate
+ * sequences, two unmistakable prefixes; documents-number.test.ts pins that the map's
+ * values are pairwise distinct so a third numbered type cannot be given `QUO` by
+ * accident and discover it as a refused document on somebody's install.
+ *
+ * A LETTER IS NOT HERE AND MUST NOT BE, and its absence is load-bearing rather
+ * than an omission: `?? "DOC"` below would mint `DOC-2026-0001` for any type that
+ * reached this function, and the thing that stops a letter reaching it is
+ * `document_number_sequences_type_valid`, which names only the numbered types.
+ * @conduit/shared's documentTypeNumbered has the three reasons a letter has none.
  */
-const PREFIX: Record<string, string> = { quote: "QUO" };
+const PREFIX: Record<string, string> = { quote: "QUO", nda: "NDA", mutual_nda: "MNDA" };
 
 /**
  * QUO-2026-0001. Four digits is a MINIMUM width on both halves, not a field size: the
