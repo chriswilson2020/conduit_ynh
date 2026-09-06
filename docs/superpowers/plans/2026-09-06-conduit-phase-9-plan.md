@@ -479,15 +479,347 @@ the suite's advisory lock is cluster-wide.
 
 ## Task 3: The letter, and the NDA pair
 
-- [ ] **Letter**: a company or contact, plus a rich-text body the user types. Reuses the composer
+- [x] **Letter**: a company or contact, plus a rich-text body the user types. Reuses the composer
       and the sanitiser. **Not frozen** — it wants redrafting before it goes.
-- [ ] **NDA and mutual NDA**: a company or contact, plus effective date, term and jurisdiction.
+- [x] **NDA and mutual NDA**: a company or contact, plus effective date, term and jurisdiction.
       **FROZEN on issue**, with the quote's guard — an agreement you can silently edit after
       sending is a different kind of document.
-- [ ] **"Exactly one" will be tested here.** An NDA names a contact at a company; the spec says it
+- [x] **"Exactly one" will be tested here.** An NDA names a contact at a company; the spec says it
       attaches to the **company** and names the contact in its content. **If that turns out wrong
       in practice, report it — do not quietly widen the CHECK.** It is Chris's decision and
       reopening it is his call.
+
+### Task 3 as built — v1.8.0, migration 0019
+
+`letter`, `nda` and `mutual_nda` are real types: `documentTypeSchema`, the three
+widened CHECKs, `document_letters` and `document_agreements`, three templates seeded
+by 0019, `issueLetter` / `issueAgreement` / `redraftLetter` / `listRecordDocuments`,
+`GET`/`POST /api/companies/:id/documents` and its contact twin, `PUT
+/api/documents/:id`, a Documents section on both detail pages, and three more tabs in
+the Settings template editor. A letter attaches to a company or a contact and is
+**not frozen**; both agreements attach to the same two records, are **numbered** and
+are **frozen on issue**.
+
+#### THE GUARD, WHICH IS THE POINT OF THE TASK
+
+Task 1 shipped `documents.frozen` with "nothing READS the column yet". It is read in
+three places now, and the third is the one that matters.
+
+1. **`redraftLetter` refuses first**, with a typed `DocumentFrozenError` → 409
+   `frozen`, before anything spawns.
+2. **Its UPDATE carries `AND frozen = false`**, so the test and the write are one
+   statement.
+3. **`conduit_document_frozen_guard` — a trigger — refuses everything that is not
+   `redraftLetter`.** `BEFORE UPDATE OR DELETE` on `documents` (with `WHEN
+   (OLD.frozen)`) and on all three detail tables, which look the parent up. It holds
+   for a psql session, an import, and a call site nobody has written yet.
+
+**A CHECK CANNOT EXPRESS THIS RULE AND THAT IS WHY THE TRIGGER IS THE FIRST ONE IN
+THIS SCHEMA.** A CHECK sees only the row being written; `frozen` does not say "this
+value must be legal", it says "this row may not change", and OLD is a thing only a
+trigger has. It is declared in the migration and not in `schema.ts` — drizzle-kit has
+no vocabulary for a trigger, exactly as it has none for 0013's `conduit_lower_emails`
+— so 0013's consequence stands: **`drizzle-kit push` must never be introduced.**
+
+**THE DETAIL TABLES ARE GUARDED TOO, AND THAT IS THE HALF THAT MATTERS MOST.** The
+parent row is where `frozen` lives, but the PRICE somebody was sent is in
+`document_quotes` and the lines are in `document_line_items`. A guard on the parent
+alone would leave both editable, with the `documents` row sitting there untouched
+while the page it points at became a lie.
+
+**IT BLOCKS NOTHING THAT EXISTED.** Verified across `packages/` and `e2e/` before it
+was written: there was not one UPDATE or DELETE against any of the four tables.
+TRUNCATE does not fire row-level triggers, so `truncateAll` is untouched; `restore`
+loads a dump through psql after dropping the schema, so the trigger travels with the
+dump like 0013's function.
+
+#### Numbering per type — argued
+
+**A LETTER TAKES NO NUMBER.** The three reasons are at `documentTypeNumbered` and each
+is the summary's argument re-checked rather than assumed to carry over:
+
+1. **The external handle is not missing, it is already taken.** A letter's reference
+   is the operator's own convention — `Our ref:`, a project code — typed into the
+   subject or the body. `LET-2026-0001` would sit beside it meaning nothing outside
+   this database, and a document with two references has none.
+2. **The lock is the same lock.** `allocateNumber` holds a `(type, year)` row lock to
+   commit with the render inside it, so every letter of a year would queue behind
+   every other one for a string nobody quotes back.
+3. **The third reason is the summary's, SHARPENED.** A summary can be produced again;
+   a letter is REDRAFTED, which is worse for a number rather than better. Producing
+   again at least leaves each number attached to one immutable page; a redraft
+   rewrites the page UNDER the number, so `LET-2026-0001` would name different
+   content on Tuesday from the content it named on Monday — the one property a
+   document number exists to deny.
+
+**BOTH AGREEMENTS ARE NUMBERED**, the first `true` since the quote, and every one of
+those reasons runs the other way: somebody else's legal team holds the reference;
+"which agreements did we sign in 2026, and are there gaps" is an audit somebody
+actually asks for; and the pathology cannot arise because an agreement is frozen, so
+the number is allocated once and names bytes that can never change. `NDA-` and
+`MNDA-`, two sequences, two prefixes — spelled that way rather than `NDA` and `NDA-M`
+because `documents_number_unique` is global and the formatted numbers are what a
+person reads.
+
+**AT FIVE TYPES `documentTypeFreezes` AND `documentTypeNumbered` NOW ANSWER
+IDENTICALLY, AND THAT IS A COINCIDENCE THAT MUST NOT BE COLLAPSED.** Task 2 predicted
+the pairing ("an NDA is frozen AND numbered, a letter is neither") and argued against
+merging them into one lookup; what arrived is agreement on all five members, which is
+a more tempting coincidence than the prediction. The counterexamples are ordinary:
+Task 4's status report is neither, and a credit note would be frozen and numbered
+while a delivery note is numbered and freely reprinted. `schema.test.ts` asserts the
+two sets as two independent literals rather than as `expect(frozen).toEqual(numbered)`,
+because the second spelling would read as an invariant.
+
+#### `document_parties` — NOT NOW, and what would change that
+
+Task 1 left this to whoever had three examples. **This task had four types and did not
+make the migration.** Three reasons, in the order they weigh (the full argument is at
+`document_letters` in `schema.ts`):
+
+1. **It would be a second migration over Chris's live quote rows in one release, for
+   a refactor rather than a feature.** 0016 is the one migration in this project that
+   has ever moved real data and the spec calls it the phase's highest-consequence
+   item. Doing that again to spare some duplication — in the same release as three
+   new types and a new guard — spends the risk in the wrong place.
+2. **The four columns do not actually agree.** `recipient_salutation` exists because a
+   quote PRINTS A GREETING, and so does a letter. An agreement has no greeting. A
+   common table would either carry a column that is structurally empty for two of its
+   four types — 0016's rejected "one table, several shapes, no guarantees", in the
+   table built to avoid it — or share three columns while the fourth stays behind.
+3. **"Recipient" is the quote's noun.** An agreement has PARTIES. A table called
+   `document_parties` holding one recipient row per document is the quote's model
+   wearing a general name, which is exactly how `documents` became a quote table. A
+   real parties table is one row PER PARTY, and nothing motivates one: even a mutual
+   NDA stores exactly one, because the other party is `org_profile` and is already on
+   the letterhead.
+
+**WHAT WOULD MAKE IT TIME:** a fourth type that needs the party group, at which point
+all four column groups move together in a migration that does nothing else. What is
+shared today is the LENGTHS (`DOCUMENT_PARTY_CAPS`), because a form spelling
+`maxLength={200}` beside a schema that says something else is the only part of this
+duplication that can drift into a bug silently.
+
+### "Exactly one" held — and here is the consequence to look at
+
+**THE NDA DID NOT BREAK IT.** The shape the spec worried about — an NDA naming a
+contact at a company — is exactly the one Chris's answer handles: the document
+attaches to the COMPANY and `document_agreements.party_contact_name` carries the
+individual, which the template prints as "The Recipient acts through Jane Smith." The
+CHECK was not widened, and `schema.test.ts` asserts that a document naming both a
+company and a contact is refused.
+
+**BUT THERE IS A CONSEQUENCE THE SPEC DOES NOT MENTION, AND IT IS THE LETTER'S, NOT
+THE NDA'S.** A letter to Jane at Acme is raised on JANE, so it does not appear on
+ACME's Documents list — and vice versa. `routes.test.ts` asserts that emptiness
+deliberately, because it is the decision working rather than a bug. For an agreement
+that is right: an NDA is with one legal entity and belongs to it. For
+CORRESPONDENCE it is real friction — six months later, somebody opening Acme's record
+sees no letters, because every letter went to a person.
+
+**THE RECOMMENDATION IS A READ, NOT A COLUMN.** If Chris wants a company to show its
+contacts' letters, the fix is a rollup in `listRecordDocuments` — `WHERE company_id =
+$1 OR contact_id IN (SELECT id FROM contacts WHERE company_id = $1)`, behind a flag
+the section can offer — and not a second owner. Widening the CHECK would make every
+reader ask "which of the two is this document really about", which is the question
+`num_nonnulls(...) = 1` exists to answer. **Reported rather than built: it is Chris's
+decision, and it is a different decision from the one the spec asked about.**
+
+### A REAL GAP THAT IS NOT THIS TASK'S TO CLOSE: which entity, per type
+
+`documents_exactly_one_entity` says exactly one of five. **It does not say WHICH one
+for a given type.** Nothing in the database stops a letter carrying a `deal_id` or a
+quote carrying a `meeting_id`; only the writers do. That has been true since Task 2
+(a summary could carry a deal) and this task made it true for three more types —
+`redraftLetter` has to cope with a letter attached to neither a company nor a
+contact, a shape no writer can produce, and it throws rather than dereferencing it.
+
+The CHECK that would close it is five lines:
+
+```sql
+ALTER TABLE "documents" ADD CONSTRAINT "documents_entity_matches_type" CHECK (
+     (type = 'quote'           AND deal_id    IS NOT NULL)
+  OR (type = 'meeting_summary' AND meeting_id IS NOT NULL)
+  OR (type IN ('letter','nda','mutual_nda') AND num_nonnulls(company_id, contact_id) = 1)
+);
+```
+
+**IT IS NOT IN 0019, DELIBERATELY.** It is a rule about all five types, two of which
+are not this task's, and adding it now means Task 4 widens a CHECK whose shape was
+chosen without the status report in front of it — which is the same mistake 0016 made
+by generalising a recipient model from the only type that existed, and which this task
+declined to repeat over `document_parties`. Every existing row would satisfy it, so it
+is a free migration whenever it is taken.
+
+### What the spec and the plan did not say, and needed to
+
+1. **THE MIGRATION TRAP FIRED A FOURTH TIME OUT OF FOUR, IDENTICALLY.**
+   `drizzle-kit generate` stamped 0019's journal `when` as **1788691029541**, which
+   falls between 0013's 1788600000000 and 0014's 1788700000000 — so 0019 would have
+   been skipped, silently and without error, on every install already carrying 0014.
+   Hand-set to 1789200000000. **The SQL itself was correct this time** (both CREATE
+   TABLEs, the four foreign keys and the five CHECK swaps are drizzle-kit's work and
+   are kept); what it cannot know about is the trigger, the two indexes and the three
+   template rows.
+2. **`test/seed-template.ts` COULD NOT READ A MIGRATION THAT SEEDS MORE THAN ONE
+   TEMPLATE, AND WOULD HAVE FAILED SILENTLY.** Its pattern was anchored on the end of
+   the FILE (`'\);\s*$`), which was an accident of 0009 and 0017 each ending with
+   their INSERT. 0019 seeds three, so the greedy match would have run from the
+   letter's opening quote to the mutual NDA's closing one and handed back all three
+   templates concatenated AS THE LETTER TEMPLATE — and every suite that seeds its own
+   copy would have merged against it. Now non-greedy and anchored on drizzle's own
+   `--> statement-breakpoint`.
+3. **THE TRIGGER SHADOWS A CHECK ON ANY FROZEN TYPE, AND ONE EXISTING TEST WAS
+   PROBING THROUGH THE SHADOW.** `document_quotes_type_is_quote` was tested with an
+   `UPDATE document_quotes SET type = ...`; a quote is frozen, so the guard now
+   refuses first — same SQLSTATE, different constraint name — and the assertion went
+   red on the NAME rather than on the refusal. The CHECK is not dead (nothing guards
+   an INSERT, which is also the reachable path), so the probe moved there and the
+   UPDATE is asserted as a refusal by whichever guard gets there first. **Generally:
+   for a frozen type, a detail-table CHECK can only be probed on INSERT from now on.**
+4. **THE EXPORT'S `documents.csv` NEVER HAD `company_id` OR `contact_id`, AND THE
+   FAILURE WOULD HAVE BEEN QUIETER THAN TASK 2'S.** Task 2 found an INNER JOIN
+   dropping every meeting summary. A letter would not have been dropped — its
+   `documents` row would have come out looking perfect — it would have come out with
+   its subject, its addressee and its BODY absent, and named no record at all. Six
+   letter columns, six agreement columns and the company/contact pair are in the
+   sheet now. **Neither the spec nor the plan mentions the export, for the second
+   task running.**
+5. **THE SPEC AND THE PLAN BOTH SAY "a record's Documents TAB". THE CODEBASE HAS
+   NEVER HAD ONE.** The deal's is a section on the page and carries a comment saying
+   why it is not a rail tab: "a document belongs to a deal alone; a sixth tab there
+   would be empty on three of the four." Half of that expired with this task and the
+   other half expires with Task 4. It is still a section, deliberately —
+   consolidating means moving a shipped surface with its e2e specs and its
+   `deal-documents` id, and the rail's tab strip carries a MEASURED phone claim about
+   the last tab being reachable (`e2e/mobile.spec.ts`). **Flagged for Task 4, which
+   will have four records in front of it instead of three.**
+6. **`documentTypeSchema`'s OWN COMMENT STILL CARRIED THE SPEC'S MISCOUNT.** It called
+   "letter, nda, mutual_nda, project_status_report" *the other three*, which is four —
+   Task 2 recorded that the phase is four templates and THREE forms, and the wrong
+   number had already reached the code. Corrected.
+7. **`drizzle-kit generate` EMITTING NOTHING WOULD NOT CLOSE THE GAP TASK 2.5 FLAGGED
+   IT FOR — measured, not reasoned.** Task 2.5 asked whoever took Task 3 to consider
+   a test asserting `drizzle-kit generate` produces no migration, to catch a
+   `schema.ts` `.default()` that has drifted from `drizzle/`. Run against this branch
+   after 0019, generate emits nothing, so the test would pass and it would catch a
+   `.default()` edited without a migration. **What it cannot see is everything
+   `schema.ts` cannot express**, and that set is no longer small: it is now one
+   function, five triggers and six indexes (`documents_deal_idx`,
+   `documents_meeting_idx`, the two 0019 adds, and 0013's two expression indexes).
+   None of those appears in `schema.ts` OR in the snapshots, so the diff is empty
+   whether they exist or not — a migration that DROPPED `documents_company_idx` would
+   pass the test. **Not built**, per the brief's "report rather than build": as a unit
+   test it also has to shell out to `drizzle-kit` and write into a temp `out`
+   directory, which is a fixture, not an assertion.
+
+### Mutation evidence
+
+**69 mutations. 67 killed, one green by design, one proved equivalent and argued.**
+Run against `schema.test.ts`, `documents-letter.test.ts`, `documents-number.test.ts`,
+`routes.test.ts`, `documents-errors.test.ts` and `export.test.ts`, on an isolated
+remote directory and database.
+
+**The harness was calibrated in both directions before any of it counted.** M00
+changes only a comment and must report GREEN; it did (131 passed, 0 failed). M01
+inverts an `undefined` check in the letter writer and must report RED; it did, naming
+22 tests.
+
+**AND THE HARNESS ITSELF HAD A BUG THAT PRODUCED A FALSE SURVIVOR.** The remote
+command ended `| tail -6`, so the exit status was TAIL's — always 0 — and a mutation
+that stops the suite from STARTING (a migration that cannot apply) printed no
+"Tests ... failed" line and was scored SURVIVED. `set -o pipefail` is the fix and the
+two affected mutations were re-run under it; both are red. Recorded because "the
+instrument reported green" and "nothing broke" looked identical, which is the failure
+mode this project keeps finding.
+
+#### The guard, which is what this task is about
+
+| mutation | result |
+|---|---|
+| `redraftLetter`'s early `frozen` check removed | KILLED (3) |
+| ...and the UPDATE's `AND frozen = false` removed **as well** — both service guards gone | **KILLED (3), by the trigger** |
+| the `documents` trigger never created | KILLED (3) |
+| the `document_quotes` trigger never created | KILLED (4) |
+| the `document_line_items` trigger never created | KILLED (1) |
+| the `document_agreements` trigger never created | KILLED (1) |
+| the trigger's `WHEN (OLD.frozen)` removed, so it fires on every row | KILLED (4) |
+| `BEFORE UPDATE OR DELETE` narrowed to `BEFORE UPDATE` | KILLED (3) |
+| the detail guard's `IF owner_frozen` inverted | KILLED (9) |
+| the detail guard returns NULL, silently cancelling the write | KILLED (5) |
+| `documents_frozen_matches_type` not widened | KILLED (18) |
+| `documentTypeFreezes` says an NDA is not frozen / a letter is | KILLED (14 / 25) |
+| the service hardcodes `frozen: false` for an agreement / `true` for a letter | KILLED (11 / 22) |
+| the 409 `frozen` arm removed from the route mapper | KILLED (2) |
+| the trigger's route arm matches SQLSTATE 23514 alone | KILLED (1) |
+| ...reads `error.message` instead of the driver's `cause.message` | KILLED (1) |
+
+**THE ONE THAT MATTERS MOST IS THE SECOND ROW.** With BOTH service-side guards
+deleted, `redraftLetter` still cannot edit a quote: the UPDATE reaches the database
+and `conduit_document_frozen_guard` refuses it. The tests go red because the error is
+the trigger's rather than `DocumentFrozenError`, and the quote's row is unchanged
+either way — which is the claim.
+
+#### Everything else, in groups
+
+Numbering (6): `documentTypeNumbered` flipped for either type; `documents_number_matches_type`
+not widened; `document_number_sequences_type_valid` widened to admit a letter; the
+mutual NDA sharing the NDA's prefix; the NDA prefix missing so it falls back to `DOC`.
+
+The migration (10): the journal `when` put back to what drizzle-kit generated; each of
+the three type CHECKs not widened; the two indexes not built; either composite foreign
+key dropped; `document_agreements_term_range` narrowed by one at each end;
+`document_agreements_stated` dropped; `document_letters_type_is_letter` dropped; the
+letter template losing `{{document.body}}`; the letter template not inserted at all.
+
+The service (19): the body not sanitised; the empty-after-sanitising check removed; the
+body emitted escaped; the subject emitted RAW; the term losing its singular; the raw
+month count exposed to the template; the filename losing its date, its truncation, or
+its subject-before-recipient rule; the redraft skipping its type check, keeping the old
+issue date, or keeping the old file; the writer dropping the subject, swapping the
+contact name and the salutation, or defaulting an omitted optional — **each of those
+three run separately against the ISSUE path and the REDRAFT path, because the two
+build the same values object and a mutation of one is invisible in the other**; the
+list inner-joining, ordering oldest-first, or reading the wrong record column; the DTO
+blanking the company id; the redraft's "attached to neither" branch removed.
+
+The record gate (3): the archived check removed for a company or for a contact, and the
+existence check removed.
+
+The export (2): the letter join broken; a missing term exported as `0` rather than blank.
+
+#### TWO SURVIVED THE FIRST PASS AND BOTH ARE NOW CLOSED
+
+| survivor | why it survived | what closed it |
+|---|---|---|
+| `assertRecordIssuable`'s archived check deleted | `attachFile` refuses an archived record too, with the SAME `ArchivedError` — so the error type and an empty `documents` table were identical either way. But `attachFile` runs AFTER the merge, the caps, the render and the blob write | a renderer stub that fails if it is called at all, so the refusal has to arrive before anything spawns. Three assertions now, one per branch and one on the agreement path (where a spent number would be the visible trace) |
+| `redraftLetter`'s "attached to neither a company nor a contact" branch | no writer can produce the row, so nothing reached it | a test that writes the row the way a psql session would — `UPDATE documents SET company_id = NULL, deal_id = ...` — which is also the concrete demonstration of the "which entity, per type" gap above |
+
+#### TWO ARE GREEN AND STAY GREEN, WITH REASONS
+
+1. **Removing the UPDATE's `AND frozen = false` ALONE is green, and it is an
+   equivalent mutant that was measured rather than assumed.** Nothing can change
+   `frozen` under a live row — `documents_frozen_matches_type` ties it to `type`, and
+   the trigger refuses the UPDATE that would try — so the SELECT a few lines above and
+   the UPDATE can never disagree. The clause stays anyway: what makes it unobservable
+   is two OTHER guards holding, and a guard that leans on another guard should still
+   state its own condition. Removing both service-side guards is red (see above).
+2. **`issueAgreement` losing its `SET LOCAL lock_timeout` is green**, exactly as
+   `issueQuote`'s identical line is. It bounds a pile-up of concurrent issues of the
+   same type and year against a saturated renderer; no unit test creates that
+   contention, and one that did would be measuring the renderer's queue rather than
+   this line.
+
+### Counts
+
+Unit suite **4065 passed / 48 skipped in 101 files**, against **3990 / 48 in 100** at
+Task 2.5's tip: **+75 tests, +1 file**
+(`packages/api/src/services/documents-letter.test.ts`). `npm run typecheck` clean. Run
+on an isolated remote directory and database, both removed afterwards —
+`/home/chris/conduit` is shared and the suite's advisory lock is cluster-wide.
+
+`drizzle-kit generate` answers "No schema changes, nothing to migrate" against this
+branch, which is the measurement behind finding 7 above.
 
 ## Task 4: Project status report — the broadest source, and the schedule risk
 
