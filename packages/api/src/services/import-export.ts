@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { inArray } from "drizzle-orm";
-import { unstorableText } from "@conduit/shared";
+import { NOT_IMPORTED_MEMBERS, unstorableText } from "@conduit/shared";
+import type { ImportedMemberName } from "@conduit/shared";
 import type { PlanFindingView, PlanRefusalView } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import { companies, contacts, users } from "../db/schema.js";
@@ -306,8 +307,16 @@ const REVERSIBLE_TRANSFORMS: readonly { name: string; version: number }[] = [
 ];
 
 const MANIFEST_MEMBER = "manifest.json";
-const COMPANIES_MEMBER = "companies.csv";
-const CONTACTS_MEMBER = "contacts.csv";
+// TYPED AS `ImportedMemberName`, WHICH IS THE HALF OF THE DECLARATION THE
+// COMPILER CAN HOLD. @conduit/shared says which members this importer reads;
+// flipping either of these to `imported: false` there makes these two lines
+// stop compiling, so the module cannot go on reading a sheet whose preview note
+// has just told the operator it does not. The opposite mistake -- a member
+// declared imported that nothing here ever opens -- is not a type error, and is
+// caught instead by comparing `applyImport`'s `opened` against
+// `importedMembers()` in services/import-export.test.ts.
+const COMPANIES_MEMBER: ImportedMemberName = "companies.csv";
+const CONTACTS_MEMBER: ImportedMemberName = "contacts.csv";
 
 /**
  * How many rows go into one INSERT.
@@ -787,59 +796,6 @@ function refuse(
   });
 }
 
-/** Every sheet this version does not import, and the specific reason. */
-const NOT_IMPORTED: readonly { member: string; reason: string }[] = [
-  {
-    member: "deals.csv",
-    reason: "the export carries no pipelines or stages for a deal to sit in, and no position "
-      + "for its place in the stage; all three are required and none is in the archive",
-  },
-  {
-    member: "projects.csv",
-    reason: "a project can point at a deal, and deals are not imported; importing one with "
-      + "that link silently dropped would lose a relationship the export does record",
-  },
-  {
-    member: "tasks.csv",
-    reason: "the export carries no position for a task, which is required, and a task can "
-      + "point at a deal or a project, neither of which is imported",
-  },
-  {
-    member: "notes.csv",
-    reason: "a note's author is a Conduit user and the export carries no users, only their "
-      + "ids and names",
-  },
-  {
-    member: "meetings.csv",
-    reason: "a meeting's owner is a Conduit user the export does not carry, and its attendees "
-      + "are exported as display names only -- the archive cannot say whether an attendee was "
-      + "a contact, a user or a guest",
-  },
-  {
-    member: "documents.csv",
-    reason: "the export carries no line items, so an imported quote would show a frozen total "
-      + "over an empty table",
-  },
-  {
-    member: "files.csv",
-    reason: "a stored file's uploader is a Conduit user the export does not carry; the files "
-      + "themselves are in the archive and can be saved out of it by hand",
-  },
-  // ADDED IN THE SAME CHANGE THAT ADDED THE SHEET (Phase 10 Task 1), because
-  // this list is the second thing a new sheet has to be told about and nothing
-  // derives it: without an entry here, time_entries.csv would be the one sheet
-  // an operator's preview said nothing at all about -- neither imported nor
-  // explained -- which is the export's own "missed by three tasks running"
-  // failure wearing the importer's clothes.
-  {
-    member: "time_entries.csv",
-    reason: "an entry's owner is a Conduit user the export does not carry, and an entry must "
-      + "name at least one record -- of which only companies and contacts are imported, so an "
-      + "hour booked to a project, deal or task would arrive with nothing to say what it was "
-      + "spent on",
-  },
-];
-
 /**
  * VALIDATE BEFORE MUTATE, AND PRODUCE A VALUE EITHER WAY.
  *
@@ -1103,7 +1059,21 @@ export async function inspectImport(options: InspectImportOptions): Promise<Impo
       + "describe rows the export does not carry everything for; each one says what is missing "
       + "below, and nothing in them is changed either way.",
   });
-  for (const sheet of NOT_IMPORTED) {
+  // ONE NOTE PER SHEET THIS VERSION DOES NOT IMPORT, WITH THE SPECIFIC REASON.
+  //
+  // **THE LIST IS @conduit/shared's SINCE v1.9.0, and it used to be one of ten
+  // hand-written copies of the export's member list.** It is the copy
+  // whose omission is at once the loudest and the least visible: with no entry
+  // for a sheet, that sheet is the one thing this preview says NOTHING about --
+  // neither imported nor explained -- so the operator is not told it was
+  // skipped, and finds the empty table later instead. The members and their
+  // reasons now sit in one union, where a member that is not imported cannot
+  // fail to carry a reason.
+  //
+  // Skipped where the archive does not HAVE the member: an export from an older
+  // Conduit has fewer sheets, and a note about a sheet that is not in the file
+  // is a note about nothing.
+  for (const sheet of NOT_IMPORTED_MEMBERS) {
     if (payload.byName(sheet.member) === undefined) continue;
     findings.push({
       severity: "note",

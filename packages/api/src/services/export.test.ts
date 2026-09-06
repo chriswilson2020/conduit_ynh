@@ -12,6 +12,7 @@ import { pipeline } from "node:stream/promises";
 import { createReadStream, createWriteStream } from "node:fs";
 import { promisify } from "node:util";
 import type { Database } from "../db/client.js";
+import { EXPORT_MEMBER_NAMES, MEMBER_BY_TABLE } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
 import { saveBlob } from "./blobs.js";
@@ -424,11 +425,16 @@ describe("withExportSnapshot", () => {
 describe("export archive shape", () => {
   itZip("contains every entity sheet and a manifest", async () => {
     const root = await extract(await writeArchive());
-    expect(await memberPaths(root)).toEqual([
-      "companies.csv", "contacts.csv", "deals.csv", "documents.csv", "files.csv",
-      "manifest.json", "meetings.csv", "notes.csv", "projects.csv", "tasks.csv",
-      "time_entries.csv",
-    ]);
+    expect(await memberPaths(root))
+      .toEqual([...EXPORT_MEMBER_NAMES, "manifest.json"].sort());
+
+    // AND IN THE DECLARED ORDER. memberPaths sorts, so the assertion above is a
+    // set: it would be just as green with the sheets written backwards. The
+    // manifest records them in the order they were added, and that order is a
+    // property of a SHIPPED FORMAT -- @conduit/shared's list is where it is
+    // decided, and reordering it reorders the archive.
+    const manifest = await readManifest(root);
+    expect(manifest.members.map((member) => member.path)).toEqual([...EXPORT_MEMBER_NAMES]);
   });
 
   itZip("records the format, app and schema versions and the timestamp", async () => {
@@ -457,7 +463,9 @@ describe("export archive shape", () => {
 
     const root = await extract(await writeArchive());
     const manifest = await readManifest(root);
-    expect(manifest.members.length).toBe(11);
+    // Every sheet, plus the one attached blob. manifest.json is not a member of
+    // itself -- a digest over a file containing that digest cannot exist.
+    expect(manifest.members.length).toBe(EXPORT_MEMBER_NAMES.length + 1);
     for (const member of manifest.members) {
       const bytes = await readFile(path.join(root, member.path));
       expect(createHash("sha256").update(bytes).digest("hex"), member.path).toBe(member.sha256);
@@ -1450,16 +1458,22 @@ describe("export time entries", () => {
  * claim that each absence was decided rather than forgotten.
  */
 describe("export coverage", () => {
-  /** Which member carries each table. Several tables share documents.csv, which
-   * is one row per document with its detail tables joined on -- see
-   * documentsSheet for why that is one sheet and not four. */
-  const EXPORTED: Record<string, string> = {
-    companies: "companies.csv", contacts: "contacts.csv", deals: "deals.csv",
-    projects: "projects.csv", tasks: "tasks.csv", notes: "notes.csv",
-    meetings: "meetings.csv", time_entries: "time_entries.csv", files: "files.csv",
-    documents: "documents.csv", document_quotes: "documents.csv",
-    document_letters: "documents.csv", document_agreements: "documents.csv",
-  };
+  /**
+   * Which member carries each table -- @conduit/shared's declaration, read here
+   * rather than restated. Several tables share documents.csv, which is one row
+   * per document with its detail tables joined on (see documentsSheet for why
+   * that is one sheet and not four).
+   *
+   * **THIS IS THE OTHER END OF THE DERIVATION, AND IT IS WHY DERIVING EVERYTHING
+   * FROM ONE LIST IS NOT A WAY OF LOSING A SHEET QUIETLY.** Every other reader
+   * of that list would be perfectly green if a member were DELETED from it: the
+   * export would stop writing the sheet, and every expectation would stop
+   * expecting it. This test is the one that would not, because what it compares
+   * the list against is the database's own catalogue -- the deleted member's
+   * table would then be carried by nothing and declared unexported by nobody,
+   * and it fails below by name.
+   */
+  const EXPORTED = Object.fromEntries(MEMBER_BY_TABLE);
 
   /** Why each remaining table is absent. One sentence each, and each one is a
    * decision somebody made rather than a table nobody thought about. */
@@ -1509,9 +1523,11 @@ describe("export coverage", () => {
     const undeclared = tables.filter((t) => !(t in EXPORTED) && !(t in NOT_EXPORTED));
     expect(
       undeclared,
-      "these tables are neither exported nor declared unexported. Add a *Sheet to "
-      + "services/export.ts, or a one-line reason to NOT_EXPORTED above -- but decide, because "
-      + "the readable export is the half that never picks a new table up for free.",
+      "these tables are neither exported nor declared unexported. Add the table to a "
+      + "member of EXPORT_MEMBERS in @conduit/shared (and a builder for it in "
+      + "services/export.ts, which will not compile until you do), or a one-line reason to "
+      + "NOT_EXPORTED above -- but decide, because the readable export is the half that never "
+      + "picks a new table up for free.",
     ).toEqual([]);
 
     // Neither map may name a table that is not there: a stale entry would let a

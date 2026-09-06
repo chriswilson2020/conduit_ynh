@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { promisify } from "node:util";
+import { EXPORT_MEMBER_NAMES } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { buildApp } from "../app.js";
 import { createCompany } from "../services/companies.js";
@@ -132,12 +133,12 @@ describe("GET /api/export", () => {
     });
     expect(response.statusCode).toBe(200);
 
+    // WHAT A REAL DOWNLOAD UNZIPS TO, held against @conduit/shared's declaration
+    // of what the archive contains -- plus the two things that are not sheets:
+    // the manifest, and the files/ directory the blobs are written into.
     const root = await extractResponse("download", response.rawPayload);
-    expect((await readdir(root)).sort()).toEqual([
-      "companies.csv", "contacts.csv", "deals.csv", "documents.csv", "files",
-      "files.csv", "manifest.json", "meetings.csv", "notes.csv", "projects.csv", "tasks.csv",
-      "time_entries.csv",
-    ]);
+    expect((await readdir(root)).sort())
+      .toEqual([...EXPORT_MEMBER_NAMES, "files", "manifest.json"].sort());
 
     // The bytes, unchanged, through the whole HTTP path.
     expect(await readFile(path.join(root, "files", "Angebot-M\u00FCller.pdf"))).toEqual(content);

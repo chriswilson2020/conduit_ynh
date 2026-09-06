@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { eq } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
+import { NOT_IMPORTED_MEMBERS } from "@conduit/shared";
 import type { CsvMapping, PlanView } from "@conduit/shared";
 import { buildApp } from "../app.js";
 import type { Config } from "../config.js";
@@ -948,17 +949,18 @@ describe("the exact importer", () => {
     // assertion alone would pass on eight copies of one sentence, so the
     // messages are checked for the specific gaps too.
     //
-    // EXACTLY EIGHT, NOT "AT LEAST" -- which is a correction rather than a
-    // tidy-up. `toBeGreaterThanOrEqual(7)` was green for a NINTH sheet arriving
-    // with no NOT_IMPORTED entry and therefore no finding at all, because the
-    // seven that already had one still cleared the bar. That is precisely the
-    // "a new sheet nobody told the other half about" failure the export side of
-    // this release is written against, and the loose comparison was the only
-    // thing standing where it would have shown.
-    expect(skipped.length).toBe(8);
+    // EXACTLY AS MANY AS ARE DECLARED, NOT "AT LEAST" -- which is a correction
+    // rather than a tidy-up. `toBeGreaterThanOrEqual(7)` was green for a NINTH
+    // sheet arriving with no NOT_IMPORTED entry and therefore no finding at all,
+    // because the seven that already had one still cleared the bar. That is
+    // precisely the "a new sheet nobody told the other half about" failure the
+    // export side of this release is written against, and the loose comparison
+    // was the only thing standing where it would have shown. The number now
+    // comes from @conduit/shared, so it cannot be left behind by a tenth.
+    expect(skipped.length).toBe(NOT_IMPORTED_MEMBERS.length);
     const all = skipped.map((finding) => finding.message).join(" ");
-    for (const sheet of ["deals", "tasks", "projects", "notes", "meetings", "documents", "time_entries"]) {
-      expect(all, `no finding names ${sheet}`).toContain(sheet);
+    for (const { member } of NOT_IMPORTED_MEMBERS) {
+      expect(all, `no finding names ${member}`).toContain(member);
     }
   });
 

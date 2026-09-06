@@ -5,7 +5,8 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { eq } from "drizzle-orm";
 import yazl from "yazl";
-import { decimalFromCents } from "@conduit/shared";
+import { EXPORT_MEMBERS, decimalFromCents } from "@conduit/shared";
+import type { ExportMemberName } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import { readMigrationJournal } from "./migration-journal.js";
 import {
@@ -17,6 +18,15 @@ import { csvDocument } from "./csv.js";
 
 // THE READABLE HALF (7.6 Task 1). A plain ZIP the operator opens in Excel: one
 // CSV per entity, the stored files under files/, and a manifest.json.
+//
+// WHICH SHEETS IT HAS IS NO LONGER DECIDED HERE (v1.9.0). @conduit/shared's
+// EXPORT_MEMBERS is the list, and this module supplies the QUERIES -- one
+// builder per member, in SHEET_BUILDERS, which the compiler holds against that
+// list. Everything below still writes the archive; nothing below gets to decide
+// on its own what is in it. The reason is in that module's header: a new sheet
+// used to have to be told to TEN separate hand-written places, three of them in
+// the product, and Phase 9 shipped an export missing three tables in a row with
+// the obligation written down in three documents.
 //
 // IT IS NOT RESTORABLE, AND THAT IS THE POINT. The backup (Task 2) is the exact
 // artefact; this one is the legible one, and Task 3's Settings page says so in
@@ -430,9 +440,13 @@ function contactName(firstName: string | null, lastName: string | null): string 
 // below filters on archived_at, and a test asserts that for every table that
 // has the column.
 
+/**
+ * A sheet's CONTENTS. It does not carry its own name any more: the member it is
+ * written as comes from `EXPORT_MEMBERS`, which is the key it was fetched under
+ * (see `SHEET_BUILDERS`). A `name` field here would have been a second place per
+ * sheet where a member's filename is spelled, and the two could differ.
+ */
 interface Sheet {
-  /** The member name, e.g. "companies.csv". */
-  name: string;
   header: readonly string[];
   rows: readonly (readonly string[])[];
 }
@@ -444,7 +458,6 @@ async function companiesSheet(db: Database): Promise<Sheet> {
     .leftJoin(users, eq(companies.ownerUserId, users.id))
     .orderBy(companies.createdAt, companies.id);
   return {
-    name: "companies.csv",
     header: [
       "id", "name", "domain", "website", "phone", "address", "industry",
       "owner_user_id", "owner_username", "custom", "archived_at", "created_at", "updated_at",
@@ -465,7 +478,6 @@ async function contactsSheet(db: Database): Promise<Sheet> {
     .leftJoin(users, eq(contacts.ownerUserId, users.id))
     .orderBy(contacts.createdAt, contacts.id);
   return {
-    name: "contacts.csv",
     header: [
       "id", "first_name", "last_name", "salutation", "pronouns", "job_title",
       "company_id", "company_name", "emails", "phones",
@@ -495,7 +507,6 @@ async function dealsSheet(db: Database): Promise<Sheet> {
     .leftJoin(users, eq(deals.ownerUserId, users.id))
     .orderBy(deals.createdAt, deals.id);
   return {
-    name: "deals.csv",
     header: [
       "id", "title", "pipeline_id", "pipeline_name", "stage_id", "stage_name",
       "value", "currency", "expected_close_date", "status", "lost_reason", "closed_at",
@@ -522,7 +533,6 @@ async function projectsSheet(db: Database): Promise<Sheet> {
     .leftJoin(users, eq(projects.ownerUserId, users.id))
     .orderBy(projects.createdAt, projects.id);
   return {
-    name: "projects.csv",
     header: [
       "id", "name", "company_id", "company_name", "deal_id", "deal_title",
       "owner_user_id", "owner_username", "status", "start_date", "due_date", "color",
@@ -552,7 +562,6 @@ async function tasksSheet(db: Database): Promise<Sheet> {
     .leftJoin(projects, eq(tasks.projectId, projects.id))
     .orderBy(tasks.createdAt, tasks.id);
   return {
-    name: "tasks.csv",
     header: [
       "id", "title", "description", "type", "status",
       "assignee_user_id", "assignee_username", "start_date", "due_date", "completed_at", "progress_pct",
@@ -588,7 +597,6 @@ async function notesSheet(db: Database): Promise<Sheet> {
     .leftJoin(projects, eq(notes.projectId, projects.id))
     .orderBy(notes.createdAt, notes.id);
   return {
-    name: "notes.csv",
     header: [
       "id", "body", "author_user_id", "author_username",
       "company_id", "company_name", "contact_id", "contact_name",
@@ -642,7 +650,6 @@ async function meetingsSheet(db: Database): Promise<Sheet> {
   }
 
   return {
-    name: "meetings.csv",
     header: [
       "id", "title", "occurred_at", "duration_minutes", "notes_html", "attendees",
       "owner_user_id", "owner_username", "company_id", "company_name", "contact_id", "contact_name",
@@ -722,7 +729,6 @@ async function timeEntriesSheet(db: Database): Promise<Sheet> {
     // deterministic, exactly as everywhere else here.
     .orderBy(timeEntries.workDate, timeEntries.id);
   return {
-    name: "time_entries.csv",
     header: [
       "id", "work_date", "minutes", "billable", "description",
       "owner_user_id", "owner_username",
@@ -836,7 +842,6 @@ async function documentsSheet(db: Database, archivePathByFileId: ReadonlyMap<str
     // than whatever the plan produced.
     .orderBy(documents.number, documents.createdAt, documents.id);
   return {
-    name: "documents.csv",
     header: [
       "id", "number", "type",
       "company_id", "company_name", "contact_id", "contact_name",
@@ -1039,7 +1044,6 @@ async function collectFiles(db: Database, dataDir: string): Promise<ExportFile[]
  */
 function filesSheet(exportFiles: readonly ExportFile[]): Sheet {
   return {
-    name: "files.csv",
     header: [
       "id", "original_name", "archive_path", "mime", "size_bytes", "sha256",
       "uploader_user_id", "uploader_username",
@@ -1057,6 +1061,51 @@ function filesSheet(exportFiles: readonly ExportFile[]): Sheet {
     ]),
   };
 }
+
+/** Everything a sheet builder may need that is not the transaction itself. */
+interface SheetContext {
+  tx: Database;
+  /** Every stored file, already collected once for files/ and for files.csv. */
+  files: readonly ExportFile[];
+  /** file id -> its member path, so documents.csv can point at the PDF. */
+  archivePathByFileId: ReadonlyMap<string, string>;
+}
+
+/**
+ * **ONE BUILDER PER MEMBER, KEYED BY THE MEMBER IT WRITES.**
+ *
+ * THE LIST OF MEMBERS IS NOT HERE. It is `EXPORT_MEMBERS` in @conduit/shared,
+ * because nine other places have to know it too -- the importer's "not
+ * imported, because" notes, the sentence Settings shows the operator, and the
+ * tests and journey that check the archive is what it says it is. What used to
+ * stand here was an array of thunks, and it was the first of those ten lists,
+ * which agreed only by somebody remembering to edit all ten. Phase 9's export
+ * was missed by three tasks running.
+ *
+ * WHAT A `Record<ExportMemberName, ...>` BUYS, and it is the reason for the
+ * `as const` on the list rather than a style preference: a member added to
+ * EXPORT_MEMBERS with no builder here does not compile, and a builder here for a
+ * member that is not in the list does not compile either. Neither failure needs a
+ * test, a reviewer or a memory -- and "you cannot forget it" is a different kind
+ * of guarantee from "something fails if you do".
+ *
+ * The archive's member ORDER is EXPORT_MEMBERS' order, not this object's; see
+ * the loop in buildExport.
+ */
+const SHEET_BUILDERS: Record<ExportMemberName, (context: SheetContext) => Promise<Sheet>> = {
+  "companies.csv": ({ tx }) => companiesSheet(tx),
+  "contacts.csv": ({ tx }) => contactsSheet(tx),
+  "deals.csv": ({ tx }) => dealsSheet(tx),
+  "projects.csv": ({ tx }) => projectsSheet(tx),
+  "tasks.csv": ({ tx }) => tasksSheet(tx),
+  "notes.csv": ({ tx }) => notesSheet(tx),
+  "meetings.csv": ({ tx }) => meetingsSheet(tx),
+  "time_entries.csv": ({ tx }) => timeEntriesSheet(tx),
+  "documents.csv": ({ tx, archivePathByFileId }) => documentsSheet(tx, archivePathByFileId),
+  // The only one that queries nothing: collectFiles has already run, because
+  // files/ and documents.csv both need its result.
+  "files.csv": ({ files }) => Promise.resolve(filesSheet(files)),
+};
 
 /**
  * The migration journal position, read from the same folder runMigrations
@@ -1261,29 +1310,18 @@ export async function buildExport(options: BuildExportOptions): Promise<ExportAr
       if (f.archivePath !== "") archivePathByFileId.set(f.id, f.archivePath);
     }
 
-    // Thunks, not sheets: nothing is queried until its turn, and nothing
-    // survives past it.
-    const build: (() => Promise<Sheet>)[] = [
-      () => companiesSheet(tx),
-      () => contactsSheet(tx),
-      () => dealsSheet(tx),
-      () => projectsSheet(tx),
-      () => tasksSheet(tx),
-      () => notesSheet(tx),
-      () => meetingsSheet(tx),
-      () => timeEntriesSheet(tx),
-      () => documentsSheet(tx, archivePathByFileId),
-      () => Promise.resolve(filesSheet(collected)),
-    ];
-    for (const buildSheet of build) {
-      const sheet = await buildSheet();
+    // THE MEMBERS AND THEIR ORDER COME FROM THE SHARED LIST; only the building
+    // is here. Nothing is queried until its turn, and nothing survives past it.
+    const context: SheetContext = { tx, files: collected, archivePathByFileId };
+    for (const { member } of EXPORT_MEMBERS) {
+      const sheet = await SHEET_BUILDERS[member](context);
       const bytes = csvDocument(sheet.header, sheet.rows);
       members.push({
-        path: sheet.name,
+        path: member,
         bytes: bytes.byteLength,
         sha256: createHash("sha256").update(bytes).digest("hex"),
       });
-      zip.addBuffer(bytes, sheet.name);
+      zip.addBuffer(bytes, member);
     }
     return collected;
   });
