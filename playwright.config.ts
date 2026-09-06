@@ -27,6 +27,35 @@ export default defineConfig({
   // announcements after every press (re-pressing a swallowed arrow), so a
   // lost keydown now self-heals inside the test instead of burning a retry
   // -- see keyboardDragCard's doc comment in tasks.spec.ts.
+  //
+  // AND THE INTERMITTENT THAT SURVIVED ALL OF THAT WAS NOT A LOST KEYDOWN.
+  // Everything above is about a swallowed press, and it was measured: run
+  // 32275345192 is a real one. But the residual "dnd-kit keyboard drag"
+  // intermittent the backlog has been carrying since 20 Aug is a different
+  // thing wearing the same name, and reading it as a lost press is why the
+  // helper's aria-live waits could not close it. Seven of its eight sightings
+  // are pipeline.spec.ts:173, whose failure message names the DOM order it
+  // read, and in all seven that order is the UNTOUCHED one -- so the arrow was
+  // processed, the drop was announced, and the move POST went out; the test
+  // simply read the column one render too early. Diagnosed and closed at the
+  // assertion on 5 Sep; that test's own comment carries the measurements.
+  // The eighth sighting, tasks.spec.ts:466 on 2 Sep, is a THIRD distinct
+  // failure and is deliberately left open. Its one-shot probe reads a scroll
+  // position inside the ArrowRight keydown, and it came back false for a full
+  // 30 s -- every retry of its own toPass. Repeating that half of the gesture
+  // 432 times on the dev server on 5 Sep made the probe false 10 times, 2.3%,
+  // and showed what the CI log could not: the board HAD scrolled (300-407 px)
+  // and `over` HAD already resolved to Done, so the coordinate-getter fix the
+  // probe exists to pin was working -- the scroll had simply stopped 41-134 px
+  // short of putting the column's right edge inside the viewport. That
+  // reproduces the ingredient, NOT the failure: a 2.3% draw cannot come up
+  // false for thirty seconds running, so that sighting still needs a sustained
+  // condition nothing here produced. (The false probes do cluster -- 4 of the
+  // 10 fell inside 31 iterations -- which is the thread to pull, not a
+  // mechanism.) One sighting in 406 attempts and no artifact; with
+  // `retain-on-first-failure` below, the next one arrives with a trace that
+  // shows the board's geometry. Do not file it under the drag intermittent's
+  // name in the meantime.
   workers: process.env.CI ? 1 : undefined,
   retries: process.env.CI ? 2 : 0,
   reporter: process.env.CI ? [["html", { open: "never" }], ["list"]] : "list",

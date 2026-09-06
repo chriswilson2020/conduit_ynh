@@ -380,6 +380,82 @@ export function flattenCursorPages<T extends { id: string }>(state: CursorPages<
   return out;
 }
 
+/**
+ * The same hold, for a list that has no pages at all.
+ *
+ * WHO NEEDS THIS. The record rail's Notes and Files tabs fetch the WHOLE list
+ * -- api: services/notes.ts and services/files.ts both say "unbounded on
+ * purpose", and neither route takes a cursor or a limit. Everything above
+ * assumes a cursor-paged accumulator, so none of it fits them; what survives
+ * the pages being taken away is one array, one key, and the one question
+ * takeCursorPage asks.
+ *
+ * NOT CursorPages WITH A SINGLE PAGE, which does work. `takeCursorPage(state,
+ * key, undefined, items, null)` gives exactly the semantics below, and spends
+ * four fields -- cursor, order, byCursor, nextCursor -- telling a reader that
+ * there is no paging here, which they then have to verify before they can
+ * believe the component. A list with no pages should not be modelled as a
+ * paging record with the paging turned off.
+ *
+ * WHAT "ALREADY ON SCREEN" MEANS WITHOUT PAGES, which is the one question that
+ * genuinely changes: it is the whole held array, so the answer is easier here
+ * than above rather than harder. There is no page boundary, so there is no
+ * cursor naming a position in an ordering that has since moved, and therefore
+ * none of takeCursorPage's difficulty about rows that would be returned by
+ * neither fetch. Re-snapshotting is just taking the next answer whole.
+ *
+ * NOTHING HERE REFRESHES A HELD ROW, and that is a deliberate absence.
+ * refreshCursorRows exists because a meeting's title and task count change
+ * under a reader; a note and a file cannot. Neither table has an UPDATE or a
+ * DELETE path anywhere in the API -- routes/notes.ts and routes/files.ts
+ * expose GET and POST and nothing else, and the services export create and
+ * list -- so a row on screen is not merely unlikely to go stale, it is
+ * incapable of it. Same argument timeline.tsx makes for itself, and the same
+ * conclusion.
+ */
+export interface HeldList<T extends { id: string }> {
+  /** Filter identity these rows belong to; see identityKey. */
+  key: string;
+  rows: readonly T[];
+}
+
+export function emptyHeldList<T extends { id: string }>(key: string): HeldList<T> {
+  return { key, rows: [] };
+}
+
+/**
+ * Take a whole list the reader ASKED FOR, and leave the one they are already
+ * looking at exactly as it is.
+ *
+ * A DIFFERENT KEY TAKES, always: the rows held describe a record nobody is
+ * looking at any more. This is not a nicety -- neither component that uses
+ * this remounts when the ids change under it, so without the key a hold is
+ * just the previous company's notes under the next company's name.
+ *
+ * A NON-EMPTY HELD LIST TAKES NOTHING. Both lists are newest-first and both
+ * tables stamp `created_at` with defaultNow(), so anything arriving from
+ * anywhere lands at index 0 and pushes every row on screen down one. On the
+ * Files tab that row carries the download link, which is how a reader aiming
+ * at one file downloads another between two clicks.
+ *
+ * AN EMPTY HELD LIST IS NOT HELD -- takeCursorPage's rule, for the reason it
+ * gives there: a tab showing nothing has no reader's place to protect, and
+ * holding would put "No notes yet" beside an offer to reveal the note that has
+ * just arrived.
+ *
+ * THE SAME ARRAY SETTLES. This runs from a render effect, so the empty case
+ * has to stop returning fresh objects or it sets state for ever; React Query
+ * hands back the same array while a query's data is unchanged, which makes
+ * reference equality the exact "nothing arrived" test rather than an
+ * approximation of one (mergeCursorPage above makes the same argument).
+ */
+export function takeWholeList<T extends { id: string }>(
+  state: HeldList<T>, key: string, items: readonly T[],
+): HeldList<T> {
+  if (state.key === key && (state.rows.length > 0 || state.rows === items)) return state;
+  return { key, rows: items };
+}
+
 export interface PendingArrivals {
   /** How many rows the fetched page has that the list is not showing. Zero
    * means there is nothing to offer the reader. */
@@ -451,6 +527,33 @@ export function pendingArrivals<T extends { id: string }>(
   for (const row of shown) if (at(row) < floor) floor = at(row);
   const count = head.filter((row) => !listed.has(row.id) && at(row) > floor).length;
   return { count, atLeast: headHasMore && count > 0 && count === head.length };
+}
+
+/**
+ * What the control above a list that is holding still says.
+ *
+ * ONE SPELLING FOR FOUR SURFACES. This was two identical one-liners differing
+ * only in a noun (timeline-lib's newActivityLabel, meetings-lib's
+ * newMeetingsLabel) and v1.7.2 needed a third and a fourth. Four copies of a
+ * string with a plural rule in it is exactly the shape test/source.ts's header
+ * complains about having found twice already -- and the copies do not have to
+ * disagree about anything interesting to be wrong, only about whether the "+"
+ * comes before or after the count.
+ *
+ * THE NOUNS ARE PASSED IN RATHER THAN DERIVED. English plurals are not a
+ * function of the singular ("entry"/"entries" is the counterexample already in
+ * this repo), and a table of irregulars here would be a second place to
+ * maintain the vocabulary of four components.
+ *
+ * THE "+" IS THE FLOOR MARKER and belongs to the paged surfaces: a whole-list
+ * fetch can never produce one, because `atLeast` means the arrivals may run
+ * past the only page that was looked at and there is no page behind the whole
+ * list.
+ */
+export function newArrivalsLabel(
+  { count, atLeast }: PendingArrivals, singular: string, plural: string,
+): string {
+  return `Show ${count}${atLeast ? "+" : ""} new ${count === 1 ? singular : plural}`;
 }
 
 /**

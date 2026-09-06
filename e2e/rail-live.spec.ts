@@ -4,12 +4,20 @@ import type { Page, Route } from "@playwright/test";
 /**
  * THE RECORD RAIL IS LIVE, AND IT DOES NOT MOVE UNDER THE READER (v1.7.1).
  *
- * The sibling of e2e/inbox-live.spec.ts, for the two lists that carried the
- * defect the inbox carried before v1.6.0: a record's Timeline tab and its
- * Meetings tab. Both are time-ordered, both accumulate pages, and both used to
- * take a refetch of a page that was already on screen -- so a row arriving
- * from anywhere (a colleague's write, or mail landing on a linked thread)
- * pushed every row below it down one, between two of the reader's clicks.
+ * The sibling of e2e/inbox-live.spec.ts, for the lists that carried the defect
+ * the inbox carried before v1.6.0: a record's Timeline tab and its Meetings
+ * tab. Both are time-ordered, both accumulate pages, and both used to take a
+ * refetch of a page that was already on screen -- so a row arriving from
+ * anywhere (a colleague's write, or mail landing on a linked thread) pushed
+ * every row below it down one, between two of the reader's clicks.
+ *
+ * AND THE TWO THAT HAVE NO PAGES AT ALL (v1.7.2): the Notes and Files tabs.
+ * Same rule, same control, different shape -- their routes return the WHOLE
+ * list, so there is no page for a refetch to re-take and no cursor to go
+ * stale. What arrives simply lands at the top of a newest-first list and
+ * pushes everything down. The tests for them are at the foot of this file, and
+ * the Files ones assert on the download HREF rather than on the row text,
+ * because a file row's link is what the reader is actually aiming at.
  *
  * WHY IT IS STUBBED, and stubbed here rather than in the journeys. The
  * arrivals these tests are about come from OTHER PEOPLE and from the mail
@@ -21,11 +29,13 @@ import type { Page, Route } from "@playwright/test";
  *
  * The app under test is the real one, unmodified. The company is real, created
  * through the real API; the session, the users list and everything else the
- * page needs are the real routes. Only `/api/events`, `/api/meetings` and
- * `/api/stream` are served from lists these tests own -- and `/api/stream`
- * hands out the same hint frames services/sse.ts publishes (["events"], from
- * mail-ingest.ts and from every record write; ["meetings"], from
- * services/meetings.ts).
+ * page needs are the real routes. Only `/api/events`, `/api/meetings`,
+ * `/api/notes`, `/api/files` and `/api/stream` are served from lists these
+ * tests own -- and `/api/stream` hands out the same hint frames
+ * services/sse.ts publishes (["events"], from mail-ingest.ts and from every
+ * record write; ["meetings"], from services/meetings.ts; ["notes"], from
+ * services/notes.ts; ["files"], from services/files.ts and from a quote being
+ * raised in services/documents.ts).
  *
  * NO POLLING ANYWHERE, and the tests below say so out loud: these lists are
  * refreshed only by a hint arriving, so a build that polled would pass the "it
@@ -157,6 +167,16 @@ function sortKey(seed: Seed): string {
   return `${seed.at}|${seed.id}`;
 }
 
+/**
+ * A whole list in the order its route returns it: the same descending
+ * `(timestamp, id)` the paged routes use, with no page taken out of it.
+ * services/notes.ts and services/files.ts both order `(created_at, id)`
+ * descending, and notes.test.ts and files.test.ts pin it.
+ */
+function newestFirst(seeds: readonly Seed[]): Seed[] {
+  return [...seeds].sort((a, b) => sortKey(b).localeCompare(sortKey(a)));
+}
+
 /** One page out of a seed list, by that keyset. */
 function keysetPage(
   seeds: readonly Seed[], cursor: string | null, limit: number,
@@ -171,9 +191,50 @@ function keysetPage(
   };
 }
 
+/** ...and of one note row (noteSchema). */
+function wireNote(seed: Seed, companyId: string) {
+  return {
+    id: seed.id,
+    body: seed.label,
+    authorUserId: ACTOR_ID,
+    companyId, contactId: null, dealId: null, projectId: null,
+    createdAt: seed.at,
+  };
+}
+
+/**
+ * ...and of one file row (fileMetaSchema).
+ *
+ * The NAME is the seed's label, because a file row's identity to a reader is
+ * its filename -- and the download href built from its id is what the hold is
+ * actually protecting.
+ */
+function wireFile(seed: Seed, companyId: string) {
+  return {
+    id: seed.id,
+    originalName: `${seed.label}.pdf`,
+    mime: "application/pdf",
+    sizeBytes: 1024,
+    sha256: "0".repeat(64),
+    uploaderUserId: ACTOR_ID,
+    companyId, contactId: null, dealId: null, projectId: null,
+    createdAt: seed.at,
+  };
+}
+
 interface RailStub {
   events: Seed[];
   meetings: Seed[];
+  /**
+   * The two WHOLE-LIST tabs (v1.7.2). Unlike the two above these are served
+   * without paging at all -- api: services/notes.ts and services/files.ts both
+   * say "unbounded on purpose", and the client sends neither a cursor nor a
+   * limit -- so the stub hands back the entire array, newest first, exactly as
+   * the routes do. That is the shape the fix is about: there is no page for a
+   * refetch to re-take, only a list that has grown at the top.
+   */
+  notes: Seed[];
+  files: Seed[];
   /** The hint keys every stream connection carries. Empty is a heartbeat,
    * which is what "nothing has been published" looks like on the wire. */
   live: string[];
@@ -212,6 +273,36 @@ async function stubRail(browserPage: Page, companyId: string, stub: RailStub): P
     const source = url.searchParams.get("archived") === "true" ? [] : stub.meetings;
     const { items, nextCursor } = keysetPage(source, url.searchParams.get("cursor"), limit);
     await route.fulfill({ json: { items: items.map((seed) => wireMeeting(seed, companyId)), nextCursor } });
+  });
+
+  /**
+   * The whole-list tabs. No cursor, no limit, no nextCursor: the response is a
+   * bare array, which is what makes these two a different shape from the pair
+   * above rather than a smaller version of them.
+   *
+   * POST is the reader's OWN write and updates the stub's list BEFORE
+   * answering, as the real service commits before it responds -- the ordering
+   * the tab's re-snapshot has to respect.
+   */
+  await browserPage.route((url) => url.pathname === "/api/notes", async (route: Route) => {
+    if (route.request().method() === "POST") {
+      const body = route.request().postDataJSON() as { body: string };
+      const seed: Seed = { id: rowId(99), at: new Date().toISOString(), label: body.body, taskCount: 0 };
+      stub.notes = [seed, ...stub.notes];
+      await route.fulfill({ json: wireNote(seed, companyId) });
+      return;
+    }
+    await route.fulfill({ json: newestFirst(stub.notes).map((seed) => wireNote(seed, companyId)) });
+  });
+
+  await browserPage.route((url) => url.pathname === "/api/files", async (route: Route) => {
+    if (route.request().method() === "POST") {
+      const seed: Seed = { id: rowId(98), at: new Date().toISOString(), label: "Uploaded now", taskCount: 0 };
+      stub.files = [seed, ...stub.files];
+      await route.fulfill({ json: wireFile(seed, companyId) });
+      return;
+    }
+    await route.fulfill({ json: newestFirst(stub.files).map((seed) => wireFile(seed, companyId)) });
   });
 
   /**
@@ -264,6 +355,27 @@ async function meetingRowIds(browserPage: Page): Promise<string[]> {
     .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-testid") ?? ""));
 }
 
+/** Every visible note row's text, in paint order. Same claim shape as
+ * entryTexts: an insertion, a removal and a re-order all change it. */
+async function noteTexts(browserPage: Page): Promise<string[]> {
+  return browserPage.locator('[data-testid="note-row"]')
+    .evaluateAll((nodes) => nodes.map((node) => node.textContent ?? ""));
+}
+
+/**
+ * Every visible file row's DOWNLOAD TARGET, in paint order -- not its text.
+ *
+ * This is the assertion the Files tab is actually about. The harm from a list
+ * that re-orders is not that the reader reads the wrong name, it is that they
+ * CLICK the wrong file: the href carries the id, so a list whose rows shifted
+ * by one returns the same names in the same places only if nothing moved at
+ * all, and returns different hrefs the instant something did.
+ */
+async function fileLinks(browserPage: Page): Promise<string[]> {
+  return browserPage.locator('[data-testid="file-row"] a')
+    .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("href") ?? ""));
+}
+
 /** A company of this test's own, so nothing here can be disturbed by -- or
  * disturb -- another spec running beside it. */
 async function makeCompany(browserPage: Page, label: string): Promise<string> {
@@ -280,7 +392,7 @@ function uniqueName(what: string, retry: number): string {
 
 test("holds an arriving timeline entry behind a count, and moves nothing to do it", async ({ page }, info) => {
   const companyId = await makeCompany(page, uniqueName("timeline", info.retry));
-  const stub: RailStub = { events: seedRows(6, (n) => `Note ${n}`), meetings: [], live: [] };
+  const stub: RailStub = { events: seedRows(6, (n) => `Note ${n}`), meetings: [], notes: [], files: [], live: [] };
   await stubRail(page, companyId, stub);
   await page.goto(`/companies/${companyId}`);
   await expect(page.locator('[data-testid="timeline-entry"]')).toHaveCount(6);
@@ -331,7 +443,7 @@ test("holds an arriving timeline entry behind a count, and moves nothing to do i
  */
 test("shows the reader's own edit at once, with nothing to click", async ({ page }, info) => {
   const companyId = await makeCompany(page, uniqueName("own edit", info.retry));
-  const stub: RailStub = { events: seedRows(3, (n) => `Note ${n}`), meetings: [], live: [] };
+  const stub: RailStub = { events: seedRows(3, (n) => `Note ${n}`), meetings: [], notes: [], files: [], live: [] };
   await stubRail(page, companyId, stub);
   await page.goto(`/companies/${companyId}`);
   await expect(page.locator('[data-testid="timeline-entry"]')).toHaveCount(3);
@@ -353,7 +465,7 @@ test("shows the reader's own edit at once, with nothing to click", async ({ page
 test("keeps the timeline live past page one, where nothing was watching before", async ({ page }, info) => {
   const companyId = await makeCompany(page, uniqueName("paging", info.retry));
   // One full page, and five entries behind it.
-  const stub: RailStub = { events: seedRows(30, (n) => `Note ${n}`), meetings: [], live: [] };
+  const stub: RailStub = { events: seedRows(30, (n) => `Note ${n}`), meetings: [], notes: [], files: [], live: [] };
   await stubRail(page, companyId, stub);
   await page.goto(`/companies/${companyId}`);
   await expect(page.locator('[data-testid="timeline-entry"]')).toHaveCount(PAGE_SIZE);
@@ -383,7 +495,7 @@ test("keeps the timeline live past page one, where nothing was watching before",
 
 test("shows the first activity on a record rather than offering to", async ({ page }, info) => {
   const companyId = await makeCompany(page, uniqueName("empty", info.retry));
-  const stub: RailStub = { events: [], meetings: [], live: [] };
+  const stub: RailStub = { events: [], meetings: [], notes: [], files: [], live: [] };
   await stubRail(page, companyId, stub);
   await page.goto(`/companies/${companyId}`);
   await expect(page.getByTestId("timeline-empty")).toBeVisible();
@@ -400,7 +512,7 @@ test("shows the first activity on a record rather than offering to", async ({ pa
 
 test("holds an arriving meeting, and refreshes a listed one where it stands", async ({ page }, info) => {
   const companyId = await makeCompany(page, uniqueName("meetings", info.retry));
-  const stub: RailStub = { events: [], meetings: seedRows(4, (n) => `Meeting ${n}`), live: [] };
+  const stub: RailStub = { events: [], meetings: seedRows(4, (n) => `Meeting ${n}`), notes: [], files: [], live: [] };
   await stubRail(page, companyId, stub);
   await page.goto(`/companies/${companyId}`);
   await page.getByTestId("meetings-tab").click();
@@ -442,7 +554,7 @@ test("holds an arriving meeting, and refreshes a listed one where it stands", as
 
 test("keeps the Meetings tab live past page one too", async ({ page }, info) => {
   const companyId = await makeCompany(page, uniqueName("meeting paging", info.retry));
-  const stub: RailStub = { events: [], meetings: seedRows(30, (n) => `Meeting ${n}`), live: [] };
+  const stub: RailStub = { events: [], meetings: seedRows(30, (n) => `Meeting ${n}`), notes: [], files: [], live: [] };
   await stubRail(page, companyId, stub);
   await page.goto(`/companies/${companyId}`);
   await page.getByTestId("meetings-tab").click();
@@ -490,7 +602,7 @@ test("keeps the Meetings tab live past page one too", async ({ page }, info) => 
  */
 test("takes the freshest page when the tab comes back, not the cache it left", async ({ page }, info) => {
   const companyId = await makeCompany(page, uniqueName("tab return", info.retry));
-  const stub: RailStub = { events: [], meetings: seedRows(3, (n) => `Meeting ${n}`), live: [] };
+  const stub: RailStub = { events: [], meetings: seedRows(3, (n) => `Meeting ${n}`), notes: [], files: [], live: [] };
   await stubRail(page, companyId, stub);
   await page.goto(`/companies/${companyId}`);
   await page.getByTestId("meetings-tab").click();
@@ -524,7 +636,7 @@ test("takes the freshest page when the tab comes back, not the cache it left", a
  */
 test("shows a meeting the reader logs themselves, at once", async ({ page }, info) => {
   const companyId = await makeCompany(page, uniqueName("own write", info.retry));
-  const stub: RailStub = { events: [], meetings: seedRows(3, (n) => `Meeting ${n}`), live: [] };
+  const stub: RailStub = { events: [], meetings: seedRows(3, (n) => `Meeting ${n}`), notes: [], files: [], live: [] };
   await stubRail(page, companyId, stub);
   await page.goto(`/companies/${companyId}`);
   await page.getByTestId("meetings-tab").click();
@@ -538,5 +650,226 @@ test("shows a meeting the reader logs themselves, at once", async ({ page }, inf
   expect((await meetingRowIds(page))[0]).toBe(`meeting-row-${rowId(99)}`);
   // Their own write is not an arrival to be offered: it is already here.
   await expect(page.getByTestId("meetings-new-show")).toHaveCount(0);
+});
+
+// ---------------------------------------------------------------------------
+// The two tabs with no pages (v1.7.2)
+// ---------------------------------------------------------------------------
+
+/**
+ * WHAT MAKES THESE DIFFERENT FROM EVERYTHING ABOVE, and why they were left
+ * alone in v1.7.1: their routes return the whole list, so there is no held
+ * page and no cursor. The defect that survives that is the simplest one --
+ * `created_at` is defaultNow() on both tables and both lists are newest-first,
+ * so anything arriving lands at index 0 and pushes every row down exactly one.
+ */
+test("holds an arriving note behind a count, and moves nothing to do it", async ({ page }, info) => {
+  const companyId = await makeCompany(page, uniqueName("notes", info.retry));
+  const stub: RailStub = {
+    events: [], meetings: [], notes: seedRows(5, (n) => `Note body ${n}`), files: [], live: [],
+  };
+  await stubRail(page, companyId, stub);
+  await page.goto(`/companies/${companyId}`);
+  await page.getByRole("tab", { name: "Notes" }).click();
+  await expect(page.locator('[data-testid="note-row"]')).toHaveCount(5);
+
+  const before = await noteTexts(page);
+  const show = page.getByTestId("notes-new-show");
+  await expect(show).toHaveCount(0);
+
+  stub.notes = [arrival("Arriving now"), ...stub.notes];
+
+  // NOTHING HAPPENS UNTIL A HINT ARRIVES. The list is a whole note out of date
+  // and stays exactly as it is: the transport is SSE and nothing here polls.
+  await page.waitForTimeout(QUIET_MS);
+  expect(await noteTexts(page)).toEqual(before);
+  await expect(show).toHaveCount(0);
+
+  stub.live = ["notes"];
+
+  // COUNTED, NOT SHOWN. Before this fix the arriving note was taken straight
+  // into the list and all five rows moved down one.
+  await expect(show).toHaveText("Show 1 new note");
+  await expect(page.getByTestId("notes").getByText("Arriving now")).toHaveCount(0);
+  expect(await noteTexts(page)).toEqual(before);
+
+  // Asking is what takes the server's order, and it takes all of it.
+  await show.click();
+  await expect(show).toHaveCount(0);
+  const after = await noteTexts(page);
+  expect(after).toHaveLength(6);
+  expect(after[0]).toContain("Arriving now");
+  expect(after.slice(1)).toEqual(before);
+});
+
+/**
+ * BEHAVIOUR 3 ON THE TAB WHERE IT MATTERS MOST. The composer sits at the top
+ * of this tab, so writing a note is the primary gesture here rather than an
+ * occasional one -- a Notes tab that answered "Show 1 new note" to the note
+ * the reader had just typed would be hiding their own work behind a button.
+ */
+test("shows a note the reader writes themselves, at once", async ({ page }, info) => {
+  const companyId = await makeCompany(page, uniqueName("own note", info.retry));
+  const stub: RailStub = {
+    events: [], meetings: [], notes: seedRows(3, (n) => `Note body ${n}`), files: [], live: [],
+  };
+  await stubRail(page, companyId, stub);
+  await page.goto(`/companies/${companyId}`);
+  await page.getByRole("tab", { name: "Notes" }).click();
+  await expect(page.locator('[data-testid="note-row"]')).toHaveCount(3);
+
+  await page.getByPlaceholder("Add a note...").fill("Written by the reader");
+  await page.getByTestId("add-note").click();
+
+  // NO HINT IS SENT (stub.live is still empty) and nothing polls, so the only
+  // thing that can put this note on screen is the write being recognised as
+  // the reader's own.
+  await expect(page.getByTestId("notes").getByText("Written by the reader")).toBeVisible();
+
+  // POLLED, AND THE ONE-SHOT READ THIS REPLACES WAS A REAL DEFECT -- but NOT
+  // the one 48cf351 closed in pipeline.spec.ts, and the difference is the
+  // whole reason this was measured rather than pattern-matched. There the gate
+  // was one React commit EARLY: dnd-kit announces the drop in the same batch
+  // as the drop, and the optimistic reorder is a commit later. Here the gate
+  // is not early. It is satisfied by the wrong element.
+  //
+  // THE LINE ABOVE IS SATISFIED BY THE COMPOSER. `[data-testid="notes"]` is
+  // the whole tab, and the <Textarea> the reader has just typed into is inside
+  // it. React writes a controlled textarea's value into `node.defaultValue`,
+  // and a textarea's defaultValue IS its child text node -- so "Written by the
+  // reader" is inside the container the instant it is typed, and getByText
+  // finds it there. Measured on the dev server on 5 Sep: that locator resolved
+  // to ONE element before the write had even been sent, 15 times out of 15,
+  // with no note row on screen at all. (It resolves to one rather than two
+  // because `createNote`'s mutate-level onSuccess clears the draft before the
+  // own-write nonce fires the re-snapshot that puts the row there; the two are
+  // never on screen together, which is why this has never thrown a strict-mode
+  // violation instead.)
+  //
+  // So the gate returns while the list is still the three seeded notes, and
+  // what the one-shot read got was `Note body 00` at the head -- the untouched
+  // fixture, which is the same signature every read of a list that has not
+  // settled produces. REPRODUCED, NOT REASONED ABOUT: 2 times in 10 with the
+  // stub answering at once, and 15 times out of 15 with POST /api/notes held
+  // for 400 ms. Holding the WRITE is what moves the failure, which is what
+  // makes the gate causally the draft rather than the note -- and the same
+  // journey gated on the note row instead of on the text was 0 out of 15 under
+  // that identical 400 ms hold.
+  //
+  // THE OTHER NINE one-shot result reads in this file were measured the same
+  // way and are sound, so they are deliberately left as they are -- 48cf351's
+  // rule, that a fix names what it did not close. Each of them waits on the
+  // row's own testid, on the row COUNT, or on the "Show" control clearing, and
+  // every one of those is produced by the SAME single setState that puts the
+  // list in order: both rails replace their whole visible list in one go (see
+  // lib.ts's takeWholeList and takeCursorPage, and each component's
+  // `resnapshot`/`reset`), so there is no second commit for a read to fall
+  // into. Read at the instant their own gate came true: 0 wrong in 30 for each
+  // of the seven "Show"-click, paging and own-edit reads, and 0 in 10 for the
+  // meeting and file own-write reads -- which stayed 0 in 15 with their own
+  // write held for the same 400 ms that makes the note read fail every time.
+  //
+  // AND THE "NOTHING MOVED" READS MUST NOT BE POLLED, which is the trap this
+  // change looks like it invites. `expect.poll` retries until it PASSES, and
+  // an invariance claim passes on its first read -- the list has not moved YET
+  // -- so polling one would not harden it, it would make it unfalsifiable.
+  // They stay one-shot, after the wait that gives them their meaning.
+  //
+  // The expected value is untouched, so this keeps its teeth -- proved with
+  // the mutation that breaks what THIS line guards, which is the ORDER rather
+  // than the arrival. Change notes.tsx's `resnapshot` to the "keep every seen
+  // row where it is and append arrivals at the bottom" design its own header
+  // rejects: the note is then on screen, so the gate above still passes, and
+  // this poll fails for its whole 5 s timeout on
+  // `Received string: "...Note body 00"` -- the same head the too-early read
+  // produced, which is exactly why an intermittent here would have been
+  // indistinguishable from a real regression. Taking the own-write effect out
+  // instead is NOT that proof: the note never appears at all, so the gate
+  // above fails first and this line is never reached.
+  await expect
+    .poll(async () => (await noteTexts(page))[0] ?? "")
+    .toContain("Written by the reader");
+  await expect(page.getByTestId("notes-new-show")).toHaveCount(0);
+});
+
+test("shows the first note on a record rather than offering to", async ({ page }, info) => {
+  const companyId = await makeCompany(page, uniqueName("empty notes", info.retry));
+  const stub: RailStub = { events: [], meetings: [], notes: [], files: [], live: [] };
+  await stubRail(page, companyId, stub);
+  await page.goto(`/companies/${companyId}`);
+  await page.getByRole("tab", { name: "Notes" }).click();
+  await expect(page.getByTestId("notes-empty")).toBeVisible();
+
+  stub.notes = [arrival("Arriving now")];
+  stub.live = ["notes"];
+
+  // An empty list has no reader's place to protect. Holding here would put
+  // "No notes yet" beside an offer to show the note that has just arrived.
+  await expect(page.getByTestId("notes").getByText("Arriving now")).toBeVisible();
+  await expect(page.getByTestId("notes-new-show")).toHaveCount(0);
+});
+
+/**
+ * THE ACUTE ONE. A file row carries the download link, and it is the only way
+ * to get a file back out of the rail -- so a list that shifts by one hands the
+ * reader somebody else's document. The assertion is on the HREFS in paint
+ * order, which is the claim "the thing under the pointer is still the thing
+ * they aimed at".
+ */
+test("holds an arriving file, and keeps every download link where it was", async ({ page }, info) => {
+  const companyId = await makeCompany(page, uniqueName("files", info.retry));
+  const stub: RailStub = {
+    events: [], meetings: [], notes: [], files: seedRows(4, (n) => `Document ${n}`), live: [],
+  };
+  await stubRail(page, companyId, stub);
+  await page.goto(`/companies/${companyId}`);
+  await page.getByRole("tab", { name: "Files" }).click();
+  await expect(page.locator('[data-testid="file-row"]')).toHaveCount(4);
+
+  const before = await fileLinks(page);
+  expect(before[0]).toContain(rowId(0));
+
+  stub.files = [arrival("Uploaded by someone else"), ...stub.files];
+  stub.live = ["files"];
+
+  // COUNTED, NOT SHOWN, and -- the point of this file -- every href is still
+  // the href it was. Before the fix the arrival took index 0 and every link
+  // below it moved down one, so a reader mid-click downloaded the row above
+  // the one they had aimed at.
+  await expect(page.getByTestId("files-new-show")).toHaveText("Show 1 new file");
+  expect(await fileLinks(page)).toEqual(before);
+
+  await page.getByTestId("files-new-show").click();
+  await expect(page.getByTestId("files-new-show")).toHaveCount(0);
+  const after = await fileLinks(page);
+  expect(after).toHaveLength(5);
+  expect(after[0]).toContain(rowId(90));
+  expect(after.slice(1)).toEqual(before);
+});
+
+/**
+ * The reader's own upload, which is never held back -- and the reason this is
+ * useOwnWriteNonce rather than a callback on the dropzone: the same signal
+ * covers a quote raised in the deal page's Documents section and an attachment
+ * added in the mail composer, neither of which knows a Files tab exists.
+ */
+test("shows a file the reader uploads themselves, at once", async ({ page }, info) => {
+  const companyId = await makeCompany(page, uniqueName("own file", info.retry));
+  const stub: RailStub = {
+    events: [], meetings: [], notes: [], files: seedRows(2, (n) => `Document ${n}`), live: [],
+  };
+  await stubRail(page, companyId, stub);
+  await page.goto(`/companies/${companyId}`);
+  await page.getByRole("tab", { name: "Files" }).click();
+  await expect(page.locator('[data-testid="file-row"]')).toHaveCount(2);
+
+  await page.getByTestId("dropzone").locator('input[type="file"]').setInputFiles({
+    name: "uploaded.txt", mimeType: "text/plain", buffer: Buffer.from("hello"),
+  });
+
+  // No hint is sent, so nothing but the own-write signal can reveal this.
+  await expect(page.locator('[data-testid="file-row"]')).toHaveCount(3);
+  expect((await fileLinks(page))[0]).toContain(rowId(98));
+  await expect(page.getByTestId("files-new-show")).toHaveCount(0);
 });
 

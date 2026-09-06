@@ -188,10 +188,58 @@ test.describe.serial("Pipeline journey", () => {
     // land right after Gamma, not before it -- [Gamma, Beta, Delta]. Read
     // off the cards' actual DOM order within the column, the same order the
     // user saw during the drag.
-    const ids = await lead.locator('[data-testid^="card-"]').evaluateAll((nodes) =>
-      nodes.map((node) => node.getAttribute("data-testid")),
-    );
-    expect(ids).toEqual([`card-${gammaId}`, `card-${betaId}`, `card-${deltaId}`]);
+    //
+    // POLLED, AND THE ONE-SHOT READ THIS REPLACES WAS THE dnd-kit KEYBOARD-DRAG
+    // INTERMITTENT -- 7 of its 8 sightings since 20 Aug, all of them here.
+    // Every other keyboard drag in this file and in tasks.spec.ts asserts what
+    // the drop produced with a retrying `toBeVisible`; this was the only
+    // instant-in-time read of a drop's RESULT anywhere in the suite, which is
+    // exactly why it was the only line that fired. (tasks.spec.ts:466's
+    // one-shot probe is not a counter-example: it reads a scroll position
+    // inside the arrow keydown, deliberately, and is the eighth sighting --
+    // a different failure, still unexplained.)
+    //
+    // It is an ordering guarantee, not a coin flip. dnd-kit commits the "was
+    // dropped" aria-live announcement inside the SAME `unstable_batchedUpdates`
+    // as the drop itself (core.cjs's createHandler), and keyboardDragCard above
+    // returns the moment that text appears. The reorder cannot be in that
+    // render: useMoveDeal's `onMutate` is async and awaits
+    // `queryClient.cancelQueries` before it writes the optimistic position, so
+    // its `setQueryData` -- and the render that re-sorts this column -- is
+    // always at least one commit later. The announcement therefore ALWAYS wins;
+    // the only question is whether the next CDP round trip arrives before the
+    // reorder does.
+    //
+    // Measured 5 Sep on the dev server, repeating this exact gesture under
+    // load: the read disagreed 31 times in the first 214, and in 31 of 31 the
+    // column settled to the order below 16-82 ms later, with POST
+    // /deals/:id/move already issued naming Gamma and Delta. The gap itself was
+    // then timed inside the browser, with MutationObservers on the live region
+    // and on this column, over a faithful replay of the whole journey above
+    // rather than the gesture alone: 30 drops, and the reorder landed 12-60 ms
+    // (median 30) after the announcement -- every time, never before it.
+    // Nothing was ever lost, and every CI sighting's "Received" array is this
+    // same untouched [Beta, Gamma, Delta] -- a card that had not moved YET, not
+    // one that failed to move. That is also why this never looked like a test
+    // bug: with the P2.6 fix mutated out, the failure message is the SAME diff,
+    // so the log a reader saw was indistinguishable from a real regression.
+    //
+    // NOT `page.waitForResponse` on the move, which is the shape crm.spec.ts's
+    // caret fix uses and would be the wrong instrument here: holding that POST
+    // for 1200 ms at the network layer still reorders the column in 8-15 ms,
+    // because the reorder is optimistic and does not wait for the server.
+    //
+    // The expected array is untouched, so this still has its P2.6 teeth:
+    // reverting handleDragEnd to over-index derivation makes the drop land Beta
+    // BEFORE Gamma -- [Beta, Gamma, Delta], the same array the intermittent
+    // produced -- and this poll then fails for its whole timeout.
+    await expect
+      .poll(() =>
+        lead.locator('[data-testid^="card-"]').evaluateAll((nodes) =>
+          nodes.map((node) => node.getAttribute("data-testid")),
+        ),
+      )
+      .toEqual([`card-${gammaId}`, `card-${betaId}`, `card-${deltaId}`]);
   });
 
   test("wins Beta and it drops off the board", async () => {

@@ -39,3 +39,31 @@
 export function withoutComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^[ \t]*\/\/.*$/gm, "");
 }
+
+/**
+ * Source with its import statements removed, so a guard can ask whether a name
+ * is USED rather than merely available.
+ *
+ * WHY THE DISTINCTION IS NOT PEDANTIC. Nothing in this repo notices an unused
+ * import: there is no linter at all, and tsconfig.base.json does not set
+ * noUnusedLocals -- so `import { useOwnWriteNonce } ...` with the call deleted
+ * compiles, ships, and satisfies any guard that searches the whole file. That
+ * is not a hypothetical evasion either; it is the FIRST mutation anyone
+ * writes, and v1.7.2's mutation run watched four guards pass against it before
+ * this function existed.
+ *
+ * MULTI-LINE IMPORTS ARE THE COMMON CASE HERE (this package's import lists
+ * routinely wrap), which is why this matches across lines up to the `from`
+ * clause rather than line by line. Non-greedy, so a file's second import is
+ * not swallowed along with its first. The second pass covers the side-effect
+ * form, which has no `from`.
+ *
+ * `export ... from` re-exports are deliberately left alone: a name a module
+ * re-exports is part of what that module DOES, not something it happens to
+ * have in scope.
+ */
+export function withoutImports(source: string): string {
+  return source
+    .replace(/^import\s[\s\S]*?\sfrom\s*["'][^"']*["'];?[ \t]*$/gm, "")
+    .replace(/^import\s*["'][^"']*["'];?[ \t]*$/gm, "");
+}

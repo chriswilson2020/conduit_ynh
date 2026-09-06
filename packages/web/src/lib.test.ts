@@ -1,21 +1,24 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { describe, it, expect } from "vitest";
-import { withoutComments } from "./test/source";
+import { withoutComments, withoutImports } from "./test/source";
 import {
   advanceCursorPages,
   cursorForKey,
   emptyCursorPages,
+  emptyHeldList,
   FIRST_PAGE,
   flattenCursorPages,
   humanSize,
   identityKey,
   mergeCursorPage,
+  newArrivalsLabel,
   overridableClass,
   parseDecimal,
   pendingArrivals,
   refreshCursorRows,
   relativeTime,
   takeCursorPage,
+  takeWholeList,
   todayLocalIso,
   userLabel,
 } from "./lib";
@@ -458,6 +461,203 @@ describe("pendingArrivals", () => {
 });
 
 /**
+ * THE SAME RULE FOR A LIST THAT HAS NO PAGES (v1.7.2).
+ *
+ * The rail's Notes and Files tabs fetch the WHOLE list -- api: services/
+ * notes.ts and services/files.ts both say "unbounded on purpose" -- so none of
+ * the cursor machinery above applies to them. What is left when the pages are
+ * taken away is this: one array, one key, and the same question takeCursorPage
+ * asks (is the reader already looking at something here?).
+ *
+ * WHY IT IS NOT takeCursorPage WITH ONE PAGE, which does work and was the
+ * first thing tried. A CursorPages holding a single FIRST_PAGE entry with a
+ * null nextCursor behaves correctly in every case below -- and spends four
+ * fields (cursor, order, byCursor, nextCursor) saying that there is no paging,
+ * to a reader who then has to prove it. A list with no pages should not be
+ * modelled as a paging record with the paging switched off.
+ */
+describe("whole-list holding", () => {
+  const row = (id: string): Row => ({ id });
+
+  it("takes the whole list when the reader is looking at nothing", () => {
+    const held = takeWholeList(emptyHeldList<Row>("k"), "k", [row("a"), row("b")]);
+    expect(held.rows.map((r) => r.id)).toEqual(["a", "b"]);
+  });
+
+  /**
+   * THE DEFECT, IN ONE ASSERTION. Both lists are newest-first and both tables
+   * stamp `created_at` with defaultNow(), so a row arriving from anywhere is
+   * newer than everything on screen and lands at index 0 -- pushing every row
+   * the reader is looking at down one. On the Files tab that row carries the
+   * download link, so the file under the pointer changes between two clicks.
+   */
+  it("takes nothing from a later fetch, however much has arrived", () => {
+    const first = takeWholeList(emptyHeldList<Row>("k"), "k", [row("a"), row("b")]);
+    const after = takeWholeList(first, "k", [row("new"), row("a"), row("b")]);
+    expect(after).toBe(first);
+    expect(after.rows.map((r) => r.id)).toEqual(["a", "b"]);
+  });
+
+  /**
+   * "ALREADY ON SCREEN" IS THE WHOLE HELD ARRAY, and the key is what stops it
+   * being the PREVIOUS record's. Neither Notes nor Files remounts when the
+   * route params change under it (rail.tsx renders both from the same tab set,
+   * and the detail pages swap ids without remounting), so a hold with no key
+   * would leave one company's notes on screen under the next company's name --
+   * exactly the leak CursorPages was keyed to prevent.
+   */
+  it("discards what it holds when the record changes under it", () => {
+    const held = takeWholeList(emptyHeldList<Row>("k"), "k", [row("a")]);
+    const moved = takeWholeList(held, "other", [row("z")]);
+    expect(moved.key).toBe("other");
+    expect(moved.rows.map((r) => r.id)).toEqual(["z"]);
+  });
+
+  /**
+   * AN EMPTY HELD LIST IS NOT HELD -- takeCursorPage's rule, for the same
+   * reason it gives. A record showing nothing has no reader's place to
+   * protect, and holding there would put "No notes yet" on screen beside an
+   * offer to show the note that has just arrived: a tab that contradicts
+   * itself.
+   */
+  it("does not hold an empty list against the first row to arrive", () => {
+    const empty = takeWholeList(emptyHeldList<Row>("k"), "k", []);
+    const filled = takeWholeList(empty, "k", [row("first")]);
+    expect(filled.rows.map((r) => r.id)).toEqual(["first"]);
+  });
+
+  /**
+   * ...AND STILL SETTLES ON A RECORD THAT REALLY IS EMPTY. This runs from a
+   * render effect, so an empty list that returned a fresh object every time
+   * would set state on every render for ever. React Query hands back the same
+   * array while a query's data is unchanged, which makes reference equality
+   * the exact "nothing arrived" test rather than an approximation of one --
+   * the argument mergeCursorPage above already makes.
+   */
+  it("settles rather than re-taking the same empty answer", () => {
+    const answer: Row[] = [];
+    const once = takeWholeList(emptyHeldList<Row>("k"), "k", answer);
+    expect(takeWholeList(once, "k", answer)).toBe(once);
+  });
+});
+
+/**
+ * WHAT HAS ARRIVED BEHIND A LIST THAT HAS NO PAGES (v1.7.2).
+ *
+ * pendingArrivals is reused here rather than replaced, and the reason is that
+ * BOTH of its exclusions are provably inert on a whole-list fetch -- which is
+ * an argument for trusting it, not for writing a fourth, thinner copy.
+ *
+ * Nothing is ever deleted from either table (api: routes/notes.ts and
+ * routes/files.ts expose GET and POST and nothing else), so the current whole
+ * list is a SUPERSET of any earlier snapshot of itself. Every row the head has
+ * and the snapshot lacks was therefore inserted after the snapshot was taken,
+ * and `created_at` is defaultNow() on both tables with no way to supply one --
+ * so it is newer than every row on screen, and the floor rule cannot exclude
+ * it. The count is the plain difference, and these tests pin that.
+ */
+describe("a whole list's arrivals", () => {
+  const row = (id: string, at: string): Row & { at: string } => ({ id, at });
+  const at = (r: { at: string }): string => r.at;
+  const shown = [
+    row("a", "2026-09-04T12:00:00.000Z"),
+    row("b", "2026-09-04T11:00:00.000Z"),
+  ];
+
+  it("counts every row the fetch has gained since the snapshot", () => {
+    const head = [
+      row("n1", "2026-09-04T14:00:00.000Z"),
+      row("n2", "2026-09-04T13:00:00.000Z"),
+      ...shown,
+    ];
+    expect(pendingArrivals(shown, head, false, at)).toEqual({ count: 2, atLeast: false });
+  });
+
+  /**
+   * NEVER A FLOOR, so the "+" the label can render never appears on these two
+   * tabs. `atLeast` means "the arrivals may run past the only page that was
+   * looked at", and the fetch here IS the whole list -- there is no page
+   * behind it for the count to be short of. Passing `false` is the fact, not a
+   * simplification, which is why it is asserted rather than assumed.
+   */
+  it("is never a floor, because the fetch is the whole list", () => {
+    const head = [row("n1", "2026-09-04T14:00:00.000Z"), row("n2", "2026-09-04T13:00:00.000Z")];
+    expect(pendingArrivals(shown, head, false, at).atLeast).toBe(false);
+  });
+});
+
+describe("newArrivalsLabel", () => {
+  it("names the one thing that arrived in the singular", () => {
+    expect(newArrivalsLabel({ count: 1, atLeast: false }, "note", "notes")).toBe("Show 1 new note");
+  });
+
+  it("pluralises for any other count", () => {
+    expect(newArrivalsLabel({ count: 3, atLeast: false }, "file", "files")).toBe("Show 3 new files");
+  });
+
+  /**
+   * The "+" is the floor marker, and it belongs to the paged surfaces: a
+   * whole-list fetch can never produce one (see above), and the two rail lists
+   * that page can. One label for all four rather than four spellings of it --
+   * the argument identityKey makes, and the one this file's own guard on
+   * mergeCursorPage was written after somebody had already made twice.
+   */
+  it("marks a count that is only a floor", () => {
+    expect(newArrivalsLabel({ count: 2, atLeast: true }, "entry", "entries")).toBe("Show 2+ new entries");
+  });
+});
+
+/**
+ * THE PREPROCESSING THE GUARDS BELOW REST ON, TESTED RATHER THAN TRUSTED.
+ *
+ * Three assertions in this file ask whether a component USES a name, and they
+ * are only as good as the stripping that makes "uses" different from
+ * "imports". The dangerous failure is not a false red -- someone would look
+ * at that -- it is over-stripping, which deletes the code being searched and
+ * turns every one of those guards permanently, silently green.
+ */
+describe("withoutImports", () => {
+  it("strips the wrapped import lists this package actually writes", () => {
+    const source = [
+      "import {",
+      "  emptyHeldList, identityKey, takeWholeList,",
+      "  type HeldList,",
+      '} from "../../lib";',
+      "const key = identityKey({ companyId });",
+    ].join("\n");
+    const body = withoutImports(source);
+    expect(body).not.toContain("emptyHeldList");
+    // The USE survives, which is the entire point of the function.
+    expect(body).toContain("const key = identityKey({ companyId });");
+  });
+
+  it("strips the single-line and side-effect forms too", () => {
+    const source = 'import { useState } from "react";\nimport "./styles.css";\nconst x = useState(1);';
+    expect(withoutImports(source).trim()).toBe("const x = useState(1);");
+  });
+
+  /**
+   * THE OVER-STRIPPING CASE, which is the one that would go unnoticed. A greedy
+   * match runs from the first `import` to the LAST `from "..."` in the file and
+   * takes everything in between with it -- so a component whose body sits
+   * between two imports would be searched as an empty string, and every guard
+   * over it would pass without reading a line of code.
+   */
+  it("does not swallow the code between two imports", () => {
+    const source = 'import a from "a";\nconst kept = a();\nimport b from "b";\nconst also = b();';
+    const body = withoutImports(source);
+    expect(body).toContain("const kept = a();");
+    expect(body).toContain("const also = b();");
+  });
+
+  // A re-export is part of what a module does, not something it merely has in
+  // scope, so it is deliberately left where it is.
+  it("leaves a re-export alone", () => {
+    expect(withoutImports('export { thing } from "./thing";')).toContain("export { thing }");
+  });
+});
+
+/**
  * THE RULE, STATED ONCE FOR EVERY SURFACE THERE IS AND EVERY SURFACE THERE
  * WILL BE (v1.7.1).
  *
@@ -498,6 +698,96 @@ describe("no component merges a page it is already holding", () => {
     const offenders = componentsIn(new URL("./", import.meta.url))
       .filter((file) => withoutComments(readFileSync(file, "utf8")).includes("mergeCursorPage"))
       .map((file) => file.pathname.split("/packages/web/")[1] ?? file.pathname);
+    expect(offenders).toEqual([]);
+  });
+
+  /**
+   * WHAT EVERY HOLDER OWES ITS READER, WALKED RATHER THAN REMEMBERED (v1.7.2).
+   *
+   * Holding rows back is two decisions, not one, and the second is the one
+   * that gets dropped. v1.7.1's first cut held the reader's OWN writes too:
+   * "edit the field and watch it land" became "edit the field, then press a
+   * button", on the app's busiest surface, and two existing journeys went red.
+   * That was caught by CI rather than by review, which is the argument for
+   * putting it here -- the mistake is invisible in a diff that looks entirely
+   * correct, because every line of it IS correct.
+   *
+   * The escape comes in two shapes and both are accepted: a component that can
+   * see this browser's mutations asks for them itself (hooks.ts's
+   * useOwnWriteNonce), and one whose single caller makes the single kind of
+   * write is told (thread-list.tsx's refreshToken prop). What is not accepted
+   * is neither.
+   *
+   * THE OTHER HALF is the key. A hold is state that outlives the fetch it came
+   * from, so it has to be keyed on the record it belongs to or it is simply
+   * the previous record's rows under the next one's name -- and none of these
+   * components remounts when the ids change under it.
+   *
+   * A WALK, for the reason the guard above gives: the next list somebody holds
+   * will reach for the same import, and naming today's five files would have
+   * to be remembered.
+   *
+   * IMPORTS ARE STRIPPED AS WELL AS COMMENTS, and that is what makes these
+   * assertions mean anything. Nothing in this repo notices an unused import --
+   * no linter, no noUnusedLocals -- so a guard that searched the whole file
+   * would be satisfied by a component that imports useOwnWriteNonce and never
+   * calls it, which is exactly the shape of the regression being guarded
+   * against. Measured: four of these passed against that mutation before
+   * withoutImports existed.
+   */
+  function holdersIn(dir: URL): { name: string; source: string }[] {
+    return componentsIn(dir)
+      .map((file) => ({
+        name: file.pathname.split("/packages/web/")[1] ?? file.pathname,
+        source: withoutImports(withoutComments(readFileSync(file, "utf8"))),
+      }))
+      .filter(({ source }) => source.includes("takeCursorPage") || source.includes("takeWholeList"));
+  }
+
+  /**
+   * THE WALK FINDS THEM; THIS NAMES WHAT IT FOUND. Five surfaces hold their
+   * rows still -- the inbox, and the record rail's Timeline, Meetings, Notes
+   * and Files tabs -- and every one of them shipped the defect first and was
+   * fixed afterwards, three of them a full release apart.
+   *
+   * A COUNT WOULD HAVE BEEN THE COMFORTABLE CHOICE and is the weaker one: a
+   * change that removed one hold and added another elsewhere passes it, and
+   * that is not a contrived pairing so much as what a refactor of this area
+   * looks like. The names are also the only way a failure here says WHICH list
+   * stopped holding, which is the whole content of the message.
+   *
+   * IT IS RED FOR A NEW HOLDER TOO, deliberately. Adding a sixth list to this
+   * set is a claim that the sixth list gets the two guarantees below, and the
+   * one line it costs to say so here is the moment to check that it does. This
+   * is the only unit-level sight of any of it: the package wires no
+   * testing-library, so the behaviour itself is Playwright's to prove
+   * (e2e/rail-live.spec.ts and e2e/inbox-live.spec.ts).
+   *
+   * This does not contradict the walk above. The corpus is still discovered
+   * rather than listed, which is what stops a new component being missed; what
+   * is written down is the ANSWER, so that changing it has to be deliberate.
+   */
+  it("finds every component that holds rows", () => {
+    expect(holdersIn(new URL("./", import.meta.url)).map(({ name }) => name).sort()).toEqual([
+      "src/components/mail/thread-list.tsx",
+      "src/components/rail/files.tsx",
+      "src/components/rail/meetings.tsx",
+      "src/components/rail/notes.tsx",
+      "src/components/rail/timeline.tsx",
+    ]);
+  });
+
+  it("gives every list that holds rows a way past the hold for the reader's own write", () => {
+    const offenders = holdersIn(new URL("./", import.meta.url))
+      .filter(({ source }) => !source.includes("useOwnWriteNonce") && !source.includes("refreshToken"))
+      .map(({ name }) => name);
+    expect(offenders).toEqual([]);
+  });
+
+  it("keys every held list on the record it belongs to", () => {
+    const offenders = holdersIn(new URL("./", import.meta.url))
+      .filter(({ source }) => !source.includes("identityKey"))
+      .map(({ name }) => name);
     expect(offenders).toEqual([]);
   });
 });
