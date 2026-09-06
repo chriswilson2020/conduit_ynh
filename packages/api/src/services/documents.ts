@@ -1,21 +1,24 @@
 import { Readable } from "node:stream";
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
+import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import {
   agreementContentBytes, documentTemplateInputSchema, documentTotals, documentTypeFreezes,
   formatDocumentInstant, formatMoneyCents, formatQtyMilli,
   documentContentBytes, formatTaxRateBp, issueAgreementInputSchema, issueLetterInputSchema,
   issueQuoteInputSchema, lineTotalCents,
-  MAX_TEMPLATE_BYTES, redraftLetterInputSchema, renderInputCost, RENDER_IMAGE_CAP_BYTES,
-  RENDER_IMAGE_PIXEL_CAP, RENDER_MARKUP_CAP_BYTES, todayInZone,
+  MAX_TEMPLATE_BYTES, PROJECT_STATUS_LABEL, redraftLetterInputSchema, renderInputCost,
+  RENDER_IMAGE_CAP_BYTES,
+  RENDER_IMAGE_PIXEL_CAP, RENDER_MARKUP_CAP_BYTES, TASK_STATUS_LABEL, todayInZone,
   type AgreementRecord, type DocumentRecord, type DocumentTemplate, type DocumentTemplateInput,
   type IssueAgreementInput, type IssueLetterInput, type IssueQuoteInput, type LetterRecord,
-  type MeetingSummaryRecord, type OrgProfile, type RecordDocument, type RedraftLetterInput,
+  type MeetingSummaryRecord, type OrgProfile, type ProjectStatus, type RecordDocument,
+  type RedraftLetterInput, type StatusReportRecord, type TaskStatus,
 } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import {
   companies, contacts, deals, documentAgreements, documentLetters, documentLineItems,
   documentQuotes, documents, documentTemplates,
-  meetingAttendees, meetings, users,
+  meetingAttendees, meetings, projects, taskDependencies, tasks, users,
   type DocumentAgreementRow, type DocumentLetterRow, type DocumentLineItemRow,
   type DocumentQuoteRow, type DocumentRow,
 } from "../db/schema.js";
@@ -23,8 +26,9 @@ import { allocateNumber } from "./documents-number.js";
 import { renderPdf } from "./documents-render.js";
 import {
   documentTemplateErrors, documentTemplateWarnings, MergeHtml, prepareDocumentHtml,
-  sanitizeDocumentHtml, type MergeContext,
+  sanitizeDocumentHtml, type MergeContext, type MergeTask,
 } from "./documents-template.js";
+import { parentTasks, taskOutlineOrder } from "./scheduling.js";
 import { getOrgProfile } from "./org-profile.js";
 import { saveBlob } from "./blobs.js";
 import { attachFile } from "./files.js";
@@ -309,14 +313,18 @@ interface RenderAndStoreInput {
   /**
    * Exactly one, matching the `documents` row this file is about to belong to.
    *
-   * FOUR OF THE FIVE SINCE TASK 3, and the missing one is `projectId`, which is
-   * Task 4's. Spelled as four optional keys rather than as a union because
-   * `attachFile` takes exactly this shape and does its own "which one is set"
-   * walk over it; a union here would be narrowed once and widened straight back.
-   * The thing that makes "exactly one" true is `documents_exactly_one_entity`
-   * and `files_exactly_one_entity`, in the database, on both rows.
+   * ALL FIVE SINCE TASK 4, which added the `projectId` this comment used to
+   * name as missing. Spelled as five optional keys rather than as a union
+   * because `attachFile` takes exactly this shape and does its own "which one is
+   * set" walk over it; a union here would be narrowed once and widened straight
+   * back. The thing that makes "exactly one" true is `documents_exactly_one_entity`
+   * and `files_exactly_one_entity`, in the database, on both rows -- and since
+   * 0020, `documents_entity_matches_type` says which one belongs to which type.
    */
-  target: { companyId?: string; contactId?: string; dealId?: string; meetingId?: string };
+  target: {
+    companyId?: string; contactId?: string; dealId?: string;
+    meetingId?: string; projectId?: string;
+  };
 }
 
 /**
@@ -1613,6 +1621,44 @@ export async function issueAgreement(
 }
 
 /**
+ * How wide a company's Documents list is.
+ *
+ * **THIS IS THE ROLLUP TASK 3 RECOMMENDED AND DID NOT BUILD, AND IT IS OFF BY
+ * DEFAULT ON PURPOSE.** Task 3's finding: "A letter to Jane at Acme is raised on
+ * JANE, so it does not appear on ACME's Documents list -- and vice versa.
+ * routes.test.ts asserts that emptiness deliberately, because it is the decision
+ * working rather than a bug... For CORRESPONDENCE it is real friction. **THE
+ * RECOMMENDATION IS A READ, NOT A COLUMN.**"
+ *
+ * So it is a read, and it is the read Task 3 wrote out: `WHERE company_id = $1 OR
+ * contact_id IN (SELECT id FROM contacts WHERE company_id = $1)`.
+ *
+ * **CHRIS'S "EXACTLY ONE" DECISION IS UNTOUCHED, AND THAT IS THE POINT OF DOING
+ * IT THIS WAY.** Nothing here widens `documents_exactly_one_entity`, nothing adds
+ * a second owner column, and every row still belongs to exactly one record. What
+ * changes is what one PAGE chooses to show, which is not a question about the
+ * data model. Task 3 was explicit that widening the CHECK "would make every
+ * reader ask 'which of the two is this document really about', which is the
+ * question `num_nonnulls(...) = 1` exists to answer".
+ *
+ * **DEFAULT `false`, SO THE ASSERTED EMPTINESS STAYS ASSERTED.** routes.test.ts's
+ * "keeps a contact's documents separate from their company's" is a deliberate
+ * test of a deliberate decision; a rollup that turned itself on would have
+ * required deleting it, which is how a decision gets reversed by a task that was
+ * only asked to consider reversing it. The operator turns it on, per view, and
+ * both behaviours are then observable.
+ *
+ * **IT IS MEANINGLESS FOR A CONTACT AND IS IGNORED THERE**, rather than being
+ * refused: a contact has no contacts, so there is nothing to roll up, and a route
+ * that 400'd on a query parameter a client sent uniformly would be a worse
+ * contract than one that answers the same list either way.
+ */
+export interface ListRecordDocumentsOptions {
+  /** A company's list also shows documents raised on its own contacts. */
+  includeContacts?: boolean;
+}
+
+/**
  * Every document attached to one company or one contact, newest first.
  *
  * **THE READER THAT MIXES TYPES, WHICH IS WHAT THE DISCRIMINATED UNION IN
@@ -1641,17 +1687,33 @@ export async function issueAgreement(
  * whose content is missing.
  */
 export async function listRecordDocuments(
-  db: Database, target: RecordTarget,
+  db: Database, target: RecordTarget, options: ListRecordDocumentsOptions = {},
 ): Promise<RecordDocument[]> {
+  // A SUBQUERY AND NOT A SECOND ROUND TRIP, for the reason the two LEFT JOINs
+  // above are one query: the ORDER BY has to run over the whole set, and merging
+  // two reads in TypeScript means reproducing it by hand in a second place.
+  // `contacts.company_id` is the link, and it is the same link the company page
+  // already uses to list its people.
+  const owner = "companyId" in target
+    ? (options.includeContacts === true
+      ? or(
+        eq(documents.companyId, target.companyId),
+        inArray(
+          documents.contactId,
+          db.select({ id: contacts.id }).from(contacts)
+            .where(eq(contacts.companyId, target.companyId)),
+        ),
+      )
+      : eq(documents.companyId, target.companyId))
+    : eq(documents.contactId, target.contactId);
+
   const rows = await db.select({
     document: documents, letter: documentLetters, agreement: documentAgreements,
   })
     .from(documents)
     .leftJoin(documentLetters, eq(documentLetters.documentId, documents.id))
     .leftJoin(documentAgreements, eq(documentAgreements.documentId, documents.id))
-    .where("companyId" in target
-      ? eq(documents.companyId, target.companyId)
-      : eq(documents.contactId, target.contactId))
+    .where(owner)
     .orderBy(desc(documents.createdAt), desc(documents.id));
   return rows.map((row) => {
     if (row.letter !== null) return toLetterRecord(row.document, row.letter);
@@ -1661,4 +1723,488 @@ export async function listRecordDocuments(
       + "with no detail row, which no writer can produce",
     );
   });
+}
+
+/* ========================================================================== *
+ *  THE PROJECT STATUS REPORT -- THE BROADEST SOURCE, AND THE SECOND TYPE WITH
+ *  NO FORM
+ * ========================================================================== */
+
+/**
+ * One task, as the report reads it out of the database and before any of it is
+ * a string.
+ *
+ * `after` IS THE ONLY FIELD NOT ON THE `tasks` ROW: the titles of this task's
+ * predecessors, in the order `listDependencies` returns them. It is what makes
+ * this the Gantt STATE rather than a task list.
+ */
+export interface StatusReportTask {
+  title: string;
+  status: TaskStatus;
+  startDate: string | null;
+  dueDate: string | null;
+  progressPct: number | null;
+  /** The assignee's display name, or "" for an unassigned task. */
+  assignee: string;
+  after: string[];
+}
+
+/** Everything the project status report template is allowed to print. */
+export interface StatusReportContextInput {
+  org: OrgProfile;
+  /**
+   * The day the report was produced, in the organisation's zone -- and also the
+   * day the overdue rule is measured against. ONE VALUE FOR BOTH, deliberately:
+   * a report that said "Reported 6 September" and counted overdue against the
+   * server's UTC day would disagree with itself for two hours a night.
+   */
+  issueDate: string;
+  projectName: string;
+  status: ProjectStatus;
+  startDate: string | null;
+  dueDate: string | null;
+  /** The project owner's display name, or "" if it has none. */
+  owner: string;
+  /** The linked company's name, or "" if the project is not on one. */
+  company: string;
+  tasks: StatusReportTask[];
+}
+
+/** How far along a task its own assignee says it is. */
+function formatProgressPct(pct: number | null): string {
+  return pct === null ? "" : `${String(pct)}%`;
+}
+
+/**
+ * Whether a task is late, as this document counts it.
+ *
+ * **DUE TODAY IS NOT OVERDUE**, which is the one judgement in the rule. A task
+ * due on the day the report is produced still has the day to run, and a report
+ * that called it late would be wrong about every task somebody planned to finish
+ * that afternoon. Strictly before, therefore.
+ *
+ * A DONE TASK IS NEVER OVERDUE, whenever it was actually finished.
+ * `tasks_completed_at_paired` ties `completed_at` to the done status, so
+ * "finished late" is answerable -- and it is deliberately not asked here. This
+ * count is "what needs attention", and a task that is finished does not, however
+ * it went.
+ *
+ * AN UNDATED TASK IS NEVER OVERDUE EITHER, which is not leniency but the only
+ * available answer: nothing can be late for a deadline that was never set. That
+ * is why the report prints an Undated count beside the Overdue one -- the two
+ * together are the whole picture, and either alone is a flattering half of it.
+ */
+function isOverdue(task: StatusReportTask, on: string): boolean {
+  return task.status !== "done" && task.dueDate !== null && task.dueDate < on;
+}
+
+/**
+ * The merge context for one project status report.
+ *
+ * **THE COUNTS ARE DERIVED FROM THE SAME ARRAY THE TABLE PRINTS, AND THAT IS THE
+ * WHOLE REASON THEY ARE COMPUTED HERE RATHER THAN IN A QUERY.** A `SELECT
+ * count(*) ... GROUP BY status` beside a separate `SELECT ... ORDER BY` would be
+ * two reads of one thing, and the failure mode is specific and awful on a printed
+ * page: a headline saying three tasks are overdue above a table showing four.
+ * Nobody checks a headline against a table they were handed in the same document.
+ * One array, counted once, is the only arrangement in which the two cannot
+ * disagree.
+ *
+ * **NOTHING HERE IS RAW.** A task title, a project name and an assignee are plain
+ * text in plain inputs, so a project called `<b>Rye Lane</b>` prints as itself
+ * rather than restructuring the page. This type has no rich-text field at all --
+ * the summary's notes and the letter's body are the only two `MergeHtml` values
+ * in Conduit, and each exists because an operator typed markup into a field whose
+ * whole purpose was markup.
+ *
+ * **NO PERCENTAGE OF THE PROJECT IS OFFERED, AND ITS ABSENCE IS A DECISION.**
+ * `doneCount / taskCount` is trivial to compute and would be a lie: it weights a
+ * three-day task the same as a three-month one, so "60% complete" is a claim
+ * about effort made out of a count of rows. The per-task `progress` IS printed,
+ * because that one is somebody's own estimate of their own task rather than
+ * arithmetic this document invented. A template can have a project percentage the
+ * day something in Conduit stores effort.
+ *
+ * NO `number` KEY, so a template naming one prints a blank -- right for a type
+ * that has none (`documentTypeNumbered`), and free from the merge language's
+ * unknown-path rule.
+ */
+export function buildStatusReportContext(input: StatusReportContextInput): MergeContext {
+  const count = (predicate: (task: StatusReportTask) => boolean): string =>
+    String(input.tasks.filter(predicate).length);
+  return {
+    org: orgContext(input.org),
+    document: {
+      issueDate: input.issueDate,
+      projectName: input.projectName,
+      projectStatus: PROJECT_STATUS_LABEL[input.status],
+      // EMPTY STRING RATHER THAN LEFT OUT for a project with no dates. The
+      // template's `{{#document.startDate}}` turns on emptiness and an absent key
+      // resolves to `undefined`, which `isEmpty` also calls empty -- so the two
+      // behave identically and only one of them says so. `?? ""` is the saying.
+      startDate: input.startDate ?? "",
+      dueDate: input.dueDate ?? "",
+      owner: input.owner,
+      company: input.company,
+      taskCount: String(input.tasks.length),
+      doneCount: count((task) => task.status === "done"),
+      inProgressCount: count((task) => task.status === "in_progress"),
+      blockedCount: count((task) => task.status === "blocked"),
+      todoCount: count((task) => task.status === "todo"),
+      overdueCount: count((task) => isOverdue(task, input.issueDate)),
+      // COUNTED ON THE DUE DATE ALONE, and `tasks_dates_paired` is what makes
+      // that the same question as "has no dates at all": the CHECK admits both
+      // null or both set, never one. The due date is the half chosen because it
+      // is the half the overdue rule turns on, so "undated" here means exactly
+      // "not a task the Overdue count could ever have included".
+      undatedCount: count((task) => task.dueDate === null),
+    },
+    // A report has no priced lines, so `{{#lines}}` renders nothing. Empty rather
+    // than absent for buildMeetingSummaryContext's reason: MergeContext requires
+    // it, and requiring it is what keeps every quote context honest.
+    lines: [],
+    tasks: input.tasks.map((task): MergeTask => ({
+      title: task.title,
+      status: TASK_STATUS_LABEL[task.status],
+      startDate: task.startDate ?? "",
+      dueDate: task.dueDate ?? "",
+      progress: formatProgressPct(task.progressPct),
+      assignee: task.assignee,
+      // JOINED HERE RATHER THAN IN THE TEMPLATE, because the merge language has
+      // no separator construct: a block over a list of names has no way to write
+      // the last-item case, so `{{#after}}{{.}}, {{/after}}` would print a
+      // trailing comma on every row that has one. The template gets one string
+      // and asks only whether it is empty.
+      after: task.after.join(", "),
+    })),
+  };
+}
+
+/**
+ * Every unarchived task on a project, in the order the Gantt draws them, with
+ * each one's predecessors named.
+ *
+ * **UNARCHIVED ONLY, AND UNLIKE `ganttPayload` THE UNDATED ONES ARE KEPT.** That
+ * function excludes a task with no dates because a chart has nowhere to draw a
+ * bar with no ends. A report is a table: it has a row for a task with no dates,
+ * and that row is one somebody needs to see -- work nobody has scheduled is
+ * exactly what a status report exists to surface, and it is the whole reason
+ * there is no date range on this type. Archived tasks ARE excluded, because
+ * archiving is how work leaves the plan and a report listing work nobody is doing
+ * is a report about a different project.
+ *
+ * **THE ORDER IS THE GANTT'S, REUSED AND NOT COPIED** (`taskOutlineOrder`, and
+ * the self-join it requires). Rejected: `listTasks`' `(parent_task_id, position)`,
+ * which is right for a list a client regroups and wrong for a printed table
+ * nobody can re-sort. Postgres sorts NULLs last on an ascending sort, so under
+ * that ordering every ROOT task prints after every subtask and each parent is
+ * separated from its own children by the whole rest of the project.
+ *
+ * **A PREDECESSOR IS NAMED EVEN WHEN IT IS NOT IN THE REPORT, WHICH IS THE
+ * OPPOSITE OF `ganttPayload`'S RULE AND IS DELIBERATE.** That function drops an
+ * edge whose other end is not in the payload, because a chart cannot draw an
+ * arrow with one end missing. A table CAN print the name.
+ *
+ * THE CASE IS NOT HYPOTHETICAL, AND IT IS NOT THE ONE THAT LOOKS OBVIOUS.
+ * `addDependency` refuses to link two tasks in different projects, so an edge
+ * cannot be CREATED across a boundary -- but `updateTask` will move a task
+ * between projects afterwards, and archiving one is ordinary. So the reachable
+ * shape is a task waiting on something that has been ARCHIVED, or moved away:
+ * the successor is still blocked, and a report that omitted the name would show
+ * it as merely late with nothing said about what it is waiting for.
+ *
+ * Ordered by `created_at`, which is `listDependencies`' own order, so what is
+ * printed and what the API returns are in the same order.
+ *
+ * TWO QUERIES AND NOT ONE, because a join to `task_dependencies` multiplies the
+ * task rows by their edge count and the de-duplication would then happen in
+ * TypeScript over a result whose ORDER BY had to survive it. The second query is
+ * skipped entirely for a project with no tasks.
+ */
+async function loadReportTasks(tx: Database, projectId: string): Promise<StatusReportTask[]> {
+  const rows = await tx.select({
+    id: tasks.id,
+    title: tasks.title,
+    status: tasks.status,
+    startDate: tasks.startDate,
+    dueDate: tasks.dueDate,
+    progressPct: tasks.progressPct,
+    // `full_name` BEFORE `username`, which is `loadAttendeeNames`' precedence and
+    // its reason: a CSV column wants the identifier an operator can join on, a
+    // printed page wants "Chris Wilson" rather than "chris". `full_name` comes
+    // from the auth header and is nullable, so the username is the fallback.
+    fullName: users.fullName,
+    username: users.username,
+  }).from(tasks)
+    .leftJoin(users, eq(tasks.assigneeUserId, users.id))
+    // REQUIRED BY taskOutlineOrder: without this join Postgres refuses the query
+    // outright ("missing FROM-clause entry") rather than ordering wrongly.
+    .leftJoin(parentTasks, eq(tasks.parentTaskId, parentTasks.id))
+    .where(and(eq(tasks.projectId, projectId), isNull(tasks.archivedAt)))
+    .orderBy(...taskOutlineOrder());
+
+  const ids = rows.map((row) => row.id);
+  const predecessors = alias(tasks, "predecessor_tasks");
+  const edges = ids.length === 0 ? [] : await tx.select({
+    successorId: taskDependencies.successorId,
+    title: predecessors.title,
+  }).from(taskDependencies)
+    .innerJoin(predecessors, eq(taskDependencies.predecessorId, predecessors.id))
+    .where(inArray(taskDependencies.successorId, ids))
+    .orderBy(asc(taskDependencies.createdAt));
+
+  return rows.map((row) => ({
+    title: row.title,
+    // The column is `text` with a CHECK rather than an enum, so the cast is where
+    // `tasks_status_valid`'s promise is cashed into the shared union -- exactly
+    // as `toDocumentRecord` casts `documents.type`.
+    status: row.status as TaskStatus,
+    startDate: row.startDate,
+    dueDate: row.dueDate,
+    progressPct: row.progressPct,
+    assignee: row.fullName ?? row.username ?? "",
+    after: edges.filter((edge) => edge.successorId === row.id).map((edge) => edge.title),
+  }));
+}
+
+/** `documents` row -> the wire shape, for the second type whose content is not in it. */
+function toStatusReportRecord(row: DocumentRow, projectId: string): StatusReportRecord {
+  return {
+    id: row.id,
+    type: "project_status_report",
+    // THE PROJECT COMES FROM THE CALLER, NOT FROM `row`, for the reason
+    // toMeetingSummaryRecord takes its meetingId that way: `documents.project_id`
+    // is nullable (a quote's is null) while this DTO's is not, so reading it off
+    // the row would put a `!` or a `?? ""` here that no caller can reach and no
+    // test could exercise. Both call sites have the id in hand.
+    projectId,
+    fileId: row.fileId,
+    issueDate: row.issueDate,
+    frozen: row.frozen,
+    issuedByUserId: row.issuedByUserId,
+    createdAt: row.createdAt.toISOString(),
+  };
+}
+
+/**
+ * The longest a project's name may be inside a downloaded filename.
+ *
+ * `projects.name` has no upper bound in the schema or in
+ * `createProjectInputSchema`, and `files.original_name` has none either -- the
+ * meeting title's situation exactly, so it takes `SUMMARY_TITLE_CHARS`' figure
+ * and its reason: 80 characters leaves the rest of the name well inside the
+ * export's 180-BYTE member limit even when every character costs three bytes.
+ */
+const REPORT_TITLE_CHARS = 80;
+
+/**
+ * What a downloaded status report is called.
+ *
+ * `summaryFileName`'s and `letterFileName`'s third sibling, and it shares both of
+ * their decisions. The name is not sanitised here (three places already have an
+ * opinion about what a filename is, and a fourth would be a fourth opinion), and
+ * the DATE is in it because this type can be produced again -- which for this
+ * type is not an edge case but the whole point. A monthly report on one project
+ * is twelve downloads a year, and twelve files called `Status report - Rye
+ * Lane.pdf` land in a folder as `... (1).pdf` through `... (11).pdf`, numbered by
+ * the order somebody downloaded them rather than the order they were written.
+ */
+function reportFileName(projectName: string, issueDate: string): string {
+  const trimmed = projectName.trim().slice(0, REPORT_TITLE_CHARS);
+  return `Status report - ${trimmed === "" ? "untitled" : trimmed} - ${issueDate}.pdf`;
+}
+
+/**
+ * Produce the status report of a project. ONE TRANSACTION, AND NO INPUT AT ALL.
+ *
+ * ======================= THE DATE RANGE, AND WHY THERE IS NONE ==============
+ *
+ * **THE SPEC GIVES THIS TYPE "possibly a date range" AS ITS EXTRA INPUT AND THE
+ * PLAN ASKED FOR THE QUESTION TO BE SETTLED BEFORE A FORM WAS BUILT FOR IT. IT IS
+ * SETTLED NO.** A range could only be one of two things and both fail:
+ *
+ * 1. **A FILTER over which tasks appear.** `tasks_dates_paired` admits a task
+ *    with NO dates -- both null, which is what every task looks like before
+ *    anybody schedules it -- so a range has to decide what to do with one, and
+ *    both answers are wrong. Drop them and the report silently omits exactly the
+ *    tasks that most need attention, which is the same class of failure as the
+ *    export's INNER JOIN dropping every meeting summary. Keep them and the range
+ *    is not a filter. There is precedent for the first answer and it is precedent
+ *    AGAINST: `ganttPayload` does drop undated tasks, because a chart has nowhere
+ *    to draw a bar with no ends. A table has a row.
+ *
+ *    And even over dated tasks a range only subtracts. A window narrower than the
+ *    project hides work; a window wider than it contains exactly the same tasks.
+ *    The one genuinely interesting window -- "what changed since the last report"
+ *    -- is not answerable from a range at all: it needs the previous report and a
+ *    diff, `tasks` keeps no history, and reconstructing one from `events` is a
+ *    different feature with a different name.
+ *
+ * 2. **A LABEL saying what period the report covers.** The project already has a
+ *    start date and a due date and both are printed at the top of the page. A
+ *    second, per-document range that can disagree with them is a second answer to
+ *    "what period is this project", inside the document whose job is to be the
+ *    answer.
+ *
+ * **SO THIS TYPE TAKES NO INPUT AT ALL, AND IT IS THE SECOND WITH NO FORM.** That
+ * is the plan's fear inverted: it expected the broadest source to be larger than
+ * it looks, and on the INPUT side this is the smallest type in the phase. All of
+ * its breadth is on the READ -- a project, every task on it, their dependencies,
+ * seven counts and an overdue rule -- and none of that is submitted by anybody.
+ *
+ * ============= THE ISSUE DATE IS THE SERVER'S, NOT THE OPERATOR'S ===========
+ *
+ * `issueMeetingSummary`'s arrangement and NOT `issueQuote`'s, and the reason is
+ * sharper here than it was for the summary. A quote's issue date is
+ * client-supplied because it is the operator's own choice about a document whose
+ * content they also chose. A status report's content is read LIVE at the moment
+ * it is produced, so a report an operator dated last Friday would print Friday's
+ * date over today's tasks. That is not a preference, it is the document telling a
+ * lie about itself -- and the same value is what the overdue count is measured
+ * against, so a back-dated report would be arithmetically wrong as well.
+ *
+ * `todayInZone(org.timeZone)`, so the calendar day is the organisation's and not
+ * the server's UTC one. v1.8.0's timezone field, third call site.
+ *
+ * =================== WHAT IT DOES **NOT** DO, EACH FOR A REASON =============
+ *
+ * - **NO NUMBER**, so no `allocateNumber`, so no row lock, so no `SET LOCAL
+ *   lock_timeout` -- the summary's and the letter's arrangement.
+ *   @conduit/shared's `documentTypeNumbered` has the three reasons, the third of
+ *   which is the letter's turned inside out. The second one bites harder here
+ *   than for either of them: "run this month's reports" is a sentence about every
+ *   active project at once, and a number would make them queue.
+ * - **NO FREEZE.** `frozen` is `documentTypeFreezes("project_status_report")`,
+ *   which is `false`, written rather than defaulted for the reason 0016 dropped
+ *   the DEFAULT.
+ * - **NO DETAIL TABLE**, which is the second type to need none and the second
+ *   distinct reason. A meeting summary needs none because its content is the
+ *   `meetings` row it points at. This one needs none because its content is a
+ *   `projects` row, the `tasks` on it and their `task_dependencies` -- and unlike
+ *   a letter's body, not one byte of it was typed into this document. There is
+ *   nothing here that is not already stored somewhere it is maintained.
+ *
+ *   THE ONE THING A DETAIL TABLE WOULD HAVE BOUGHT is a snapshot of the counts,
+ *   so a Documents list could say "12 of 20 done" without re-reading the project.
+ *   Rejected: that is a cache of a page which is already stored, in a table that
+ *   would then have to be kept truthful against a PDF nothing can regenerate, to
+ *   spare one query on a list of single-digit length.
+ * - **NO UPDATE PATH.** Producing a report again appends a SECOND document with
+ *   its own PDF; it does not rewrite the first. `redraftLetter` refuses anything
+ *   that is not a letter and says so, which is a refusal this type inherits
+ *   rather than one it needed.
+ *
+ * THE ORDER IS `issueMeetingSummary`'s: read the project, read the template, read
+ * the issuer profile, read the tasks, merge, check the caps, render, write the
+ * blob, insert the file, insert the document. Everything attributable to the
+ * caller fails before anything spawns. The blob write is the one part that cannot
+ * roll back, for `issueQuote`'s reason exactly.
+ */
+export async function issueStatusReport(
+  db: Database,
+  deps: IssueQuoteDeps,
+  actorId: string,
+  projectId: string,
+): Promise<StatusReportRecord> {
+  const record = await db.transaction(async (tx) => {
+    const [project] = await tx.select({
+      name: projects.name,
+      status: projects.status,
+      startDate: projects.startDate,
+      dueDate: projects.dueDate,
+      archivedAt: projects.archivedAt,
+      companyName: companies.name,
+      ownerFullName: users.fullName,
+      ownerUsername: users.username,
+    }).from(projects)
+      .leftJoin(companies, eq(projects.companyId, companies.id))
+      .leftJoin(users, eq(projects.ownerUserId, users.id))
+      .where(eq(projects.id, projectId));
+    if (project === undefined) throw new NotFoundError("project", projectId);
+    // issueQuote's refusal of an archived deal, on the record this document is
+    // of. attachFile re-checks it a moment later from inside the same
+    // transaction; this one is what makes the refusal arrive before a subprocess
+    // has run.
+    if (project.archivedAt !== null) throw new ArchivedError("project", projectId);
+
+    const templateHtml = await loadTemplateBody(tx, "project_status_report");
+    const org = await getOrgProfile(tx);
+    const issueDate = todayInZone(org.timeZone);
+    const reportTasks = await loadReportTasks(tx, projectId);
+
+    const file = await renderAndStore(tx, deps, actorId, {
+      noun: "status report",
+      templateHtml,
+      context: buildStatusReportContext({
+        org, issueDate,
+        projectName: project.name,
+        status: project.status as ProjectStatus,
+        startDate: project.startDate,
+        dueDate: project.dueDate,
+        owner: project.ownerFullName ?? project.ownerUsername ?? "",
+        company: project.companyName ?? "",
+        tasks: reportTasks,
+      }),
+      // NAMES THE TASK COUNT, because that is the only term of this document's
+      // size an operator has any purchase on. A quote's provenance offers three
+      // levers and the summary's offers the notes; here there is no submission to
+      // trim and no notes -- there is a project with as many tasks as it has, and
+      // a report that will not render is a project somebody has to split up.
+      provenance: "Its template is "
+        + `${String(Buffer.byteLength(templateHtml, "utf8"))} bytes, its logo `
+        + `${String(org.logoDataUri.length)}, and it lists `
+        + `${String(reportTasks.length)} task(s)`,
+      originalName: reportFileName(project.name, issueDate),
+      target: { projectId },
+    });
+
+    const [row] = await tx.insert(documents).values({
+      // SPELLED OUT RATHER THAN OMITTED, as the summary's and the letter's are.
+      // `number` is nullable, so leaving it off would insert the same NULL -- but
+      // this is where a reader finds out that a status report has none.
+      number: null,
+      type: "project_status_report", projectId, fileId: file.id,
+      issueDate,
+      frozen: documentTypeFreezes("project_status_report"),
+      issuedByUserId: actorId,
+    }).returning();
+    if (row === undefined) throw new Error("document insert returned no row");
+
+    // NO SECOND INSERT, and its absence is the data model working -- see the
+    // header. What 0020 adds instead is `documents_entity_matches_type`, which
+    // makes this insert's `projectId` obligatory rather than conventional: a
+    // report written against a company would now be a refused INSERT rather than
+    // a document nothing displays.
+    return toStatusReportRecord(row, projectId);
+  });
+
+  publish({ keys: [["project-documents", projectId], ["files"], ["events"]] });
+  return record;
+}
+
+/**
+ * Every status report produced for a project, newest first.
+ *
+ * `listMeetingSummaries`' twin, down to the reasoning. NO JOIN, because a
+ * report's content is the project the client already has open. FILTERED BY TYPE
+ * as well as by project, though nothing else attaches to a project today: it is
+ * what makes `toStatusReportRecord`'s literal `type` true rather than assumed,
+ * and the moment a second project-attached type exists this function keeps
+ * meaning what its name says instead of quietly widening.
+ *
+ * SERVED BY documents_project_idx (0020). This is the read that made that index
+ * worth building -- 0017 named it ("project with the status report") and 0019
+ * declined to build it early, on the grounds that an index maintained by every
+ * INSERT and used by no SELECT is a cost with no reader.
+ */
+export async function listProjectDocuments(
+  db: Database, projectId: string,
+): Promise<StatusReportRecord[]> {
+  const rows = await db.select().from(documents)
+    .where(and(
+      eq(documents.projectId, projectId),
+      eq(documents.type, "project_status_report"),
+    ))
+    .orderBy(desc(documents.createdAt), desc(documents.id));
+  return rows.map((row) => toStatusReportRecord(row, projectId));
 }

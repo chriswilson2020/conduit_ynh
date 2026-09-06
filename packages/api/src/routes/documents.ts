@@ -11,7 +11,8 @@ import { TemplateError } from "../services/documents-template.js";
 import {
   DocumentFrozenError, DocumentInputError, DocumentTemplateMissingError, DocumentTooLargeError,
   getDocumentTemplate, issueAgreement, issueLetter, issueMeetingSummary, issueQuote,
-  listDocuments, listMeetingSummaries, listRecordDocuments, redraftLetter, saveDocumentTemplate,
+  issueStatusReport, listDocuments, listMeetingSummaries, listProjectDocuments,
+  listRecordDocuments, redraftLetter, saveDocumentTemplate,
   type RecordTarget,
 } from "../services/documents.js";
 import { getOrgProfile, OrgProfileInputError, saveOrgProfile } from "../services/org-profile.js";
@@ -247,6 +248,46 @@ export function registerDocumentRoutes(app: FastifyInstance, { db, dataDir }: Cr
   });
 
   /*
+   * THE PROJECT'S STATUS REPORTS -- Phase 9 Task 4, and the second pair in this
+   * file with NO REQUEST BODY.
+   *
+   * The meeting summary's pair a few lines up says "NO BODY, AND THAT IS THE
+   * WHOLE POINT OF THIS TYPE". That sentence was about a type the spec had
+   * already described as having no extra input; this one is about a type the spec
+   * gave "possibly a date range" and which turned out to need nothing -- see
+   * `issueStatusReport` for the argument, which is the plan's own question
+   * answered rather than dodged. There is nothing to parse, so there is no
+   * `parseOrReject` for a body and no input schema in @conduit/shared. Fastify
+   * accepts a POST with no body.
+   *
+   * `:id` AGAIN, for the reason every other pair here has it: find-my-way refuses
+   * two different parameter names in the same path position, and
+   * `/api/projects/:id`, `/archive` and `/unarchive` already exist in
+   * routes/projects.ts.
+   */
+  app.get("/api/projects/:id/documents", async (request, reply) => {
+    if (requireUser(request, reply) === null) return;
+    const params = parseOrReject(idParamSchema, request.params, reply);
+    if (params === undefined) return;
+    // Unbounded, like the deal's documents and the meeting's summaries: a
+    // project's reports stay countable -- one a month is twelve a year.
+    return await listProjectDocuments(db, params.id);
+  });
+
+  app.post("/api/projects/:id/documents", async (request, reply) => {
+    const user = requireUser(request, reply);
+    if (user === null) return;
+    const params = parseOrReject(idParamSchema, request.params, reply);
+    if (params === undefined) return;
+    try {
+      const document = await issueStatusReport(db, { dataDir }, user.id, params.id);
+      return await reply.code(201).send(document);
+    } catch (error) {
+      mapDocumentError(reply, error);
+    }
+  });
+
+  /*
    * THE COMPANY'S AND THE CONTACT'S DOCUMENTS -- Phase 9 Task 3.
    *
    * TWO RECORDS, ONE PAIR OF HANDLERS EACH, AND ONE BODY SCHEMA. The type is in
@@ -273,9 +314,33 @@ export function registerDocumentRoutes(app: FastifyInstance, { db, dataDir }: Cr
       if (requireUser(request, reply) === null) return;
       const params = parseOrReject(idParamSchema, request.params, reply);
       if (params === undefined) return;
+      /*
+       * **`?includeContacts=true` -- THE ROLLUP TASK 3 RECOMMENDED, AS A QUERY
+       * PARAMETER RATHER THAN A SECOND ROUTE OR A CHANGED DEFAULT.**
+       *
+       * Task 3 found that a letter to Jane at Acme does not appear on Acme's
+       * Documents list, called it "real friction" for correspondence, and
+       * recommended "a read, not a column... behind a flag the section can
+       * offer". This is that flag. Nothing about the data model moved: Chris's
+       * "a document belongs to exactly one thing" is untouched, and what changed
+       * is what one page chooses to SHOW.
+       *
+       * OFF UNLESS ASKED, so the behaviour Task 3 asserted deliberately
+       * ("keeps a contact's documents separate from their company's") is still
+       * the behaviour of an unqualified GET -- and both are now testable side by
+       * side, which is what makes the choice reversible rather than replaced.
+       *
+       * PARSED AS THE LITERAL STRING "true", not with a boolean coercion.
+       * `z.coerce.boolean()` answers TRUE for the string "false", which is the
+       * one value a client is most likely to send when it means the opposite.
+       * The parameter is absent or it is "true"; anything else is off, and no
+       * request is ever refused over it.
+       */
+      const query = request.query as { includeContacts?: unknown };
+      const includeContacts = query.includeContacts === "true";
       // Unbounded, like the deal's documents and the meeting's summaries: a
       // company's documents stay countable, and there is no cursor to page with.
-      return await listRecordDocuments(db, toTarget(params.id));
+      return await listRecordDocuments(db, toTarget(params.id), { includeContacts });
     });
 
     app.post(`/api/${path}/:id/documents`, async (request, reply) => {

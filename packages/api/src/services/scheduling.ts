@@ -657,7 +657,57 @@ export type GanttPayloadOptions = { projectId: string } | { global: true };
 // immediately followed by its children, in position order) without a
 // recursive query -- Phase 3 supports exactly one level of subtask nesting,
 // so a single self-join covers every case.
-const parentTasks = alias(tasks, "parent_tasks");
+//
+// EXPORTED SINCE PHASE 9 TASK 4, because the project status report reads tasks
+// in this same outline order and a second copy of the ORDER BY below would be a
+// second copy of its three subtleties. See `taskOutlineOrder`.
+export const parentTasks = alias(tasks, "parent_tasks");
+
+/**
+ * The ORDER BY that puts a root task immediately in front of its own children.
+ *
+ * **EXTRACTED FOR A SECOND READER RATHER THAN COPIED FOR ONE**, and the second
+ * reader is `issueStatusReport`. Every clause here is load-bearing and none of
+ * them is obvious from the outside: the COALESCE is what makes a child sort by
+ * its PARENT's position, the boolean expression is what puts the root ahead of
+ * its own children at that shared key, and the self-join being unfiltered is a
+ * deliberate degradation for a child whose parent is not in the result set. A
+ * report that reproduced this by hand would get one of the three wrong and the
+ * failure would be a printed table in a subtly odd order -- which nobody reports
+ * as a bug.
+ *
+ * IT TAKES NO `projectId` CLAUSE, and `ganttPayload` prepends its own. That one
+ * serves a GLOBAL chart as well as a per-project one, so it has to group by
+ * project first; the report is always about one project, where the same clause
+ * would be a constant.
+ *
+ * **THE CALLER MUST JOIN `parentTasks`**, or Postgres refuses the query outright
+ * ("missing FROM-clause entry for table parent_tasks") rather than ordering
+ * wrongly -- which is the failure mode worth having, and is why this returns the
+ * clauses rather than trying to own the join too.
+ */
+export function taskOutlineOrder() {
+  return [
+    // Root-first within each parent-group: a child's group key is its PARENT's
+    // position (via the self-join); a root task's group key is its own.
+    // Same-group rows land contiguous, ordered by that shared key.
+    //
+    // The self-join is deliberately unfiltered by any caller's WHERE, so a row
+    // whose parent is excluded from the result set (undated, or archived) still
+    // finds its parent via the join and sorts by that invisible parent's
+    // position. Intentional graceful degradation, not a bug: the child has
+    // nowhere better to sort, and reusing the excluded parent's position at
+    // least keeps it near where its sibling group would have rendered, instead
+    // of the COALESCE falling through to the child's own position and
+    // scattering it away from any siblings it does have.
+    sql`COALESCE(${parentTasks.position}, ${tasks.position})`,
+    // Within a group, the root itself (parentTaskId IS NULL, false/0) sorts
+    // before its children (true/1) at the same group key.
+    sql`(${tasks.parentTaskId} IS NOT NULL)`,
+    // Children of the same parent, ordered among themselves.
+    tasks.position,
+  ];
+}
 
 export async function ganttPayload(db: Database, opts: GanttPayloadOptions): Promise<GanttPayload> {
   const where = [isNull(tasks.archivedAt), isNotNull(tasks.startDate), isNotNull(tasks.dueDate)];
@@ -674,29 +724,11 @@ export async function ganttPayload(db: Database, opts: GanttPayloadOptions): Pro
     .orderBy(
       // Standalone tasks (projectId NULL) sort last within the returned set,
       // Postgres's default NULLS LAST on an ascending sort -- same convention
-      // as projects.ts/tasks.ts's own orderings.
+      // as projects.ts/tasks.ts's own orderings. THIS CLAUSE IS THIS
+      // FUNCTION'S OWN and is not in `taskOutlineOrder`: it exists because this
+      // payload can be GLOBAL, and for a single project it would be a constant.
       tasks.projectId,
-      // Root-first within each (project, parent-group): a child's group key
-      // is its PARENT's position (via the self-join); a root task's group
-      // key is its own position. Same-group rows (a root and its children)
-      // land contiguous, ordered by that shared key.
-      //
-      // The self-join is unfiltered by the WHERE above (no dated/archived
-      // check on parentTasks), so a dated, unarchived child whose parent is
-      // itself excluded from this payload (undated, or archived) still finds
-      // its row via the join and sorts by that invisible parent's position.
-      // This is intentional graceful degradation, not a bug: the child has
-      // nowhere better to sort (its own group has no visible root to anchor
-      // on), and reusing the excluded parent's position at least keeps it
-      // near where its sibling group would have rendered, instead of the
-      // COALESCE falling through to the child's own position and scattering
-      // it away from any siblings it does have.
-      sql`COALESCE(${parentTasks.position}, ${tasks.position})`,
-      // Within a group, the root itself (parentTaskId IS NULL, false/0)
-      // sorts before its children (true/1) at the same group key.
-      sql`(${tasks.parentTaskId} IS NOT NULL)`,
-      // Children of the same parent, ordered among themselves.
-      tasks.position,
+      ...taskOutlineOrder(),
     );
 
   const ganttTasks: GanttTask[] = rows.map((r) => ({

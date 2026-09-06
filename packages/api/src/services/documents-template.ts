@@ -529,6 +529,28 @@ export interface MergeAttendee {
 }
 
 /**
+ * One task, as the project status report prints it. Every field is already a
+ * string: the formatting -- a status label, a percentage, an ISO date or a blank
+ * -- happened in the caller, exactly as it does for `MergeLine`.
+ *
+ * **`after` IS THE ONE FIELD HERE THAT IS NOT ON THE `tasks` ROW**, and it is
+ * what makes this the Gantt STATE rather than a task list: the titles of this
+ * task's predecessors, comma-joined, empty when it has none. The template prints
+ * it inside `{{#after}}`, which is the first conditional any collection item in
+ * this language has carried -- and it works because blocks resolve against the
+ * enclosing scope first (see `lookup`), so `after` finds the task's own key.
+ */
+export interface MergeTask {
+  title: string;
+  status: string;
+  startDate: string;
+  dueDate: string;
+  progress: string;
+  assignee: string;
+  after: string;
+}
+
+/**
  * A value that is ALREADY HTML and must not be escaped again.
  *
  * **THE ONE CASE THAT NEEDS IT IS THE MEETING SUMMARY'S NOTES**, which are TipTap
@@ -590,6 +612,13 @@ export interface MergeContext {
    * cheapest available proof that the block machinery was never quote-specific.
    */
   attendees?: MergeAttendee[];
+  /**
+   * The project status report's tasks. OPTIONAL, for `attendees`' reason, and
+   * the THIRD collection -- which is the point at which `lines` being a key on
+   * the root context rather than a feature of the language stops needing to be
+   * argued and simply is one.
+   */
+  tasks?: MergeTask[];
 }
 
 /** A template that cannot produce a document at all, as opposed to one with a typo. */
