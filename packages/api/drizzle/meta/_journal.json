@@ -120,6 +120,13 @@
       "when": 1788900000000,
       "tag": "0016_documents_common_table",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1789000000000,
+      "tag": "0017_meeting_summary",
+      "breakpoints": true
     }
   ]
 }

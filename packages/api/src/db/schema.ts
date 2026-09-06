@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, jsonb, integer, bigint, char, date, boolean, check, unique, primaryKey, customType } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, jsonb, integer, bigint, char, date, boolean, check, unique, primaryKey, foreignKey, customType } from "drizzle-orm/pg-core";
 import type { AnyPgColumn } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
@@ -280,6 +280,27 @@ export const notes = pgTable("notes", {
 }, (t) => [check("notes_exactly_one_entity", exactlyOne)]);
 export type NoteRow = typeof notes.$inferSelect;
 
+// A FIFTH PARENT SINCE 0017, AND ONLY ON `files` -- `notes` keeps the four.
+//
+// The reason is not that a meeting can have files; it is that a meeting can have
+// a DOCUMENT. `documents.file_id` is NOT NULL and every rendered PDF is an
+// ordinary `files` row (Phase 7's design, and what makes GET
+// /api/files/:id/download the only download path there is), so a meeting summary
+// -- whose `documents` row sets meeting_id and nothing else -- needed somewhere
+// to put its page. The three alternatives were all worse: filing it under one of
+// the meeting's OWN links (a meeting may carry a company AND a deal AND a
+// project, so "which one" is an arbitrary rule, and the file would then be
+// attached to a record its own document says it is not about); making
+// `documents.file_id` nullable and giving documents a second, private blob path
+// (two download routes, two storage stories); or a `meeting_files` table (a
+// second files table, so every reader of files becomes two readers).
+//
+// notes stays at four, and `exactlyOne` above is still notes' rule, spelled once.
+// The Phase 5 argument for excluding meetings -- "a note about a meeting goes on
+// the meeting's own record" -- is untouched by any of this: it is about what a
+// PERSON writes, and a rendered document is not written by a person.
+const filesExactlyOne = sql`num_nonnulls(company_id, contact_id, deal_id, project_id, meeting_id) = 1`;
+
 export const files = pgTable("files", {
   id: uuid("id").primaryKey().defaultRandom(),
   originalName: text("original_name").notNull(), mime: text("mime").notNull(),
@@ -289,8 +310,17 @@ export const files = pgTable("files", {
   contactId: uuid("contact_id").references(() => contacts.id),
   dealId: uuid("deal_id").references(() => deals.id),
   projectId: uuid("project_id").references(() => projects.id),
+  // Forward reference (meetings is declared at the foot of this file), hence the
+  // explicit AnyPgColumn return type -- same reason as events.meetingId above.
+  //
+  // NOT REACHABLE FROM THE UPLOAD ROUTE, deliberately: POST /api/files still
+  // parses the four, so the only writer that can set this column is
+  // services/documents.ts issuing a meeting summary. The CHECK admits it because
+  // the CHECK is about what a row may BE; which callers may write one is the
+  // route's question and it answers it more narrowly.
+  meetingId: uuid("meeting_id").references((): AnyPgColumn => meetings.id),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-}, (t) => [check("files_exactly_one_entity", exactlyOne)]);
+}, () => [check("files_exactly_one_entity", filesExactlyOne)]);
 export type FileRow = typeof files.$inferSelect;
 
 export const events = pgTable("events", {
@@ -918,12 +948,24 @@ export const documents = pgTable("documents", {
   // if a future type were ever given a colliding prefix, this rejects the
   // second document loudly at issue instead of minting a duplicate.
   //
-  // NOT EVERY TYPE WILL WANT ONE. QUO-2026-0001 suits a quote and suits a
-  // meeting summary not at all, and the spec makes numbering a per-type
-  // decision. The column stays NOT NULL for now because the one type that
-  // exists is numbered; the type that does not want a number is the migration
-  // that relaxes it, with a reason.
-  number: text("number").notNull(),
+  // NULLABLE SINCE 0017, WHICH IS THE MIGRATION THIS COMMENT USED TO PREDICT.
+  // The meeting summary is the type that wants no number, and
+  // @conduit/shared's documentTypeNumbered() carries the three reasons it was
+  // given (an external handle nobody holds; a lock that would serialise
+  // issuing to buy a string nobody reads; and a type that can be produced
+  // again, which a number cannot survive).
+  //
+  // THE UNIQUE CONSTRAINT SURVIVES THE NULLS UNCHANGED, and that is why this
+  // needed no second index. PostgreSQL treats NULLs as distinct in a UNIQUE
+  // constraint by default (NULLS NOT DISTINCT is opt-in, PG15+), so every
+  // unnumbered document is unique from every other one for free, and the
+  // numbered types keep exactly the guarantee they had. A partial unique index
+  // `WHERE number IS NOT NULL` would say the same thing in more SQL.
+  //
+  // WHAT REPLACES `NOT NULL` IS documents_number_matches_type BELOW, which is
+  // strictly stronger: NOT NULL forbade an unnumbered quote, and the CHECK
+  // forbids that AND a numbered meeting summary, which NOT NULL never could.
+  number: text("number"),
   type: text("type").notNull(),
   // EXACTLY ONE OF FIVE, and the CHECK below is `notes`'/`files`' `exactlyOne`
   // with meeting_id added -- the same rule, already enforced in two places,
@@ -981,7 +1023,27 @@ export const documents = pgTable("documents", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
   unique("documents_number_unique").on(t.number),
-  check("documents_type_valid", sql`type IN ('quote')`),
+  // THE TARGET OF document_quotes' COMPOSITE FOREIGN KEY, and its only purpose.
+  // `id` is already the primary key, so this constraint forbids nothing a row
+  // could otherwise do -- PostgreSQL simply requires a UNIQUE over the exact
+  // column list a foreign key references, and (id, type) is that list. See
+  // document_quotes below for what the key buys and why 0017 is where it
+  // arrives rather than 0016.
+  unique("documents_id_type_unique").on(t.id, t.type),
+  check("documents_type_valid", sql`type IN ('quote','meeting_summary')`),
+  // WHETHER THIS TYPE IS NUMBERED, IN THE DATABASE, so `documents.number` and
+  // @conduit/shared's documentTypeNumbered() cannot drift apart -- the same
+  // arrangement documents_frozen_matches_type has with documentTypeFreezes(),
+  // and schema.test.ts asserts these two spellings agree for every type too.
+  //
+  // AN EQUALITY, NOT AN IMPLICATION, for documents_frozen_matches_type's
+  // reason exactly: a quote with no number is the failure that matters (it is
+  // what `NOT NULL` used to forbid, and dropping that must not lose it), and a
+  // meeting summary that acquired one is a stored fact disagreeing with the
+  // declared rule -- which is not hypothetical, since `formatDocumentNumber`
+  // has a `?? "DOC"` fallback that would happily mint `DOC-2026-0001` for any
+  // type that reached it.
+  check("documents_number_matches_type", sql`(number IS NOT NULL) = (type IN ('quote'))`),
   // Spelled exactly like notes'/files' `exactlyOne` above, one column wider.
   check(
     "documents_exactly_one_entity",
@@ -994,12 +1056,16 @@ export const documents = pgTable("documents", {
   //
   // AN EQUALITY, NOT AN IMPLICATION, so neither direction can be wrong: a quote
   // that is not frozen is the failure that matters, and a letter that is frozen
-  // for no reason is a stored fact disagreeing with the declared rule. With one
-  // type this reads as `frozen`, which is not vacuous -- it is precisely the
-  // clause that forbids an editable quote. Each later type widens the list here,
-  // exactly as every phase has widened events_verb_valid, and widening it is
-  // also the moment somebody has to decide what happens to rows already stored
-  // under the old rule rather than have it change under them.
+  // for no reason is a stored fact disagreeing with the declared rule.
+  //
+  // **THE LIST DID NOT WIDEN WHEN THE SECOND TYPE ARRIVED**, and this sentence
+  // replaces one that assumed it would ("each later type widens the list here").
+  // `meeting_summary` is not frozen, so it belongs on the FALSE side and the
+  // clause is unchanged -- which is exactly why the equality had to be written
+  // both ways round in 0016. An implication (`type IN ('quote') -> frozen`)
+  // would have admitted a frozen meeting summary in silence, and with one type
+  // in existence nothing could have told the two spellings apart. The list
+  // widens for the NDA, which is Task 3's.
   check("documents_frozen_matches_type", sql`frozen = (type IN ('quote'))`),
 ]);
 export type DocumentRow = typeof documents.$inferSelect;
@@ -1015,22 +1081,46 @@ export type DocumentRow = typeof documents.$inferSelect;
 // the only index this table needs -- every read of it is "the quote detail for
 // these documents".
 //
-// CONSIDERED AND LEFT OUT: a composite (document_id, type) foreign key back to
-// documents(id, type), which is the standard trick for making "a meeting summary
-// with a tax total" unspellable rather than merely unusual. The spec's argument
-// against nullable columns is that they make the wrong shape the DEFAULT
-// representation, and a separate table already answers that -- a summary simply
-// has no row here. Buying the rest costs a redundant `type` column on every
-// quote, added by the one migration in this phase that moves live rows, in
-// exchange for a constraint that cannot be exercised at all until a second type
-// exists. Task 2 is both the first moment it would catch anything and the first
-// moment it could be tested as more than structure; it is a cheap ALTER then.
+// THE COMPOSITE (document_id, type) FOREIGN KEY, WHICH 0016 DEFERRED AND 0017
+// ADDS. It is the standard trick for making "a meeting summary with a tax total"
+// unspellable rather than merely unusual, and Task 1's note said Task 2 was both
+// the first moment it would catch anything and the first moment it could be
+// tested as more than structure. Both turned out true, so it is here.
+//
+// WHAT IT ACTUALLY CATCHES, because "unspellable" is easy to say and this buys
+// one specific thing: without it, `INSERT INTO document_quotes (document_id, ...)`
+// naming a meeting summary's id succeeds, and that row is not inert -- every read
+// of a quote in this codebase is an INNER JOIN on document_id (listDocuments,
+// export.ts's documentsSheet), so the summary would start being RETURNED as a
+// quote, with a currency and three money columns, by code that never asked
+// whether it was one. The join is what makes the missing constraint reachable.
+//
+// THE REDUNDANT COLUMN COSTS NOTHING TO KEEP IN STEP, which was the objection.
+// `type` here is NOT NULL DEFAULT 'quote' with a CHECK pinning it to 'quote', so
+// it is a constant: no writer mentions it, no writer can change it, and there is
+// no path by which it can disagree with the row it describes. What it buys is
+// that PostgreSQL then has a column to match against documents(id, type). The
+// cost is one text column per quote row and one more unique index on
+// `documents`; the deployment target holds tens of quotes.
+//
+// WHY NOT IN 0016: that migration moved live rows out of `documents`, and adding
+// a column to the table it was creating -- for a constraint that could not be
+// exercised, because a second type did not exist -- would have put untestable
+// structure into the one migration in this project that could destroy data. This
+// one adds a column to a table with a handful of rows in it and a test that fails
+// without it.
 //
 // NO ON DELETE CASCADE, matching every other foreign key in this file. A
 // document is never deleted, so a cascade would be configuration that can only
 // fire by accident.
 export const documentQuotes = pgTable("document_quotes", {
   documentId: uuid("document_id").primaryKey().references(() => documents.id),
+  // A CONSTANT. See the composite key above: this exists so a foreign key has a
+  // column to match documents.type against, and the CHECK below is what makes it
+  // a fact rather than a field. It is deliberately not in `DocumentQuoteRow`'s
+  // useful surface -- nothing reads it, and a reader that wanted a document's
+  // type would read `documents.type`, which is where it lives.
+  type: text("type").notNull().default("quote"),
   currency: char("currency", { length: 3 }).notNull(),
   // Nullable: a quote with no expiry is a legitimate quote.
   validUntilDate: date("valid_until_date"),
@@ -1072,7 +1162,21 @@ export const documentQuotes = pgTable("document_quotes", {
   totalCents: bigint("total_cents", { mode: "number" }).notNull(),
   notes: text("notes").notNull().default(""),
   terms: text("terms").notNull().default(""),
-}, () => [
+}, (t) => [
+  // "THE DOCUMENT THIS DETAIL ROW DESCRIBES IS A QUOTE", said by the database.
+  // Named explicitly rather than left to drizzle's generated name, because 0015's
+  // lesson is that a constraint name in a migration is a claim about what an
+  // earlier migration really created, and this one is written by hand in 0017.
+  foreignKey({
+    name: "document_quotes_document_id_type_fk",
+    columns: [t.documentId, t.type],
+    foreignColumns: [documents.id, documents.type],
+  }),
+  // What makes the column above a constant rather than a field somebody has to
+  // remember to write. Without it the composite key would still hold -- it would
+  // just start meaning "this row describes a document of whatever type this
+  // column says", which is not the statement wanted.
+  check("document_quotes_type_is_quote", sql`type = 'quote'`),
   // deals_currency_format's twin. A quote's currency is copied from its deal and
   // printed on the page; the same three-letter rule has to hold or the two
   // records disagree about what the money is.
@@ -1167,14 +1271,28 @@ export const documentNumberSequences = pgTable("document_number_sequences", {
   lastValue: integer("last_value").notNull().default(0),
 }, (t) => [
   primaryKey({ columns: [t.type, t.year] }),
-  // The same enum documents.type carries. A typo'd type here would silently
-  // start a private numbering series rather than failing.
+  // **NOT the same enum documents.type carries, since 0017 -- THIS IS THE LIST OF
+  // TYPES THAT ARE NUMBERED, and it is narrower on purpose.** It reads as the same
+  // list because for the whole of v1.x it was: with one document type, "a valid
+  // type" and "a numbered type" were the same set and nothing could tell them
+  // apart. `meeting_summary` is the first type that is one and not the other
+  // (@conduit/shared's documentTypeNumbered has the reasons), so this stays at
+  // 'quote' and thereby becomes a third enforcement of the numbering rule: a
+  // writer that called allocateNumber for a summary fails on this INSERT rather
+  // than quietly starting a `DOC-2026-` series -- which is exactly what
+  // formatDocumentNumber's `?? "DOC"` fallback would otherwise have produced.
+  // schema.test.ts pins it against documentTypeNumbered so it cannot be "fixed"
+  // by widening it to match documents_type_valid.
+  //
+  // The original sentence's point survives unchanged: a typo'd type here would
+  // silently start a private numbering series rather than failing.
   check("document_number_sequences_type_valid", sql`type IN ('quote')`),
 ]);
 export type DocumentNumberSequenceRow = typeof documentNumberSequences.$inferSelect;
 
-// One editable template per document type, seeded with a working default in
-// drizzle/0009_*.sql so a quote renders before anyone has opened Settings.
+// One editable template per document type, seeded with a working default in the
+// migration that adds the type -- drizzle/0009_*.sql for the quote, 0017 for the
+// meeting summary -- so a document renders before anyone has opened Settings.
 // NOT sanitised with the mail profile: mail's exists to defang HTML written by
 // strangers, and it strips exactly the page-layout CSS a printed document is
 // made of. See services/documents-template.ts for the profile this one uses.
@@ -1185,6 +1303,9 @@ export const documentTemplates = pgTable("document_templates", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
   unique("document_templates_type_unique").on(t.type),
-  check("document_templates_type_valid", sql`type IN ('quote')`),
+  // documents_type_valid's list exactly, and this one really is the same set:
+  // every type Conduit can produce has an editable template, which is what makes
+  // `documentTypeSchema` the right parser for the :type route param.
+  check("document_templates_type_valid", sql`type IN ('quote','meeting_summary')`),
 ]);
 export type DocumentTemplateRow = typeof documentTemplates.$inferSelect;
