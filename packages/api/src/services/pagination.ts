@@ -26,8 +26,21 @@ export interface LastMessageAtCursor { lastMessageAt: string; id: string; }
  * (helpers.ts's validateCursor) instead.
  */
 export interface OccurredAtCursor { occurredAt: string; id: string; }
+/**
+ * time_entries' (work_date, id) keyset -- see services/time-entries.ts.
+ *
+ * A FOURTH TYPE, and the first whose timestamp is not a timestamp: work_date is
+ * a bare `date`, so this cursor carries "2026-09-06" where the other three carry
+ * an ISO instant. That is the strongest possible case for the naming rule this
+ * file already follows -- a created_at cursor decoding here would page from a
+ * value that is not even the same KIND of thing, and the rows it skipped would
+ * depend on how Postgres cast one to the other.
+ */
+export interface WorkDateCursor { workDate: string; id: string; }
 
-export function encodeCursor(c: Cursor | LastMessageAtCursor | OccurredAtCursor): string {
+export function encodeCursor(
+  c: Cursor | LastMessageAtCursor | OccurredAtCursor | WorkDateCursor,
+): string {
   return Buffer.from(JSON.stringify(c), "utf8").toString("base64url");
 }
 
@@ -56,6 +69,9 @@ export function decodeLastMessageAtCursor(raw: string): LastMessageAtCursor | nu
 }
 export function decodeOccurredAtCursor(raw: string): OccurredAtCursor | null {
   return decodeKeyed(raw, "occurredAt");
+}
+export function decodeWorkDateCursor(raw: string): WorkDateCursor | null {
+  return decodeKeyed(raw, "workDate");
 }
 
 /** Escape %, _ and \ so user input cannot act as ILIKE wildcards. */

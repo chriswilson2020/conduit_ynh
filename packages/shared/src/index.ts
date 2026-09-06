@@ -4826,3 +4826,202 @@ export const importOutcomeSchema = z.object({
   message: z.string(),
 });
 export type ImportOutcome = z.infer<typeof importOutcomeSchema>;
+
+/* ========================================================================== *
+ *  TIME TRACKING (Phase 10)
+ * ========================================================================== */
+
+/**
+ * The longest one entry may be, in minutes: one day.
+ *
+ * SPELLED HERE AND AS A DB CHECK, and schema.test.ts probes the exact edges so
+ * the two cannot drift -- the belt-and-braces arrangement projects.color and
+ * tasks.progress_pct use, NOT meetings.duration_minutes' zod-only one. The
+ * difference between those two columns is what this one IS: a meeting's
+ * duration sits beside the meeting and nothing sums it, while these minutes ARE
+ * the week's total, so a value the database would accept and no report could
+ * explain is exactly the failure the spec calls "quietly wrong in the direction
+ * nobody checks".
+ *
+ * ONE DAY, because `work_date` is one day. An entry is a quantity of work
+ * attributed to a calendar date, and no date holds more than 24 hours -- so
+ * this is the bound the column's own meaning already implies, rather than a
+ * policy about how long anybody should work. What it catches in practice is a
+ * missing decimal point: 90 minutes typed as 900 still lands, 6000 does not.
+ *
+ * IT IS ALSO THE BOUND TASK 5 WILL MEET. The spec's "you left this running for
+ * 62 hours" cannot be stored, so the timer's recovery interaction has to
+ * produce a real answer rather than saving the elapsed time and moving on --
+ * the spec's own "the recovery interaction is most of the feature", made
+ * unavoidable rather than merely recommended.
+ */
+export const MAX_TIME_ENTRY_MINUTES = 24 * 60;
+
+/**
+ * This predicate and the `time_entries_has_link` DB CHECK
+ * (num_nonnulls(company_id, contact_id, deal_id, project_id, task_id) >= 1,
+ * api: db/schema.ts) are ONE RULE IN TWO PLACES, exactly as
+ * meetingAtLeastOneLink and meetings_has_link are.
+ *
+ * AT LEAST ONE OF FIVE, and both halves of that are decisions the spec argues
+ * rather than defaults:
+ *
+ *   NOT EXACTLY ONE (notes'/files'/documents' rule): an hour can legitimately
+ *   belong to a project AND the deal it came from, and a schema that made the
+ *   operator pick one would be making one of those two reports wrong on
+ *   purpose.
+ *
+ *   NOT ANY-INCLUDING-NONE (tasks'/mail_threads' rule): unattached time appears
+ *   in no report and can be found only by SQL, so the week's total comes out
+ *   short and nothing anywhere says so.
+ *
+ * Exported for meetingAtLeastOneLink's reason exactly: updateTimeEntry must
+ * re-assert it against the MERGED row, because a patch sees one snapshot and
+ * only the service can tell "clearing companyId while dealId stays" from
+ * "clearing the last link". The parameter type accepts a merge result
+ * unchanged.
+ */
+export function timeEntryAtLeastOneLink(
+  v: {
+    companyId?: string | null; contactId?: string | null; dealId?: string | null;
+    projectId?: string | null; taskId?: string | null;
+  },
+): boolean {
+  return [v.companyId, v.contactId, v.dealId, v.projectId, v.taskId].some((x) => x != null);
+}
+
+/**
+ * The sentence both the wire refine and the service's merged-row check use, so
+ * a client reading the prose reads the same words whichever gate spoke.
+ */
+export const TIME_ENTRY_NO_LINK_MESSAGE =
+  "at least one of companyId, contactId, dealId, projectId or taskId is required";
+
+export const timeEntrySchema = z.object({
+  id: z.uuid(),
+  /**
+   * THE DAY THE WORK HAPPENED -- a bare date, not a timestamp.
+   *
+   * A timesheet's question is which DAY an hour belongs to, and a timestamptz
+   * cannot answer it without also answering "in whose time zone", which for a
+   * row typed by hand has no true answer at all: the operator did not record an
+   * instant, they recorded a day. org_profile.time_zone (0018) exists and would
+   * have to be consulted on every read, so the same stored row would move
+   * between weeks when that setting changed.
+   *
+   * FUTURE AND PAST ARE BOTH ADMITTED and nothing bounds the year. The database
+   * cannot hold such a rule -- a CHECK must be immutable and `now()` is not --
+   * so a bound here would be a rule exactly one write path enforced, which is
+   * the arrangement this schema keeps refusing. A mistyped year is visible in
+   * the timesheet's own date column and in the export's.
+   */
+  workDate: z.iso.date(),
+  minutes: z.number().int().positive().max(MAX_TIME_ENTRY_MINUTES),
+  /**
+   * What the hour was, in the operator's own words. "" is not a value: an entry
+   * with nothing written on it is NULL.
+   *
+   * NOT IN THE SPEC'S COLUMN LIST, which names "a duration, a date, an owner, a
+   * billable flag, and the link set", and here anyway because the phase's
+   * definition of done is a timesheet that answers "where did the week go".
+   * Five hours against a project, with no words, is a number rather than an
+   * answer. Adding it later is a migration over live rows, every one of which
+   * would lack it.
+   */
+  description: nullableString,
+  /**
+   * A FLAG, AND THERE IS NO RATE. Invoicing is out of Conduit (spec), so this
+   * feeds reporting and the export and nothing else. A rate column without a
+   * rate card is a number somebody re-types on every entry for ever, and rates
+   * belong to the products/rate-card item already on the backlog.
+   */
+  billable: z.boolean(),
+  ownerUserId: z.uuid(),
+  companyId: z.uuid().nullable(), contactId: z.uuid().nullable(),
+  dealId: z.uuid().nullable(), projectId: z.uuid().nullable(),
+  /**
+   * THE FIFTH LINK, AND IT IS NOT `documents`' FIFTH. documents' five are
+   * company/contact/deal/project/MEETING; these are
+   * company/contact/deal/project/TASK. Same arity, different set -- so this is a
+   * new shape rather than a copy of 0016's, which is the point db/schema.ts
+   * makes at greater length about the CHECK.
+   *
+   * A task is in the set because the spec's first decision is "log time against
+   * anything, properly", and because a task is the natural unit for the
+   * booked-versus-estimated comparison Task 3 adds.
+   */
+  taskId: z.uuid().nullable(),
+  archivedAt: z.iso.datetime().nullable(), ...timestamps,
+});
+export type TimeEntry = z.infer<typeof timeEntrySchema>;
+
+// ownerUserId is absent on purpose: the owner is the actor, stamped
+// server-side -- the rule notes' authorUserId, files' uploaderUserId and
+// meetings' ownerUserId all follow.
+const timeEntryInputShape = z.object({
+  workDate: z.iso.date(),
+  minutes: z.number().int().positive().max(MAX_TIME_ENTRY_MINUTES),
+  description: nullableString.optional(),
+  /**
+   * REQUIRED ON CREATE, and that is the decision rather than an oversight.
+   *
+   * The column carries no DEFAULT either (db/schema.ts), which is
+   * documents.frozen's arrangement and documents.frozen's reason: a boolean
+   * whose two values are both perfectly ordinary has no default that is not a
+   * guess, and a guess is made silently on the row where it is hardest to
+   * notice. An entry defaulting to non-billable would under-report chargeable
+   * time -- the direction nobody checks, because with invoicing out of the
+   * product nothing downstream ever contradicts it.
+   *
+   * So the form decides every time, and a caller that says nothing gets a 400
+   * naming this field rather than a row carrying an answer nobody gave.
+   */
+  billable: z.boolean(),
+  companyId: z.uuid().nullable().optional(), contactId: z.uuid().nullable().optional(),
+  dealId: z.uuid().nullable().optional(), projectId: z.uuid().nullable().optional(),
+  taskId: z.uuid().nullable().optional(),
+});
+
+export const timeEntryCreateInputSchema = timeEntryInputShape.superRefine((v, ctx) => {
+  if (!timeEntryAtLeastOneLink(v)) {
+    ctx.addIssue({ code: "custom", message: TIME_ENTRY_NO_LINK_MESSAGE });
+  }
+});
+export type TimeEntryCreateInput = z.infer<typeof timeEntryCreateInputSchema>;
+
+// The at-least-one-link refine deliberately does NOT ride the patch shape, for
+// meetingUpdateInputSchema's reason word for word: a partial update sees one
+// snapshot and never its persisted counterpart, so clearing companyId on an
+// entry that also carries a dealId is legitimate while clearing the LAST link
+// is not, and only the service can tell them apart. api:
+// services/time-entries.ts's updateTimeEntry re-asserts it against the merged
+// row -- through the exported timeEntryAtLeastOneLink above, never a second
+// copy -- and answers 409 rather than letting the CHECK raise a 500.
+export const timeEntryUpdateInputSchema = timeEntryInputShape.partial();
+export type TimeEntryUpdateInput = z.infer<typeof timeEntryUpdateInputSchema>;
+
+/**
+ * Query-side filter contract for GET /api/time-entries.
+ *
+ * `from`/`to` are INCLUSIVE bounds on work_date, and they are in Task 1 because
+ * they are the whole reason the date column is a date: Task 4's timesheet is
+ * "this week", which is a closed range over exactly this column.
+ *
+ * WHAT IS DELIBERATELY NOT HERE, so the omissions read as decisions rather than
+ * gaps: no `ownerUserId` filter and no `billable` filter. Each is one WHERE
+ * clause on the day something reads it, and a filter with no reader costs what
+ * an unbuilt index costs (0017/0019/0020's rule, applied to the other half of
+ * the query). The billable split is a report Task 4 owns; the owner filter
+ * needs a second person before it can select anything.
+ */
+export const timeEntryListFiltersSchema = z.object({
+  companyId: z.uuid().optional(), contactId: z.uuid().optional(),
+  dealId: z.uuid().optional(), projectId: z.uuid().optional(), taskId: z.uuid().optional(),
+  from: z.iso.date().optional(), to: z.iso.date().optional(),
+  // true = ONLY archived entries, absent/false = only live ones -- the house
+  // semantics every archived list uses (api: services/companies.ts).
+  archived: z.boolean().optional(),
+  cursor: z.string().min(1).optional(),
+  limit: z.number().int().positive().max(100).optional(),
+});
+export type TimeEntryListFilters = z.infer<typeof timeEntryListFiltersSchema>;

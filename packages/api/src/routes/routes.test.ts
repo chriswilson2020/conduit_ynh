@@ -9,7 +9,8 @@ import {
   errorResponseSchema, listResponseSchema, searchResultsSchema,
   pipelineSchema, pipelineWithStagesSchema, stageSchema, dealSchema, funnelRowSchema,
   projectSchema, taskSchema, taskDependencySchema, shiftResultSchema, ganttPayloadSchema,
-  meetingSchema, meetingDetailSchema, meetingSummarySchema, documentSchema, orgProfileSchema,
+  meetingSchema, meetingDetailSchema, meetingSummarySchema, timeEntrySchema,
+  documentSchema, orgProfileSchema,
   agreementSchema, letterSchema, recordDocumentSchema, statusReportSchema,
   documentTemplateSchema, CONTACT_FIELD_CAPS, DEFAULT_TIME_ZONE,
   DOCUMENT_MAX_DESCRIPTION_CHARS, DOCUMENT_MAX_LINES, MAX_TEMPLATE_BYTES,
@@ -2020,6 +2021,236 @@ describe("meetings routes", () => {
       { method: "POST" as const, url: `/api/meetings/${unknownId}/archive` },
       { method: "POST" as const, url: `/api/meetings/${unknownId}/unarchive` },
       { method: "POST" as const, url: `/api/meetings/${unknownId}/tasks` },
+    ];
+    for (const call of calls) {
+      const response = await a.inject({ ...call, payload: {} });
+      expect(response.statusCode).toBe(401);
+      expect(errorResponseSchema.parse(response.json()).error).toBe("unauthenticated");
+    }
+    await a.close();
+  });
+});
+
+describe("time entries routes", () => {
+  const unknownId = "3f2504e0-4f89-41d3-9a0c-0305e82c3303";
+
+  async function makeProject(a: Awaited<ReturnType<typeof app>>, name = "Rollout") {
+    const response = await a.inject({
+      method: "POST", url: "/api/projects", headers: authHeaders, payload: { name },
+    });
+    return projectSchema.parse(response.json());
+  }
+
+  async function makeEntry(a: Awaited<ReturnType<typeof app>>, payload: Record<string, unknown>) {
+    const response = await a.inject({
+      method: "POST", url: "/api/time-entries", headers: authHeaders, payload,
+    });
+    expect(response.statusCode, response.body).toBe(201);
+    return timeEntrySchema.parse(response.json());
+  }
+
+  it("creates an entry and returns 201 with a contract-shaped body", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    const entry = await makeEntry(a, {
+      workDate: "2026-09-01", minutes: 90, billable: true,
+      description: "Data migration dry run", projectId: project.id,
+    });
+    expect(entry).toMatchObject({
+      workDate: "2026-09-01", minutes: 90, billable: true, projectId: project.id,
+    });
+    await a.close();
+  });
+
+  /**
+   * **THE LINK RULE ARRIVES AS A 400, NOT AS A 500.** The CHECK is the backstop;
+   * the wire refine is what a person filling in a form actually meets, and the
+   * whole reason both exist is that a 23514 escaping to a client is an
+   * unactionable server error for a form field somebody can fix.
+   */
+  it("400s an entry attached to nothing, naming what is missing", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "POST", url: "/api/time-entries", headers: authHeaders,
+      payload: { workDate: "2026-09-01", minutes: 60, billable: true },
+    });
+    expect(response.statusCode).toBe(400);
+    const body = errorResponseSchema.parse(response.json());
+    expect(body.error).toBe("validation");
+    expect(body.message).toContain("at least one of");
+    await a.close();
+  });
+
+  it("400s a create with no billable flag, rather than choosing one", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    const response = await a.inject({
+      method: "POST", url: "/api/time-entries", headers: authHeaders,
+      payload: { workDate: "2026-09-01", minutes: 60, projectId: project.id },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("validation");
+    await a.close();
+  });
+
+  it("400s a duration of zero, and one longer than a day", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    for (const minutes of [0, -30, 1441]) {
+      const response = await a.inject({
+        method: "POST", url: "/api/time-entries", headers: authHeaders,
+        payload: { workDate: "2026-09-01", minutes, billable: true, projectId: project.id },
+      });
+      expect(response.statusCode, `${String(minutes)} minutes`).toBe(400);
+    }
+    await a.close();
+  });
+
+  it("404s a link that names a record which does not exist", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "POST", url: "/api/time-entries", headers: authHeaders,
+      payload: { workDate: "2026-09-01", minutes: 60, billable: true, projectId: unknownId },
+    });
+    expect(response.statusCode).toBe(404);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("not_found");
+    await a.close();
+  });
+
+  it("lists by record and by an inclusive date range, newest day first", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    const other = await makeProject(a, "Something else");
+    for (const workDate of ["2026-08-31", "2026-09-01", "2026-09-02"]) {
+      await makeEntry(a, { workDate, minutes: 60, billable: true, projectId: project.id });
+    }
+    await makeEntry(a, { workDate: "2026-09-01", minutes: 15, billable: false, projectId: other.id });
+
+    const week = await a.inject({
+      method: "GET",
+      url: `/api/time-entries?project_id=${project.id}&from=2026-08-31&to=2026-09-01`,
+      headers: authHeaders,
+    });
+    expect(week.statusCode).toBe(200);
+    const body = listResponseSchema(timeEntrySchema).parse(week.json());
+    expect(body.items.map((e) => e.workDate)).toEqual(["2026-09-01", "2026-08-31"]);
+    await a.close();
+  });
+
+  it("400s a cursor minted by a different ordering", async () => {
+    const a = await app();
+    // A created_at cursor, which every Phase 1-3 list mints. Time entries page
+    // by (work_date, id), so accepting this would page from a value that is not
+    // even the same kind of thing.
+    const foreign = Buffer.from(
+      JSON.stringify({ createdAt: new Date().toISOString(), id: unknownId }), "utf8",
+    ).toString("base64url");
+    const response = await a.inject({
+      method: "GET", url: `/api/time-entries?cursor=${foreign}`, headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(response.json()).message).toBe("invalid cursor");
+    await a.close();
+  });
+
+  it("patches an entry, and 409s the patch that would leave it linked to nothing", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    const entry = await makeEntry(a, {
+      workDate: "2026-09-01", minutes: 60, billable: true, projectId: project.id,
+    });
+
+    const patched = await a.inject({
+      method: "PATCH", url: `/api/time-entries/${entry.id}`, headers: authHeaders,
+      payload: { minutes: 75, billable: false },
+    });
+    expect(patched.statusCode).toBe(200);
+    expect(timeEntrySchema.parse(patched.json())).toMatchObject({ minutes: 75, billable: false });
+
+    const orphaned = await a.inject({
+      method: "PATCH", url: `/api/time-entries/${entry.id}`, headers: authHeaders,
+      payload: { projectId: null },
+    });
+    expect(orphaned.statusCode).toBe(409);
+    // `conflict`, not `archived`: the entry is fine, it is the submission that
+    // cannot stand against the stored row -- and the message says what would.
+    expect(errorResponseSchema.parse(orphaned.json()).error).toBe("conflict");
+    await a.close();
+  });
+
+  it("archives and unarchives, and 409s a patch against an archived entry", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    const entry = await makeEntry(a, {
+      workDate: "2026-09-01", minutes: 60, billable: true, projectId: project.id,
+    });
+
+    const archived = await a.inject({
+      method: "POST", url: `/api/time-entries/${entry.id}/archive`, headers: authHeaders,
+    });
+    expect(archived.statusCode).toBe(200);
+    expect(timeEntrySchema.parse(archived.json()).archivedAt).not.toBeNull();
+
+    const live = await a.inject({ method: "GET", url: "/api/time-entries", headers: authHeaders });
+    expect(listResponseSchema(timeEntrySchema).parse(live.json()).items).toEqual([]);
+    const onlyArchived = await a.inject({
+      method: "GET", url: "/api/time-entries?archived=true", headers: authHeaders,
+    });
+    expect(listResponseSchema(timeEntrySchema).parse(onlyArchived.json()).items.map((e) => e.id))
+      .toEqual([entry.id]);
+
+    const patched = await a.inject({
+      method: "PATCH", url: `/api/time-entries/${entry.id}`, headers: authHeaders,
+      payload: { minutes: 30 },
+    });
+    expect(patched.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(patched.json()).error).toBe("archived");
+
+    const restored = await a.inject({
+      method: "POST", url: `/api/time-entries/${entry.id}/unarchive`, headers: authHeaders,
+    });
+    expect(timeEntrySchema.parse(restored.json()).archivedAt).toBeNull();
+    await a.close();
+  });
+
+  // "false" is a non-empty string, so z.coerce.boolean() would read it as TRUE
+  // and silently invert this filter -- the trap routes/companies.ts records.
+  it("reads archived=false as the live list, not as the archived one", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    const entry = await makeEntry(a, {
+      workDate: "2026-09-01", minutes: 60, billable: true, projectId: project.id,
+    });
+    const response = await a.inject({
+      method: "GET", url: "/api/time-entries?archived=false", headers: authHeaders,
+    });
+    expect(listResponseSchema(timeEntrySchema).parse(response.json()).items.map((e) => e.id))
+      .toEqual([entry.id]);
+    await a.close();
+  });
+
+  it("404s an entry that is not there", async () => {
+    const a = await app();
+    for (const call of [
+      { method: "GET" as const, url: `/api/time-entries/${unknownId}` },
+      { method: "POST" as const, url: `/api/time-entries/${unknownId}/archive` },
+      { method: "POST" as const, url: `/api/time-entries/${unknownId}/unarchive` },
+    ]) {
+      const response = await a.inject({ ...call, headers: authHeaders, payload: {} });
+      expect(response.statusCode, call.url).toBe(404);
+    }
+    await a.close();
+  });
+
+  it("returns 401 without an identity header on every time-entries route", async () => {
+    const a = await app();
+    const calls = [
+      { method: "GET" as const, url: "/api/time-entries" },
+      { method: "POST" as const, url: "/api/time-entries" },
+      { method: "GET" as const, url: `/api/time-entries/${unknownId}` },
+      { method: "PATCH" as const, url: `/api/time-entries/${unknownId}` },
+      { method: "POST" as const, url: `/api/time-entries/${unknownId}/archive` },
+      { method: "POST" as const, url: `/api/time-entries/${unknownId}/unarchive` },
     ];
     for (const call of calls) {
       const response = await a.inject({ ...call, payload: {} });

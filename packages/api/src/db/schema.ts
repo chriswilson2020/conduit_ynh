@@ -1624,3 +1624,125 @@ export const documentTemplates = pgTable("document_templates", {
   ),
 ]);
 export type DocumentTemplateRow = typeof documentTemplates.$inferSelect;
+
+// --- Time tracking (Phase 10) ---------------------------------------------
+//
+// ONE ROW IS ONE QUANTITY OF WORK ATTRIBUTED TO ONE DAY. A duration, that day,
+// the person who did it, whether it is chargeable, and the records it belongs
+// to. Nothing here is an instant: see work_date below.
+//
+// **THE LINK SET IS A FIFTH SET, NOT A COPY OF A FOURTH OR A FIFTH ALREADY
+// HERE**, and this is the one place the plan's instruction has to be read
+// carefully. The plan says Phase 9 "established the pattern for a five-way link
+// set with a per-type CHECK -- documents_entity_matches_type in 0020 -- read it
+// before inventing one". It was read, and only half of it transfers:
+//
+//   THE COUNT PATTERN TRANSFERS. `num_nonnulls(...)` over the record columns is
+//   how every one of these rules is spelled in this file (notes = 1, files = 1,
+//   documents = 1, meetings >= 1), and this is the same rule at a fifth column
+//   and the meetings count. Spelled the same way for the same reason: at-least-
+//   one and exactly-one are then visibly one rule at two counts.
+//
+//   THE PER-TYPE PATTERN DOES NOT, AND CANNOT. `documents_entity_matches_type`
+//   answers "which record does a document of THIS TYPE belong to", and it needs
+//   `documents.type` to ask the question. A time entry has no type and no
+//   discriminator of any kind: an hour is an hour, and which record it belongs
+//   to is the operator's answer, not a consequence of what kind of thing it is.
+//   A CHECK of that shape here would have to invent a type column to hang
+//   itself on, which is 0016's mistake -- generalising from the one example that
+//   had been built -- in the other direction.
+//
+//   AND THE FIVE ARE NOT THE SAME FIVE. documents' are company, contact, deal,
+//   project, MEETING. These are company, contact, deal, project, TASK. So even
+//   the column list could not have been copied.
+//
+// **A MEETING IS DELIBERATELY NOT A SIXTH LINK, AND THE ABSENCE IS THE
+// ENFORCEMENT.** The spec's third decision is that a manual entry cannot be
+// attached to a meeting, so the same hour cannot be counted twice -- and it asks
+// for that to be impossible rather than discouraged. There is no meeting_id
+// column here, so an INSERT naming one does not violate a CHECK, it fails to
+// parse against the table at all (42703, "column meeting_id does not exist").
+// That is Task 2's decision to confirm rather than this task's to make; it is
+// recorded here so that task starts from "the strongest form of the refusal is
+// already standing" rather than from "add a column and then forbid it", which
+// would make the impossible merely illegal.
+export const timeEntries = pgTable("time_entries", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  // THE DAY, NOT AN INSTANT. `date`, like tasks.start_date and
+  // deals.expected_close_date, and deliberately not the timestamptz every
+  // "when did this happen" column in this file otherwise uses (meetings.
+  // occurred_at, mail_messages.sent_at). A timesheet asks which DAY an hour
+  // belongs to; a timestamptz cannot answer that without also answering "in
+  // whose time zone", and for a row typed by hand there is no true answer --
+  // the operator recorded a day, not a moment. Storing an instant would make
+  // org_profile.time_zone (0018) load-bearing on every read, so the same stored
+  // row would move between weeks when somebody changed a setting.
+  //
+  // Task 5's timer will need real instants (a start that survives a restart is
+  // an instant or it is nothing). Those belong to the TIMER's own state, and
+  // what it produces when it stops is a row here: a day and a number of
+  // minutes.
+  workDate: date("work_date").notNull(),
+  // Minutes, matching meetings.duration_minutes, so the two things the
+  // timesheet sums are counted in one unit and no conversion sits between them.
+  // NOT NULL, unlike that column: a meeting whose length nobody recorded is
+  // honest (spec), while an ENTRY with no duration is not an entry at all.
+  minutes: integer("minutes").notNull(),
+  description: text("description"),
+  // NO DEFAULT, which is documents.frozen's arrangement and documents.frozen's
+  // reason. Both values are ordinary, so any default is a guess, and a guess
+  // made by the schema is made silently on the row nobody re-reads. An INSERT
+  // that says nothing about it is refused; @conduit/shared's
+  // timeEntryCreateInputSchema requires it on the wire for the same reason.
+  //
+  // AND NO RATE COLUMN ANYWHERE NEAR IT. Invoicing is out of Conduit, so this
+  // flag feeds reporting and the export; a rate without a rate card is a number
+  // somebody re-types for ever (spec).
+  billable: boolean("billable").notNull(),
+  // NOT NULL, matching meetings.owner_user_id rather than the nullable
+  // owner_user_id on companies/contacts/deals/projects: an hour was worked BY
+  // somebody, and the actor is stamped server-side, never sent by the caller.
+  ownerUserId: uuid("owner_user_id").notNull().references(() => users.id),
+  companyId: uuid("company_id").references(() => companies.id),
+  contactId: uuid("contact_id").references(() => contacts.id),
+  dealId: uuid("deal_id").references(() => deals.id),
+  projectId: uuid("project_id").references(() => projects.id),
+  taskId: uuid("task_id").references(() => tasks.id),
+  // ARCHIVE, NOT DELETE, this file's rule everywhere -- and here it is the only
+  // way to take an hour back out of a total. An entry cannot be corrected to
+  // nothing, because `time_entries_minutes_range` forbids zero, so without this
+  // column a duplicated afternoon would stay in the week's total for ever.
+  archivedAt: timestamp("archived_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, () => [
+  // AT LEAST ONE OF FIVE. Its twin lives on @conduit/shared's
+  // timeEntryAtLeastOneLink, which the create schema refines with and
+  // updateTimeEntry re-asserts against the merged row, so a 4xx never arrives
+  // as a 500 -- the same two-place arrangement meetings_has_link has.
+  //
+  // NOT `= 1`, which is notes'/files'/documents' rule: an hour can legitimately
+  // belong to a project AND the deal it came from, and forcing a choice would
+  // make one of those two reports wrong on purpose.
+  //
+  // NOT ABSENT, which is tasks'/mail_threads' rule: a row linked to nothing
+  // appears in no report and can be found only by SQL, so the week's total
+  // comes out short with nothing anywhere saying so. That is the whole reason
+  // this constraint is `>= 1` and not merely a convention in the form.
+  check(
+    "time_entries_has_link",
+    sql`num_nonnulls(company_id, contact_id, deal_id, project_id, task_id) >= 1`,
+  ),
+  // BELT AND BRACES, unlike meetings.duration_minutes, whose bound is zod-only
+  // by an explicit decision recorded on that column. The difference is what
+  // this column is FOR: nothing sums a meeting's duration, and this number IS
+  // the week's total, so a value no report could explain is precisely the
+  // silent wrongness the link CHECK above exists to prevent, arriving through
+  // the other field.
+  //
+  // The upper bound is one DAY because work_date is one day, and it is
+  // MAX_TIME_ENTRY_MINUTES in @conduit/shared spelled a second time;
+  // db/schema.test.ts probes 1, 1440, 1441, 0 and -1 so the two cannot drift.
+  check("time_entries_minutes_range", sql`minutes > 0 AND minutes <= 1440`),
+]);
+export type TimeEntryRow = typeof timeEntries.$inferSelect;

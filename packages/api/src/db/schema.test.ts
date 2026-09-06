@@ -10,6 +10,7 @@ import {
   mailAuthMethodSchema, mailOAuthProviderOf, documentTypeSchema, documentTypeFreezes,
   documentTypeNumbered,
   CONTACT_FIELD_CAPS, DEFAULT_TIME_ZONE, MAX_LOGO_DATA_URI_CHARS, MAX_TEMPLATE_BYTES,
+  MAX_TIME_ENTRY_MINUTES,
   type DocumentType,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
@@ -40,7 +41,7 @@ import {
   mailAccounts, mailAccountFolders, mailFolderState, mailThreads, mailMessages, mailAttachments,
   mailThreadHides, meetings, meetingAttendees,
   orgProfile, documents, documentAgreements, documentLetters, documentQuotes, documentLineItems,
-  documentNumberSequences, documentTemplates,
+  documentNumberSequences, documentTemplates, tasks, timeEntries,
 } from "./schema.js";
 
 const handle = openTestDatabase();
@@ -4188,5 +4189,299 @@ describe("the project status report (0020)", () => {
       for (const type of ["quote", "nda", "mutual_nda"]) expect(row.def).toContain(type);
     }
     expect(defs).toHaveLength(3);
+  });
+});
+
+describe("time entries (0021)", () => {
+  /** A row that satisfies every constraint except the link one, overridable per
+   * test. No record link by default, so a test that means to insert a VALID row
+   * has to say which record it belongs to -- which is the rule under test. */
+  function entryValues(
+    overrides: Partial<typeof timeEntries.$inferInsert> = {},
+  ): typeof timeEntries.$inferInsert {
+    return {
+      workDate: "2026-09-01", minutes: 60, billable: false, ownerUserId: userId, ...overrides,
+    };
+  }
+
+  async function seedProject(): Promise<string> {
+    return (await createProject(handle.db, userId, { name: "Rollout" })).id;
+  }
+
+  /**
+   * **THE UPGRADE DRILL, AND ITS QUESTION IS THE CHEAPEST ONE IN THE FILE.**
+   *
+   * 0021 creates one table and touches nothing that exists, so unlike 0016 there
+   * is no fixture of pre-migration rows to replay and unlike 0018 there is no
+   * backfill whose DEFAULT could lie about rows that predate it. What is left to
+   * prove is exactly two things, and both of them have failed before in this
+   * project: that the migration ARRIVES AT ALL on a database that is already
+   * migrated (the journal trap, five for five in Phase 9), and that a populated
+   * install still has its rows afterwards.
+   *
+   * THE PREMISE IS PINNED FIRST. Without the catalogue check below, every
+   * assertion here would pass just as happily against a database that had been
+   * fully migrated all along -- which is the exact failure mode a drill exists
+   * for, and the exact shape a skipped migration would have produced.
+   */
+  it("applies migration 0021 to a real pre-0021 database -- the table, both CHECKs and the index arrive, and existing rows are untouched", async () => {
+    await withPreMigrationDatabase("0021", async (scratch) => {
+      // RAW SQL, NOT `insert(companies)`: schema.ts describes TODAY's shape, and
+      // this file's standing hazard is a drizzle insert naming a column the
+      // pre-migration database does not have. (Harmless for `companies` today,
+      // written this way because the 0011 and 0017 drills both went red on it.)
+      await scratch.db.execute(sql`
+        INSERT INTO users (id, username) VALUES (${userId}::uuid, 'chris')
+      `);
+      await scratch.db.execute(sql`
+        INSERT INTO companies (id, name) VALUES (gen_random_uuid(), 'Acme')
+      `);
+
+      const before = await scratch.db.execute<{ tablename: string }>(sql`
+        SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = 'time_entries'
+      `);
+      expect(before).toEqual([]);
+
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      // THE TABLE IS HERE, WHICH IS THE HALF THE JOURNAL TRAP WOULD HAVE TAKEN:
+      // a skipped 0021 raises no error anywhere, it just leaves this empty.
+      const after = await scratch.db.execute<{ tablename: string }>(sql`
+        SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = 'time_entries'
+      `);
+      expect(after).toHaveLength(1);
+
+      // Both CHECKs arrived VALIDATED rather than merely declared -- proved by
+      // exercising them, which is the only way to tell.
+      const [company] = await scratch.db.execute<{ id: string }>(sql`SELECT id FROM companies`);
+      await expect(scratch.db.execute(sql`
+        INSERT INTO time_entries (work_date, minutes, billable, owner_user_id)
+        VALUES ('2026-09-01', 60, false, ${userId}::uuid)
+      `)).rejects.toMatchObject({ cause: { constraint_name: "time_entries_has_link" } });
+      await expect(scratch.db.execute(sql`
+        INSERT INTO time_entries (work_date, minutes, billable, owner_user_id, company_id)
+        VALUES ('2026-09-01', 0, false, ${userId}::uuid, ${company?.id ?? ""}::uuid)
+      `)).rejects.toMatchObject({ cause: { constraint_name: "time_entries_minutes_range" } });
+
+      // The hand-written index is in the migration and not in schema.ts, so
+      // nothing else in this suite would notice its absence.
+      const indexes = await scratch.db.execute<{ indexname: string }>(sql`
+        SELECT indexname FROM pg_indexes
+        WHERE tablename = 'time_entries' AND indexname = 'time_entries_work_date_idx'
+      `);
+      expect(indexes).toHaveLength(1);
+
+      // ...and the install that was already here still is.
+      const companies = await scratch.db.execute<{ name: string }>(sql`SELECT name FROM companies`);
+      expect(companies.map((row) => row.name)).toEqual(["Acme"]);
+    });
+  }, 30000);
+
+  /**
+   * **THE CONSTRAINT THIS TASK EXISTS FOR.** Three arms, and each one is a
+   * decision the spec argues rather than a default:
+   *
+   *   NONE IS REFUSED -- not tasks'/mail_threads' "any subset including the
+   *   empty one". An entry linked to nothing is in no report and findable only
+   *   by SQL, so the week's total is short and nothing says so.
+   *
+   *   ONE IS ENOUGH -- the ordinary row.
+   *
+   *   ALL FIVE AT ONCE IS VALID -- not notes'/files'/documents' exactly-one. An
+   *   hour on a project AND the deal it came from is the case the spec names,
+   *   and a schema that refused it would make one of those two reports wrong on
+   *   purpose.
+   */
+  it("enforces time_entries_has_link: none is rejected, one is enough, and all five at once are valid", async () => {
+    await expect(handle.db.insert(timeEntries).values(entryValues()))
+      .rejects.toMatchObject({ cause: { constraint_name: "time_entries_has_link" } });
+
+    const company = await createCompany(handle.db, userId, { name: "Acme" });
+    const [oneLink] = await handle.db.insert(timeEntries)
+      .values(entryValues({ companyId: company.id })).returning();
+    expect(oneLink).toMatchObject({ companyId: company.id, contactId: null, taskId: null });
+
+    const contact = await createContact(handle.db, userId, { firstName: "Bob", companyId: company.id });
+    const pipeline = await createPipeline(handle.db, userId, { name: "Sales", scope: "global" });
+    const stage = await createStage(handle.db, userId, pipeline.id, { name: "New" });
+    const deal = await createDeal(
+      handle.db, userId, { title: "Big Deal", pipelineId: pipeline.id, stageId: stage.id }, "EUR",
+    );
+    const project = await createProject(handle.db, userId, { name: "Rollout" });
+    const [task] = await handle.db.insert(tasks)
+      .values({ title: "Migrate the data", position: "a0", projectId: project.id }).returning();
+    const [everyLink] = await handle.db.insert(timeEntries).values(entryValues({
+      companyId: company.id, contactId: contact.id, dealId: deal.id,
+      projectId: project.id, taskId: task?.id,
+    })).returning();
+    expect(everyLink).toMatchObject({
+      companyId: company.id, contactId: contact.id, dealId: deal.id,
+      projectId: project.id, taskId: task?.id,
+    });
+  });
+
+  /**
+   * **EACH OF THE FIVE IS ENOUGH ON ITS OWN**, one at a time.
+   *
+   * The test above proves "one is enough" for `company_id` only, and a CHECK
+   * that had lost a column from its num_nonnulls list would still pass it. This
+   * is the loop that names which column went missing -- the same reason the
+   * documents drills iterate their types instead of spot-checking one.
+   */
+  it("accepts an entry attached to each one of the five records on its own", async () => {
+    const company = await createCompany(handle.db, userId, { name: "Acme" });
+    const contact = await createContact(handle.db, userId, { firstName: "Bob" });
+    const pipeline = await createPipeline(handle.db, userId, { name: "Sales", scope: "global" });
+    const stage = await createStage(handle.db, userId, pipeline.id, { name: "New" });
+    const deal = await createDeal(
+      handle.db, userId, { title: "Big Deal", pipelineId: pipeline.id, stageId: stage.id }, "EUR",
+    );
+    const project = await createProject(handle.db, userId, { name: "Rollout" });
+    const [task] = await handle.db.insert(tasks)
+      .values({ title: "Migrate the data", position: "a0", projectId: project.id }).returning();
+
+    const only = [
+      ["companyId", company.id], ["contactId", contact.id], ["dealId", deal.id],
+      ["projectId", project.id], ["taskId", task?.id ?? ""],
+    ] as const;
+    for (const [column, id] of only) {
+      const [row] = await handle.db.insert(timeEntries)
+        .values(entryValues({ [column]: id })).returning();
+      expect(row, `an entry attached only to ${column} was refused`).toMatchObject({ [column]: id });
+    }
+  });
+
+  /**
+   * **THE DOUBLE-COUNTING RULE, ALREADY STANDING, IN ITS STRONGEST FORM.**
+   *
+   * The spec's third decision is that a manual entry cannot be attached to a
+   * meeting, so a logged meeting's duration and a typed entry can never be the
+   * same hour twice -- and it asks for that to be IMPOSSIBLE rather than
+   * discouraged. There is no `meeting_id` column, so this INSERT does not
+   * violate a CHECK: it fails to resolve against the table at all (42703,
+   * `undefined_column`), which is a refusal no constraint can be dropped to get
+   * around.
+   *
+   * TASK 2 OWNS THE DECISION, and this test is here so that task starts from
+   * what is standing rather than from an empty column it then has to forbid. If
+   * Task 2 adds the column for the sake of a nameable error message, this test
+   * is what will tell it that it has traded impossible for illegal.
+   */
+  it("cannot express a time entry that names a meeting, because there is no column to name one with", async () => {
+    const company = await createCompany(handle.db, userId, { name: "Acme" });
+    const [meeting] = await handle.db.insert(meetings).values({
+      title: "Kickoff", occurredAt: new Date("2026-09-01T09:00:00Z"),
+      durationMinutes: 60, ownerUserId: userId, companyId: company.id,
+    }).returning();
+    expect(meeting).toBeDefined();
+
+    await expect(handle.db.execute(sql`
+      INSERT INTO time_entries (work_date, minutes, billable, owner_user_id, company_id, meeting_id)
+      VALUES ('2026-09-01', 60, false, ${userId}::uuid, ${company.id}::uuid, ${meeting?.id ?? ""}::uuid)
+    `)).rejects.toMatchObject({ cause: { code: "42703" } });
+
+    // The premise: the identical INSERT without that column succeeds, so the
+    // failure above is the column and not the row.
+    await expect(handle.db.execute(sql`
+      INSERT INTO time_entries (work_date, minutes, billable, owner_user_id, company_id)
+      VALUES ('2026-09-01', 60, false, ${userId}::uuid, ${company.id}::uuid)
+    `)).resolves.toBeDefined();
+  });
+
+  /**
+   * **THE EXACT EDGES**, documents' totals CHECK's pattern, and the reason is
+   * that this column IS the week's total: a bound narrowed or widened by one is
+   * invisible to every test that inserts a plausible number.
+   *
+   * The upper edge is MAX_TIME_ENTRY_MINUTES, imported rather than restated, so
+   * the constant in @conduit/shared and the literal in the migration cannot
+   * drift into meaning different things -- the same arrangement
+   * documentTypeFreezes has with documents_frozen_matches_type.
+   */
+  it("enforces time_entries_minutes_range at the exact edges, and that edge is MAX_TIME_ENTRY_MINUTES", async () => {
+    const projectId = await seedProject();
+    expect(MAX_TIME_ENTRY_MINUTES).toBe(1440);
+
+    for (const minutes of [1, MAX_TIME_ENTRY_MINUTES]) {
+      const [row] = await handle.db.insert(timeEntries)
+        .values(entryValues({ minutes, projectId })).returning();
+      expect(row?.minutes, `${String(minutes)} minutes was refused`).toBe(minutes);
+    }
+    for (const minutes of [0, -1, MAX_TIME_ENTRY_MINUTES + 1]) {
+      await expect(
+        handle.db.insert(timeEntries).values(entryValues({ minutes, projectId })),
+        `${String(minutes)} minutes was accepted`,
+      ).rejects.toMatchObject({ cause: { constraint_name: "time_entries_minutes_range" } });
+    }
+  });
+
+  /**
+   * **`billable` HAS NO DEFAULT**, which is documents.frozen's arrangement and
+   * documents.frozen's test. Both values are ordinary, so a default would be a
+   * guess made silently on the row where it is hardest to notice -- and the
+   * guess that reads worst (non-billable) under-reports chargeable time in a
+   * product with no invoicing step to contradict it.
+   *
+   * READ OUT OF THE CATALOGUE as well as exercised: an INSERT proves the column
+   * is NOT NULL, and only `column_default` proves there is nothing standing
+   * behind it.
+   */
+  it("gives billable no default, so a writer that says nothing is refused", async () => {
+    const projectId = await seedProject();
+    const [column] = await handle.db.execute<{ column_default: string | null }>(sql`
+      SELECT column_default FROM information_schema.columns
+      WHERE table_name = 'time_entries' AND column_name = 'billable'
+    `);
+    expect(column?.column_default).toBeNull();
+
+    await expect(handle.db.execute(sql`
+      INSERT INTO time_entries (work_date, minutes, owner_user_id, project_id)
+      VALUES ('2026-09-01', 60, ${userId}::uuid, ${projectId}::uuid)
+    `)).rejects.toMatchObject({ cause: { code: "23502" } });
+  });
+
+  /**
+   * WORK_DATE IS A `date` AND NOT A TIMESTAMP, read out of the catalogue.
+   *
+   * Nothing else can see this: a `timestamptz` column would accept every value
+   * these tests insert and return something that formats identically in most of
+   * them. What it would change is the meaning -- an hour would acquire an
+   * instant, and which WEEK it fell in would depend on a time zone the operator
+   * never supplied.
+   */
+  it("stores the work date as a date, so an hour belongs to a day and not to an instant", async () => {
+    const [column] = await handle.db.execute<{ data_type: string }>(sql`
+      SELECT data_type FROM information_schema.columns
+      WHERE table_name = 'time_entries' AND column_name = 'work_date'
+    `);
+    expect(column?.data_type).toBe("date");
+
+    const projectId = await seedProject();
+    const [row] = await handle.db.insert(timeEntries)
+      .values(entryValues({ workDate: "2026-01-01", projectId })).returning();
+    // Comes back as the bare string it went in as -- never a Date, which is what
+    // services/time-entries.ts's toTimeEntry relies on.
+    expect(row?.workDate).toBe("2026-01-01");
+  });
+
+  /**
+   * ALL SIX FOREIGN KEYS, ONE AT A TIME. Six columns declared as references is
+   * six chances for one of them to be a bare uuid nobody notices, and a bare
+   * uuid accepts an id that does not exist -- which is a link the timesheet
+   * renders as a blank name for ever.
+   *
+   * Each row is otherwise valid (a real project keeps time_entries_has_link
+   * satisfied), so a 23503 can only have come from the column under test.
+   */
+  it("enforces every foreign key on time_entries", async () => {
+    const absent = randomUUID();
+    const projectId = await seedProject();
+    const columns = ["ownerUserId", "companyId", "contactId", "dealId", "projectId", "taskId"] as const;
+    for (const column of columns) {
+      await expect(
+        handle.db.insert(timeEntries).values(entryValues({ projectId, [column]: absent })),
+        `${column} accepted an id that does not exist`,
+      ).rejects.toMatchObject({ cause: { code: "23503" } });
+    }
   });
 });

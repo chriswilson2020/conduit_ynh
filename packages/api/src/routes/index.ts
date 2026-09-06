@@ -20,6 +20,7 @@ import { registerTaskRoutes } from "./tasks.js";
 import { registerGanttRoutes } from "./gantt.js";
 import { registerMailRoutes } from "./mail.js";
 import { registerMeetingRoutes } from "./meetings.js";
+import { registerTimeEntryRoutes } from "./time-entries.js";
 import { registerDocumentRoutes } from "./documents.js";
 import { registerExportRoutes } from "./export.js";
 import { registerBackupRoutes } from "./backup.js";
@@ -193,8 +194,8 @@ export interface CrmRouteDeps {
  * 2), projects/tasks/gantt (Phase 3), mail (Phase 4), meetings (Phase 5),
  * documents plus the issuer profile (Phase 7), the data export, the encrypted
  * backup, its pre-flight and the re-authentication that gates both downloads
- * (Phase 7.6), and the restore's upload/preview/apply family and the two
- * importers' (Phase 7.7).
+ * (Phase 7.6), the restore's upload/preview/apply family and the two importers'
+ * (Phase 7.7), and time entries (Phase 10).
  *
  * THIS LIST IS EXHAUSTIVE BY CONSTRUCTION -- it is the register calls below,
  * in words -- so a family added without a line here is a list that has started
@@ -229,6 +230,7 @@ export async function registerCrmRoutes(app: FastifyInstance, deps: CrmRouteDeps
   registerGanttRoutes(app, deps);
   registerMailRoutes(app, deps);
   registerMeetingRoutes(app, deps);
+  registerTimeEntryRoutes(app, deps);
   registerDocumentRoutes(app, deps);
   registerExportRoutes(app, deps);
   registerBackupRoutes(app, deps);

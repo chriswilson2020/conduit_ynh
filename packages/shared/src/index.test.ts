@@ -3,6 +3,10 @@ import { randomUUID } from "node:crypto";
 import {
   CSV_IMPORT_FIELDS,
   DEFAULT_TIME_ZONE,
+  MAX_TIME_ENTRY_MINUTES,
+  timeEntryAtLeastOneLink,
+  timeEntryCreateInputSchema,
+  timeEntryUpdateInputSchema,
   csvImportFieldSchema,
   formatDocumentInstant,
   userSchema,
@@ -2728,5 +2732,86 @@ describe("formatDocumentInstant", () => {
       expect(formatDocumentInstant(bad, "UTC"), bad).toBe("");
       expect(formatDocumentInstant(bad, "Factory"), bad).toBe("");
     }
+  });
+});
+
+describe("time entries (Phase 10)", () => {
+  const id = randomUUID();
+
+  /**
+   * THE PREDICATE'S TRUTH TABLE, over all 32 subsets of the five links.
+   *
+   * `!= null` rather than truthiness, which is the trap this is really pinning:
+   * a `== null` written as `=== null` would count `undefined` as a link, and an
+   * absent key is precisely how a wire payload says "not this one". The api-side
+   * test in services/time-entries.test.ts runs the same 32 cases against the
+   * database, so the predicate and the CHECK are compared rather than trusted.
+   */
+  it("says at-least-one for every subset of the five links except the empty one", () => {
+    const links = ["companyId", "contactId", "dealId", "projectId", "taskId"] as const;
+    for (let mask = 0; mask < 32; mask += 1) {
+      const value: Record<string, string | null> = {};
+      for (const [i, link] of links.entries()) {
+        value[link] = (mask & (1 << i)) === 0 ? null : id;
+      }
+      expect(timeEntryAtLeastOneLink(value), `mask ${String(mask)}`).toBe(mask !== 0);
+    }
+    // An ABSENT key is not a link either -- the shape a create payload naming one
+    // record actually has.
+    expect(timeEntryAtLeastOneLink({})).toBe(false);
+    expect(timeEntryAtLeastOneLink({ projectId: id })).toBe(true);
+    expect(timeEntryAtLeastOneLink({ projectId: undefined })).toBe(false);
+  });
+
+  it("refuses a create with no link, naming all five in the message", () => {
+    const result = timeEntryCreateInputSchema.safeParse({
+      workDate: "2026-09-01", minutes: 60, billable: true,
+    });
+    expect(result.success).toBe(false);
+    const message = result.error?.issues[0]?.message ?? "";
+    for (const field of ["companyId", "contactId", "dealId", "projectId", "taskId"]) {
+      expect(message, `the refusal does not name ${field}`).toContain(field);
+    }
+  });
+
+  it("requires billable on create and leaves it optional on a patch", () => {
+    const withoutFlag = { workDate: "2026-09-01", minutes: 60, projectId: id };
+    expect(timeEntryCreateInputSchema.safeParse(withoutFlag).success).toBe(false);
+    expect(timeEntryCreateInputSchema.safeParse({ ...withoutFlag, billable: false }).success).toBe(true);
+    // A patch that does not mention it leaves it alone, which is what makes
+    // "required" a statement about CREATING an entry rather than about editing.
+    expect(timeEntryUpdateInputSchema.safeParse({ minutes: 30 }).success).toBe(true);
+  });
+
+  it("bounds minutes at one day, at the exact edge, and refuses a fraction", () => {
+    const base = { workDate: "2026-09-01", billable: true, projectId: id };
+    expect(MAX_TIME_ENTRY_MINUTES).toBe(1440);
+    expect(timeEntryCreateInputSchema.safeParse({ ...base, minutes: 1 }).success).toBe(true);
+    expect(timeEntryCreateInputSchema.safeParse({ ...base, minutes: MAX_TIME_ENTRY_MINUTES }).success)
+      .toBe(true);
+    expect(timeEntryCreateInputSchema.safeParse({ ...base, minutes: MAX_TIME_ENTRY_MINUTES + 1 }).success)
+      .toBe(false);
+    for (const minutes of [0, -1, 1.5]) {
+      expect(timeEntryCreateInputSchema.safeParse({ ...base, minutes }).success, String(minutes))
+        .toBe(false);
+    }
+  });
+
+  // A BARE DATE, and nothing that is merely date-shaped: an instant here would
+  // sail through and then be stored as whatever Postgres cast it to.
+  it("takes a date for the work date, not a timestamp", () => {
+    const base = { minutes: 60, billable: true, projectId: id };
+    expect(timeEntryCreateInputSchema.safeParse({ ...base, workDate: "2026-09-01" }).success).toBe(true);
+    for (const workDate of ["2026-09-01T09:00:00.000Z", "2026-9-1", "2026-09", "01/09/2026", ""]) {
+      expect(timeEntryCreateInputSchema.safeParse({ ...base, workDate }).success, workDate).toBe(false);
+    }
+  });
+
+  it("treats an empty description as no description at all", () => {
+    const base = { workDate: "2026-09-01", minutes: 60, billable: true, projectId: id };
+    // nullableString: null is a value, "" is not. The service trims and nulls a
+    // whitespace-only one; the schema is what refuses the empty string outright.
+    expect(timeEntryCreateInputSchema.safeParse({ ...base, description: null }).success).toBe(true);
+    expect(timeEntryCreateInputSchema.safeParse({ ...base, description: "" }).success).toBe(false);
   });
 });
