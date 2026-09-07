@@ -139,6 +139,21 @@ export const EXPORT_MEMBERS = [
       + "spent on",
   },
   {
+    member: "timers.csv",
+    tables: ["timers"],
+    /**
+     * "timer runs" RATHER THAN "timers", because the operator's sentence has to
+     * distinguish these from the hours themselves, which are the member above:
+     * a row here is one RUN of the clock, and several of them are already in
+     * `time_entries.csv` as the entries they produced.
+     */
+    noun: "timer runs",
+    imported: false,
+    notImported: "a timer names the Conduit user whose clock it was and the time entry it "
+      + "produced, and neither is imported -- a timer arriving without its entry would be a "
+      + "record that work happened with no record of the work",
+  },
+  {
     member: "documents.csv",
     tables: ["documents", "document_quotes", "document_letters", "document_agreements"],
     noun: "documents",

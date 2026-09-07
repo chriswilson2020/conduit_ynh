@@ -12,7 +12,7 @@ import { readMigrationJournal } from "./migration-journal.js";
 import {
   companies, contacts, deals, documentAgreements, documentLetters, documentQuotes, documents,
   files, meetingAttendees, meetings,
-  notes, pipelines, projects, stages, tasks, timeEntries, users,
+  notes, pipelines, projects, stages, tasks, timeEntries, timers, users,
 } from "../db/schema.js";
 import { csvDocument } from "./csv.js";
 
@@ -761,6 +761,85 @@ async function timeEntriesSheet(db: Database): Promise<Sheet> {
 }
 
 /**
+ * **THE CLOCK'S OWN RECORD, IN THE SAME CHANGE THAT CREATES ITS TABLE.**
+ *
+ * Task 1's obligation applied to Task 5's table, and it is the fourth time this
+ * phase has had to be said: the backup is a `pg_dump` and gets `timers` the day
+ * it exists; this half has one hand-written function per entity and walks no
+ * schema, so a table with no function here is simply absent from the only
+ * artefact an operator can read.
+ *
+ * **IT CARRIES SOMETHING `time_entries.csv` CANNOT, WHICH IS WHY IT IS A SHEET
+ * AND NOT A DECLARED ABSENCE.** An entry records a DAY and a QUANTITY -- that is
+ * `work_date`'s whole argument -- so nowhere in the archive does it say WHEN in
+ * the day an hour was worked. This is the only place those two instants exist.
+ * It is also the only record of a timer that was DISCARDED: the clock ran, the
+ * operator decided it represented nothing, and no entry was ever written. A row
+ * with a `stopped_at` and no `time_entry_id` is exactly that, and it is the one
+ * thing a `time_entries`-shaped export could never show.
+ *
+ * **NO `elapsed_minutes` COLUMN**, for `time_entries.csv`'s no-`hours` reason
+ * exactly: both instants are here and a spreadsheet's own subtraction is one
+ * keystroke, while a second stored representation of one figure is how a CSV
+ * starts disagreeing with itself the first time somebody edits one cell and not
+ * the other. And here it would be worse than redundant -- the elapsed time and
+ * the minutes the operator actually logged are DELIBERATELY allowed to differ
+ * (that is the recovery interaction), so a derived column would look like a
+ * contradiction of `time_entries.csv` rather than the two true numbers they are.
+ *
+ * EVERY COLUMN OF THE TABLE IS HERE, under its own name -- no renames, so this
+ * sheet needs no line in export.test.ts's `COLUMNS_NOT_NAMED_IN_A_HEADER` -- and
+ * the `information_schema` guard asserts that against the catalogue rather than
+ * against this list. All six record joins are LEFT, for the reason
+ * `timeEntriesSheet` gives at length: at-least-one means four of the five record
+ * columns are null on an ordinary row, and `time_entry_id` is null on every
+ * running and every discarded one.
+ */
+async function timersSheet(db: Database): Promise<Sheet> {
+  const rows = await db
+    .select({
+      t: timers, ownerUsername: users.username, companyName: companies.name,
+      contactFirstName: contacts.firstName, contactLastName: contacts.lastName,
+      dealTitle: deals.title, projectName: projects.name, taskTitle: tasks.title,
+    })
+    .from(timers)
+    .leftJoin(users, eq(timers.ownerUserId, users.id))
+    .leftJoin(companies, eq(timers.companyId, companies.id))
+    .leftJoin(contacts, eq(timers.contactId, contacts.id))
+    .leftJoin(deals, eq(timers.dealId, deals.id))
+    .leftJoin(projects, eq(timers.projectId, projects.id))
+    .leftJoin(tasks, eq(timers.taskId, tasks.id))
+    // BY THE MOMENT THE CLOCK STARTED, which is this table's own chronology --
+    // `created_at` is the same instant by construction and would read as a
+    // second answer to one question. `id` is the tiebreaker that makes it
+    // deterministic, as everywhere else here.
+    .orderBy(timers.startedAt, timers.id);
+  return {
+    header: [
+      "id", "started_at", "stopped_at", "description",
+      "owner_user_id", "owner_username", "time_entry_id",
+      "company_id", "company_name", "contact_id", "contact_name",
+      "deal_id", "deal_title", "project_id", "project_name", "task_id", "task_title",
+      "created_at", "updated_at",
+    ],
+    rows: rows.map((r) => [
+      r.t.id, timestamp(r.t.startedAt), timestamp(r.t.stoppedAt), text(r.t.description),
+      r.t.ownerUserId, text(r.ownerUsername),
+      // Empty for a timer that is STILL RUNNING and for one that was DISCARDED,
+      // and the difference between those two is `stopped_at` -- which is why
+      // both columns are here and neither is derived from the other.
+      text(r.t.timeEntryId),
+      text(r.t.companyId), text(r.companyName),
+      text(r.t.contactId), contactName(r.contactFirstName, r.contactLastName),
+      text(r.t.dealId), text(r.dealTitle),
+      text(r.t.projectId), text(r.projectName),
+      text(r.t.taskId), text(r.taskTitle),
+      timestamp(r.t.createdAt), timestamp(r.t.updatedAt),
+    ]),
+  };
+}
+
+/**
  * `archivePathByFileId` maps every exported file's id to its member path, not
  * only the quote PDFs -- documents.csv is just the only sheet that needs the
  * reverse lookup, to get a reader from a quote number to the page that was sent.
@@ -1107,6 +1186,7 @@ const SHEET_BUILDERS: Record<ExportMemberName, (context: SheetContext) => Promis
   "notes.csv": ({ tx }) => notesSheet(tx),
   "meetings.csv": ({ tx }) => meetingsSheet(tx),
   "time_entries.csv": ({ tx }) => timeEntriesSheet(tx),
+  "timers.csv": ({ tx }) => timersSheet(tx),
   "documents.csv": ({ tx, archivePathByFileId }) => documentsSheet(tx, archivePathByFileId),
   // The only one that queries nothing: collectFiles has already run, because
   // files/ and documents.csv both need its result.

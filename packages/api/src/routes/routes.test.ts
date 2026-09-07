@@ -12,7 +12,7 @@ import {
   shiftResultSchema, ganttPayloadSchema,
   meetingSchema, meetingDetailSchema, meetingSummarySchema, timeEntrySchema,
   timesheetBillableSummary, timesheetSummary, timesheetTotalsSchema, timesheetWeekSchema,
-  MAX_TIMESHEET_DAY_SPAN,
+  timerStateSchema, MAX_TIME_ENTRY_MINUTES, MAX_TIMESHEET_DAY_SPAN,
   documentSchema, orgProfileSchema,
   agreementSchema, letterSchema, recordDocumentSchema, statusReportSchema,
   documentTemplateSchema, CONTACT_FIELD_CAPS, DEFAULT_TIME_ZONE,
@@ -3507,6 +3507,273 @@ describe("documents routes", () => {
     for (const call of calls) {
       const response = await a.inject({ ...call, payload: {} });
       expect(response.statusCode).toBe(401);
+      expect(errorResponseSchema.parse(response.json()).error).toBe("unauthenticated");
+    }
+    await a.close();
+  });
+});
+
+/**
+ * **THE TIMER OVER HTTP (Phase 10 Task 5).**
+ *
+ * The service tests hold the transaction, the constraints and the recovery
+ * rules; these hold the contract a browser meets -- the status codes, the
+ * parsed shapes, and the two refusals a client has to be able to tell apart (a
+ * timer already running, and a timer already stopped).
+ */
+describe("timer routes", () => {
+  const unknownId = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+
+  async function seedProject(a: Awaited<ReturnType<typeof app>>, name = "Rollout"): Promise<string> {
+    const response = await a.inject({
+      method: "POST", url: "/api/projects", headers: authHeaders, payload: { name },
+    });
+    return projectSchema.parse(response.json()).id;
+  }
+
+  async function start(
+    a: Awaited<ReturnType<typeof app>>, payload: Record<string, unknown>,
+  ) {
+    return a.inject({ method: "POST", url: "/api/timer", headers: authHeaders, payload });
+  }
+
+  it("answers no timer running, with the clock the days are decided in", async () => {
+    const a = await app();
+    const response = await a.inject({ method: "GET", url: "/api/timer", headers: authHeaders });
+    expect(response.statusCode, response.body).toBe(200);
+    const state = timerStateSchema.parse(response.json());
+    expect(state.timer).toBeNull();
+    expect(state.timeZone).toBe(DEFAULT_TIME_ZONE);
+    await a.close();
+  });
+
+  /**
+   * **THE CLOSED TAB, AS A REQUEST.** Everything a reopened tab, a second device
+   * and a restarted process need is in this one response: the instant, the
+   * links, and the day the hours will land on. Nothing in it is an elapsed
+   * figure -- that is computed from `startedAt` at render time, by the same
+   * function on both sides of the wire.
+   */
+  it("starts a timer, returns 201, and hands the same one back to a fresh request", async () => {
+    const a = await app();
+    const projectId = await seedProject(a);
+    const created = await start(a, { projectId, description: "Ingest rewrite" });
+    expect(created.statusCode, created.body).toBe(201);
+    const startedState = timerStateSchema.parse(created.json());
+    expect(startedState.timer?.projectId).toBe(projectId);
+
+    const fetched = timerStateSchema.parse((await a.inject({
+      method: "GET", url: "/api/timer", headers: authHeaders,
+    })).json());
+    expect(fetched.timer?.id).toBe(startedState.timer?.id);
+    expect(fetched.timer?.startedAt).toBe(startedState.timer?.startedAt);
+    expect(fetched.timer?.description).toBe("Ingest rewrite");
+    // NO DURATION ON THE WIRE, which is the decision that keeps one definition
+    // of "how long has this run" rather than two that agree at serialisation
+    // time and diverge a second later.
+    expect(fetched.timer).not.toHaveProperty("elapsedMinutes");
+    expect(fetched.timer).not.toHaveProperty("minutes");
+    await a.close();
+  });
+
+  it("400s a timer attached to nothing, naming the five links", async () => {
+    const a = await app();
+    const response = await start(a, { description: "Something" });
+    expect(response.statusCode, response.body).toBe(400);
+    const body = errorResponseSchema.parse(response.json());
+    expect(body.error).toBe("validation");
+    expect(body.message).toContain("projectId");
+    await a.close();
+  });
+
+  it("404s a timer whose record does not exist", async () => {
+    const a = await app();
+    const response = await start(a, { projectId: unknownId });
+    expect(response.statusCode, response.body).toBe(404);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("not_found");
+    await a.close();
+  });
+
+  /**
+   * **THE SECOND DEVICE, AS A STATUS CODE.** 409 rather than a 500 out of the
+   * partial unique index, and the running timer's id is IN THE MESSAGE so a
+   * second tab can offer to stop that one rather than only refusing.
+   */
+  it("409s a second timer and names the one already running", async () => {
+    const a = await app();
+    const projectId = await seedProject(a);
+    const first = timerStateSchema.parse((await start(a, { projectId })).json());
+    const second = await start(a, { projectId });
+    expect(second.statusCode, second.body).toBe(409);
+    const body = errorResponseSchema.parse(second.json());
+    expect(body.error).toBe("conflict");
+    expect(body.message).toContain(first.timer?.id ?? "never");
+    await a.close();
+  });
+
+  /**
+   * **THE ORDINARY STOP.** 201 and a time entry, because that is what it
+   * creates -- and the entry is an ordinary one, indistinguishable from a
+   * hand-typed row to everything that reads `time_entries`, which is the whole
+   * reason the two capture paths cannot be told apart by a report.
+   */
+  it("stops a timer into a time entry, on the timer's own day", async () => {
+    const a = await app();
+    const projectId = await seedProject(a);
+    const state = timerStateSchema.parse((await start(a, { projectId })).json());
+
+    const response = await a.inject({
+      method: "POST", url: `/api/timer/${state.timer?.id ?? ""}/stop`,
+      headers: authHeaders, payload: { minutes: 95, billable: true },
+    });
+    expect(response.statusCode, response.body).toBe(201);
+    const entry = timeEntrySchema.parse(response.json());
+    expect(entry.minutes).toBe(95);
+    expect(entry.workDate).toBe(state.timer?.workDate);
+    expect(entry.projectId).toBe(projectId);
+
+    // The strip empties, and the entry is in the week.
+    expect(timerStateSchema.parse((await a.inject({
+      method: "GET", url: "/api/timer", headers: authHeaders,
+    })).json()).timer).toBeNull();
+    const list = listResponseSchema(timeEntrySchema).parse((await a.inject({
+      method: "GET", url: "/api/time-entries", headers: authHeaders,
+    })).json());
+    expect(list.items).toHaveLength(1);
+    await a.close();
+  });
+
+  /**
+   * **THE MINUTES ARE REQUIRED AND THE FLAG IS TOO**, and both refusals are the
+   * recovery interaction reaching the wire. An optional `minutes` defaulting to
+   * the elapsed time would be pleasant for the ordinary stop and would have NO
+   * LEGAL VALUE for the 62-hour weekend; a defaulted `billable` would put back
+   * the guess the column has no DEFAULT in order to refuse.
+   */
+  it("400s a stop that states no duration, no flag, or an impossible duration", async () => {
+    const a = await app();
+    const projectId = await seedProject(a);
+    const state = timerStateSchema.parse((await start(a, { projectId })).json());
+    const url = `/api/timer/${state.timer?.id ?? ""}/stop`;
+
+    for (const payload of [
+      {},
+      { billable: true },
+      { minutes: 30 },
+      { minutes: 0, billable: true },
+      { minutes: MAX_TIME_ENTRY_MINUTES + 1, billable: true },
+      { minutes: 62 * 60, billable: true },
+      { minutes: 1.5, billable: true },
+    ]) {
+      const response = await a.inject({ method: "POST", url, headers: authHeaders, payload });
+      expect(response.statusCode, JSON.stringify(payload)).toBe(400);
+      expect(errorResponseSchema.parse(response.json()).error).toBe("validation");
+    }
+    // AND THE TIMER IS STILL RUNNING after every one of them, which is what
+    // makes a rejected stop a retry rather than a loss.
+    expect(timerStateSchema.parse((await a.inject({
+      method: "GET", url: "/api/timer", headers: authHeaders,
+    })).json()).timer?.id).toBe(state.timer?.id);
+    await a.close();
+  });
+
+  /**
+   * **STOPPING A TIMER THAT IS ALREADY STOPPED IS A 409, NOT A SECOND ENTRY**,
+   * and the id in the path is what makes it answerable. At most one timer runs
+   * per person, so a stop with no id would have been enough -- and would have
+   * stopped whichever timer happened to be running when a stale tab's button
+   * fired, booking its minutes to the wrong record.
+   */
+  it("409s a stop for a timer that has already finished, and writes no second entry", async () => {
+    const a = await app();
+    const projectId = await seedProject(a);
+    const state = timerStateSchema.parse((await start(a, { projectId })).json());
+    const url = `/api/timer/${state.timer?.id ?? ""}/stop`;
+    const payload = { minutes: 30, billable: false };
+
+    expect((await a.inject({ method: "POST", url, headers: authHeaders, payload })).statusCode).toBe(201);
+    const again = await a.inject({ method: "POST", url, headers: authHeaders, payload });
+    expect(again.statusCode, again.body).toBe(409);
+    expect(errorResponseSchema.parse(again.json()).error).toBe("conflict");
+
+    const list = listResponseSchema(timeEntrySchema).parse((await a.inject({
+      method: "GET", url: "/api/time-entries", headers: authHeaders,
+    })).json());
+    expect(list.items).toHaveLength(1);
+    await a.close();
+  });
+
+  it("404s a stop or a discard for a timer that never existed", async () => {
+    const a = await app();
+    const stop = await a.inject({
+      method: "POST", url: `/api/timer/${unknownId}/stop`,
+      headers: authHeaders, payload: { minutes: 30, billable: false },
+    });
+    expect(stop.statusCode, stop.body).toBe(404);
+    const discard = await a.inject({
+      method: "POST", url: `/api/timer/${unknownId}/discard`, headers: authHeaders,
+    });
+    expect(discard.statusCode, discard.body).toBe(404);
+    await a.close();
+  });
+
+  it("400s an id that is not an id", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "POST", url: "/api/timer/not-a-uuid/stop",
+      headers: authHeaders, payload: { minutes: 30, billable: false },
+    });
+    expect(response.statusCode, response.body).toBe(400);
+    await a.close();
+  });
+
+  /**
+   * **DISCARD IS THE OTHER WAY OUT OF THE WEEKEND**, and it has to write nothing
+   * -- the alternative for a timer that represents no work is an operator
+   * inventing a number to make the strip go away, which is worse than nothing
+   * because it is indistinguishable from a real hour afterwards.
+   */
+  it("discards a timer without writing an entry, and frees the operator to start another", async () => {
+    const a = await app();
+    const projectId = await seedProject(a);
+    const state = timerStateSchema.parse((await start(a, { projectId })).json());
+
+    const response = await a.inject({
+      method: "POST", url: `/api/timer/${state.timer?.id ?? ""}/discard`, headers: authHeaders,
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    expect(timerStateSchema.parse(response.json()).timer).toBeNull();
+
+    const list = listResponseSchema(timeEntrySchema).parse((await a.inject({
+      method: "GET", url: "/api/time-entries", headers: authHeaders,
+    })).json());
+    expect(list.items).toHaveLength(0);
+    expect((await start(a, { projectId })).statusCode).toBe(201);
+    await a.close();
+  });
+
+  it("409s a discard for a timer that has already finished", async () => {
+    const a = await app();
+    const projectId = await seedProject(a);
+    const state = timerStateSchema.parse((await start(a, { projectId })).json());
+    const url = `/api/timer/${state.timer?.id ?? ""}/discard`;
+    expect((await a.inject({ method: "POST", url, headers: authHeaders })).statusCode).toBe(200);
+    const again = await a.inject({ method: "POST", url, headers: authHeaders });
+    expect(again.statusCode, again.body).toBe(409);
+    await a.close();
+  });
+
+  it("returns 401 without an identity header on every timer route", async () => {
+    const a = await app();
+    const calls = [
+      { method: "GET" as const, url: "/api/timer" },
+      { method: "POST" as const, url: "/api/timer" },
+      { method: "POST" as const, url: `/api/timer/${unknownId}/stop` },
+      { method: "POST" as const, url: `/api/timer/${unknownId}/discard` },
+    ];
+    for (const call of calls) {
+      const response = await a.inject({ ...call, payload: {} });
+      expect(response.statusCode, call.url).toBe(401);
       expect(errorResponseSchema.parse(response.json()).error).toBe("unauthenticated");
     }
     await a.close();

@@ -22,6 +22,7 @@ import { registerMailRoutes } from "./mail.js";
 import { registerMeetingRoutes } from "./meetings.js";
 import { registerTimeEntryRoutes } from "./time-entries.js";
 import { registerTimesheetRoutes } from "./timesheet.js";
+import { registerTimerRoutes } from "./timers.js";
 import { registerDocumentRoutes } from "./documents.js";
 import { registerExportRoutes } from "./export.js";
 import { registerBackupRoutes } from "./backup.js";
@@ -234,6 +235,7 @@ export async function registerCrmRoutes(app: FastifyInstance, deps: CrmRouteDeps
   registerMeetingRoutes(app, deps);
   registerTimeEntryRoutes(app, deps);
   registerTimesheetRoutes(app, deps);
+  registerTimerRoutes(app, deps);
   registerDocumentRoutes(app, deps);
   registerExportRoutes(app, deps);
   registerBackupRoutes(app, deps);

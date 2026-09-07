@@ -26,6 +26,7 @@ import { createTask, archiveTask } from "./tasks.js";
 import { createNote } from "./notes.js";
 import { createMeeting, archiveMeeting } from "./meetings.js";
 import { createTimeEntry, archiveTimeEntry } from "./time-entries.js";
+import { startTimer, stopTimer, discardTimer } from "./timers.js";
 import {
   companies as companiesTable, deals as dealsTable, documents as documentsTable,
   documentAgreements, documentLetters, documentQuotes as documentQuotesTable,
@@ -1466,6 +1467,153 @@ describe("export time entries", () => {
     // that could not fail.
     const mutilated = sheet.header.filter((name) => name !== "billable");
     expect(catalogue.filter((name) => !mutilated.includes(name))).toEqual(["billable"]);
+  });
+});
+
+/**
+ * **THE CLOCK'S OWN RECORD (Phase 10 Task 5), IN THE RELEASE THAT CREATES ITS
+ * TABLE.**
+ *
+ * Phase 9 missed the export three tasks running, Task 1 wrote the obligation at
+ * the top of the plan, Task 3 found the plan's own convention note was wrong
+ * about which table the column guard covered -- and this is the fourth table in
+ * three tasks to go through the same door. The coverage guard below would fail
+ * by name without a member; these are the tests for the sheet it names.
+ */
+describe("export timers", () => {
+  async function runTimer(
+    minutes: number | null, links: Record<string, string>, description?: string,
+  ): Promise<{ timerId: string; entryId: string | null }> {
+    const state = await startTimer(handle.db, actorId, { ...links, description });
+    const timerId = state.timer?.id ?? "";
+    if (minutes === null) {
+      await discardTimer(handle.db, actorId, timerId);
+      return { timerId, entryId: null };
+    }
+    const entry = await stopTimer(handle.db, actorId, timerId, { minutes, billable: true });
+    return { timerId, entryId: entry.id };
+  }
+
+  itZip("names every record a timer can belong to, id and readable name for each", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    const contact = await createContact(handle.db, actorId, { firstName: "Jane", lastName: "Smith" });
+    const { deal } = await makeDeal(handle.db, "Big one", company.id, contact.id);
+    const project = await createProject(handle.db, actorId, { name: "Rollout" });
+    const task = await createTask(handle.db, actorId, { title: "Migrate the data", projectId: project.id });
+    await runTimer(90, {
+      companyId: company.id, contactId: contact.id, dealId: deal.id,
+      projectId: project.id, taskId: task.id,
+    }, "Data migration dry run");
+
+    const sheet = await readSheet(await extract(await writeArchive()), "timers.csv");
+    expect(cell(sheet, 0, "company_name")).toBe("Acme");
+    expect(cell(sheet, 0, "contact_name")).toBe("Jane Smith");
+    expect(cell(sheet, 0, "deal_title")).toBe("Big one");
+    expect(cell(sheet, 0, "project_name")).toBe("Rollout");
+    expect(cell(sheet, 0, "task_title")).toBe("Migrate the data");
+    expect(cell(sheet, 0, "owner_user_id")).toBe(actorId);
+    expect(cell(sheet, 0, "owner_username")).toBe("chris");
+    expect(cell(sheet, 0, "description")).toBe("Data migration dry run");
+  });
+
+  // Phase 9's FIRST miss in advance, at a sixth join: at-least-one means four of
+  // the five record columns are null on an ordinary row, so an INNER JOIN among
+  // them drops the row -- and `time_entry_id` is null on every RUNNING and every
+  // DISCARDED timer, so an inner join there drops most of the table.
+  itZip("exports a running timer, which names one record and no entry at all", async () => {
+    const project = await createProject(handle.db, actorId, { name: "Rollout" });
+    await startTimer(handle.db, actorId, { projectId: project.id });
+
+    const sheet = await readSheet(await extract(await writeArchive()), "timers.csv");
+    expect(sheet.records).toHaveLength(1);
+    expect(cell(sheet, 0, "project_id")).toBe(project.id);
+    expect(cell(sheet, 0, "started_at")).not.toBe("");
+    for (const blank of ["stopped_at", "time_entry_id", "company_id", "company_name",
+      "contact_id", "contact_name", "deal_id", "deal_title", "task_id", "task_title",
+      "description"]) {
+      expect(cell(sheet, 0, blank), blank).toBe("");
+    }
+  });
+
+  /**
+   * **THE THREE STATES, AND THE REASON THIS SHEET EXISTS RATHER THAN BEING A
+   * DECLARED ABSENCE.** A discarded timer -- the clock ran, the operator decided
+   * it represented nothing -- appears NOWHERE else in the archive, because it
+   * produced no entry. `stopped_at` and `time_entry_id` together are what tell
+   * the three apart, which is why both columns are here and neither is derived.
+   */
+  itZip("tells a logged timer from a discarded one and from one still running", async () => {
+    const project = await createProject(handle.db, actorId, { name: "Rollout" });
+    const logged = await runTimer(45, { projectId: project.id });
+    await runTimer(null, { projectId: project.id });
+    await startTimer(handle.db, actorId, { projectId: project.id });
+
+    const sheet = await readSheet(await extract(await writeArchive()), "timers.csv");
+    expect(sheet.records).toHaveLength(3);
+    const state = sheet.records.map((_r, i) => ({
+      stopped: cell(sheet, i, "stopped_at") !== "",
+      entry: cell(sheet, i, "time_entry_id"),
+    }));
+    expect(state).toEqual([
+      { stopped: true, entry: logged.entryId },
+      { stopped: true, entry: "" },
+      { stopped: false, entry: "" },
+    ]);
+  });
+
+  /**
+   * **NO `elapsed_minutes` COLUMN**, `time_entries.csv`'s no-`hours` rule -- and
+   * here it would be worse than redundant. The clock's elapsed time and the
+   * minutes the operator actually logged are DELIBERATELY allowed to differ (that
+   * is the recovery interaction), so a derived column would read as a
+   * contradiction of `time_entries.csv` rather than as the two true numbers they
+   * are. This asserts the two instants are present and the derivation is not.
+   */
+  itZip("carries both instants and derives no duration from them", async () => {
+    const project = await createProject(handle.db, actorId, { name: "Rollout" });
+    const { entryId } = await runTimer(45, { projectId: project.id });
+
+    const root = await extract(await writeArchive());
+    const sheet = await readSheet(root, "timers.csv");
+    for (const derived of ["elapsed_minutes", "minutes", "duration_minutes", "elapsed"]) {
+      expect(sheet.header, derived).not.toContain(derived);
+    }
+    expect(Date.parse(cell(sheet, 0, "started_at"))).not.toBeNaN();
+    expect(Date.parse(cell(sheet, 0, "stopped_at"))).not.toBeNaN();
+
+    // AND THE HOURS THEMSELVES ARE THE OTHER SHEET'S, joined by the id this one
+    // carries -- which is what makes provenance readable rather than duplicated.
+    const entries = await readSheet(root, "time_entries.csv");
+    expect(cell(sheet, 0, "time_entry_id")).toBe(entryId);
+    expect(cell(entries, 0, "id")).toBe(entryId);
+    expect(cell(entries, 0, "minutes")).toBe("45");
+  });
+
+  /**
+   * THE COLUMN GUARD, at Task 5's table. Read out of `information_schema` rather
+   * than out of a list here, and with the instrument watched failing -- Task 1's
+   * arrangement, which Task 3 found had covered exactly one table and generalised.
+   */
+  itZip("names every timers column, so a column added later cannot ship unexported", async () => {
+    const project = await createProject(handle.db, actorId, { name: "Rollout" });
+    await startTimer(handle.db, actorId, { projectId: project.id });
+    const sheet = await readSheet(await extract(await writeArchive()), "timers.csv");
+
+    const rows = await handle.db.execute<{ column_name: string }>(sql`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'timers'
+      ORDER BY column_name
+    `);
+    const catalogue = rows.map((row) => row.column_name);
+    // The premise: the catalogue was really read.
+    expect(catalogue).toContain("started_at");
+    expect(catalogue.length).toBeGreaterThanOrEqual(13);
+
+    expect(catalogue.filter((name) => !sheet.header.includes(name))).toEqual([]);
+
+    // The instrument, watched failing rather than trusted.
+    const mutilated = sheet.header.filter((name) => name !== "stopped_at");
+    expect(catalogue.filter((name) => !mutilated.includes(name))).toEqual(["stopped_at"]);
   });
 });
 

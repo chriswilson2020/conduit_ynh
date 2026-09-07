@@ -69,7 +69,11 @@ import { publish } from "./sse.js";
  * them when they are the same. Nulls are dropped here rather than at each call
  * site -- an entry linked to a project and no task has no task key to publish.
  */
-function publishTimeEntryHint(id: string, taskIds: (string | null)[] = []): void {
+// EXPORTED SINCE v1.9.0 TASK 5, for `insertTimeEntry`'s reason: the timer's stop
+// writes the entry inside a transaction and must publish AFTER the commit, so
+// the caller needs the hint separately from the write. services/timers.ts is the
+// only other caller and passes exactly what createTimeEntry passes.
+export function publishTimeEntryHint(id: string, taskIds: (string | null)[] = []): void {
   // `["timesheet"]` SINCE v1.9.0 TASK 4, and it is a key of its own rather than
   // a nesting under either table's. The timesheet reads time_entries AND
   // meetings, and a TanStack query has one key: under `["time-entries"]` it
@@ -125,8 +129,19 @@ function toTimeEntry(row: TimeEntryRow): TimeEntry {
  * gain nothing but a line count, and leaving the two callers with a function
  * whose name no longer says which columns it covers. Two copies is the honest
  * number; a third caller is when it becomes a module.
+ *
+ * **THE THIRD CALLER ARRIVED IN TASK 5 AND THIS IS STILL NOT A MODULE**, which
+ * is a smaller change than the sentence above promised and is argued rather
+ * than glossed. services/timers.ts checks THESE five columns, not meetings'
+ * four -- a timer carries `task_id` and a meeting cannot -- so what it needs is
+ * this exact function, exported. Moving it to a file of its own would still
+ * leave meetings.ts's copy alone (extracting THAT one is the edit to a shipped
+ * write path this comment refused, and it is no more attractive now), so the
+ * only thing a new module would buy is a third import path for the same body.
+ * Two copies is still the honest number; what changed is that one of them has
+ * two callers.
  */
-async function assertLinkedRecordsExist(
+export async function assertLinkedRecordsExist(
   db: Database,
   links: {
     companyId?: string | null; contactId?: string | null; dealId?: string | null;
@@ -166,7 +181,7 @@ async function assertLinkedRecordsExist(
  * meetings.notes' (that column is rich-text HTML and passes through
  * sanitizeMailHtml; this one is a line the operator typed).
  */
-function normaliseDescription(description: string | null | undefined): string | null {
+export function normaliseDescription(description: string | null | undefined): string | null {
   if (description == null) return null;
   const trimmed = description.trim();
   return trimmed === "" ? null : trimmed;
@@ -180,14 +195,30 @@ async function mustGet(db: Database, id: string): Promise<TimeEntryRow> {
 
 // --- Writes ----------------------------------------------------------------
 
-export async function createTimeEntry(
+/**
+ * THE WRITE, WITHOUT THE HINT -- and the split is Task 5's, for one reason.
+ *
+ * The timer's stop claims its row and inserts the entry in ONE transaction (see
+ * services/timers.ts), and a hint published inside a transaction sends clients
+ * to refetch over a different connection that may not see the row yet
+ * (services/sse.ts's contract). So the transactional caller takes this and
+ * publishes `publishTimeEntryHint` itself after the commit, and
+ * `createTimeEntry` below is this plus that one line.
+ *
+ * **EVERY RULE AN ENTRY HAS STAYS HERE, WHICH IS THE POINT OF THE SPLIT RATHER
+ * THAN A SIDE EFFECT.** The at-least-one re-assertion, the record existence
+ * checks, the owner stamp and the description normalisation are the things the
+ * two capture paths must not come to disagree about, so the timer calls this
+ * instead of writing its own INSERT.
+ */
+export async function insertTimeEntry(
   db: Database, actorId: string, input: TimeEntryCreateInput,
 ): Promise<TimeEntry> {
   // timeEntryCreateInputSchema's superRefine already enforces this at the HTTP
   // boundary; re-asserted here for a direct service caller that builds the input
   // by hand and never meets zod (createMeeting's and createTask's precedent).
-  // Without it the CHECK raises 23514 as a 500. Task 5's timer will be exactly
-  // such a caller.
+  // Without it the CHECK raises 23514 as a 500. Task 5's timer IS exactly such a
+  // caller: `stopTimer` builds this input from a `timers` row.
   if (!timeEntryAtLeastOneLink(input)) {
     throw new Error(`createTimeEntry: ${TIME_ENTRY_NO_LINK_MESSAGE}`);
   }
@@ -209,9 +240,15 @@ export async function createTimeEntry(
     taskId: input.taskId ?? null,
   }).returning();
   if (row === undefined) throw new Error("insert returned no row");
-
-  publishTimeEntryHint(row.id, [row.taskId]);
   return toTimeEntry(row);
+}
+
+export async function createTimeEntry(
+  db: Database, actorId: string, input: TimeEntryCreateInput,
+): Promise<TimeEntry> {
+  const entry = await insertTimeEntry(db, actorId, input);
+  publishTimeEntryHint(entry.id, [entry.taskId]);
+  return entry;
 }
 
 export async function getTimeEntry(db: Database, id: string): Promise<TimeEntry> {
