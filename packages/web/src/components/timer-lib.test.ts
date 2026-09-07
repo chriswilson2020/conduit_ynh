@@ -63,6 +63,33 @@ describe("timerLandingSentence", () => {
     expect(timerLandingSentence("2026-01-01")).toContain("Thursday 1 January");
     expect(timerLandingSentence("2026-12-31")).toContain("Thursday 31 December");
   });
+
+  /**
+   * **AND IT MUST NOT DEPEND ON THE BROWSER'S OWN ZONE, WHICH IS AN ASSERTION
+   * THE CASES ABOVE CANNOT MAKE.** Dropping `timeZone: "UTC"` from the formatter
+   * SURVIVED mutation testing, because `new Date("2026-09-04")` is UTC MIDNIGHT
+   * and every machine this suite runs on sits at or ahead of UTC — so the day
+   * only slips in a zone BEHIND it, and neither the dev server nor CI is one.
+   *
+   * Measured: at Pacific/Niue (UTC−11) the unpinned formatter renders
+   * "Thursday 3 September" for the stored day `2026-09-04`. That is the class of
+   * bug `work_date` is a `date` to avoid, arriving on the one screen where the
+   * operator is being told which day their hours are about to land on — so it is
+   * driven from both ends of the range rather than from the runner's zone.
+   */
+  it("renders the same day in a zone fourteen hours ahead and one eleven behind", () => {
+    const original = process.env.TZ;
+    try {
+      const rendered = new Set<string>();
+      for (const zone of ["Pacific/Kiritimati", "UTC", "Pacific/Niue"]) {
+        process.env.TZ = zone;
+        rendered.add(timerLandingSentence("2026-09-04"));
+      }
+      expect([...rendered]).toEqual([expect.stringContaining("Friday 4 September")]);
+    } finally {
+      process.env.TZ = original;
+    }
+  });
 });
 
 describe("timerStopDraft", () => {

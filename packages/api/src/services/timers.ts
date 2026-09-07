@@ -322,7 +322,10 @@ export async function startTimer(
 export async function stopTimer(
   db: Database, actorId: string, id: string, input: TimerStopInput,
 ): Promise<TimeEntry> {
-  const existing = await mustGetOwn(db, actorId, id);
+  // Called for its 404 and nothing else: the row it returns is deliberately not
+  // used, because the CLAIM below re-reads it inside the transaction and that is
+  // the read this stop is entitled to act on.
+  await mustGetOwn(db, actorId, id);
   const timeZone = usableTimeZone((await getOrgProfile(db)).timeZone);
 
   const entry = await db.transaction(async (tx) => {

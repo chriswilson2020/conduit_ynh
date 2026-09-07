@@ -3686,12 +3686,18 @@ describe("timerStateSchema", () => {
   });
 
   /**
-   * **AND A MALFORMED `links` IS A REFUSAL RATHER THAN A THROW**, which is Task
-   * 4's finding used rather than repeated: measured on zod 4.4.3, a `.refine`
-   * runs even when the object's own fields have already failed and is handed the
-   * RAW value. The consistency refine above therefore checks `Array.isArray`
-   * before touching it -- without that guard this case is an exception escaping
-   * `safeParse`, which at a route is a 500 where a 400 belongs.
+   * **A MALFORMED `links` IS A REFUSAL RATHER THAN A THROW**, which is the
+   * property a route needs: an exception escaping `safeParse` is a 500 where a
+   * 400 belongs.
+   *
+   * **AND WHAT SATISFIES IT IS ZOD, NOT THE GUARD IN THE REFINE, WHICH IS SAID
+   * HERE RATHER THAN LEFT TO BE DISCOVERED.** Deleting that `Array.isArray`
+   * check is a GREEN mutation, and probing zod 4.4.3 directly says why: a
+   * refine runs after a field failure only for a FORMAT failure on a value of
+   * the right type, and never for a wrong type, a missing key or a bad array
+   * element. Task 4's finding is sound for the case it met and its
+   * generalisation to "any refine can be handed rubbish" is too broad. This test
+   * is the contract; the guard is belt to its braces.
    */
   it("refuses a links field that is not an array without throwing out of safeParse", () => {
     for (const links of ["project", 3, null, { kind: "project" }]) {

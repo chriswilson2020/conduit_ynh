@@ -10,6 +10,7 @@ import { listTimeEntries } from "./time-entries.js";
 import { timesheetTotals } from "./timesheet.js";
 import { createProject } from "./projects.js";
 import { createCompany, archiveCompany } from "./companies.js";
+import { createContact } from "./contacts.js";
 import { createTask } from "./tasks.js";
 import { subscribe } from "./sse.js";
 import { NotFoundError, ConflictError } from "./errors.js";
@@ -107,6 +108,46 @@ describe("the timer's running state", () => {
     // The wire schema refuses a payload where the resolved links and the id
     // columns are not the same set, so this parse is the agreement biting.
     expect(() => timerStateSchema.parse(state)).not.toThrow();
+  });
+
+  /**
+   * **PHASE 9'S FIRST MISS, AT A NEW QUERY, AND MUTATION TESTING IS WHAT FOUND
+   * IT MISSING.** At-least-one means the ORDINARY timer names ONE record and
+   * leaves four null, so an INNER JOIN anywhere among the five drops the row
+   * entirely — and `linksOf` then falls back to the raw uuid, giving a chip on
+   * the strip that reads as an id and a stop dialog that cannot say where the
+   * hours are going.
+   *
+   * The test above gave its timer THREE links, so the row survived an inner join
+   * on any one of them and every label still resolved: turning
+   * `leftJoin(companies)` into `innerJoin` was green across the whole file. This
+   * is the loop that names which of the five went wrong — the `time_entries.csv`
+   * sheet's own arrangement, and 0021's five-column CHECK loop.
+   */
+  it("resolves the label of a timer that names ONE record and leaves the other four null", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    const contact = await createContact(handle.db, actorId, { firstName: "Jane", lastName: "Smith" });
+    const projectId = await seedProject();
+    const task = await createTask(handle.db, actorId, { title: "Migrate", projectId });
+
+    const alone: { kind: string; input: Record<string, string>; label: string }[] = [
+      { kind: "company", input: { companyId: company.id }, label: "Acme" },
+      { kind: "contact", input: { contactId: contact.id }, label: "Jane Smith" },
+      { kind: "project", input: { projectId }, label: "Rollout" },
+      { kind: "task", input: { taskId: task.id }, label: "Migrate" },
+    ];
+    for (const { kind, input, label } of alone) {
+      const started = await startTimer(handle.db, actorId, input);
+      const state = await getRunningTimer(handle.db, actorId);
+      expect(state.timer?.links, kind).toHaveLength(1);
+      expect(state.timer?.links[0], kind).toMatchObject({ kind, label });
+      // The label is the record's NAME and not its id, which is exactly what an
+      // inner join leaves behind: `linksOf` falls back to the id when the join
+      // found no row at all.
+      expect(state.timer?.links[0]?.label, `${kind} resolved to an id`)
+        .not.toBe(state.timer?.links[0]?.id);
+      await discardTimer(handle.db, actorId, started.timer?.id ?? "");
+    }
   });
 
   /**

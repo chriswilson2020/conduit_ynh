@@ -5792,14 +5792,34 @@ export const runningTimerSchema = z.object({
    * The resolved links and the id columns are the same set counted twice, so a
    * payload where they disagree is a service that joined the wrong rows.
    *
-   * **`Array.isArray` FIRST, AND THAT GUARD IS TASK 4'S FINDING USED RATHER
-   * THAN REPEATED.** Measured there on zod 4.4.3: a `.refine` runs even when the
-   * object's own fields have already failed, and is handed the RAW value. So
-   * `v.links` here can be anything at all -- a string, a number, absent -- and
-   * `.length` on the wrong type would silently pass while a method call on it
-   * would THROW, turning a 400 the field validator had already decided into a
-   * 500. When it is not an array, the array validator has said so and this has
-   * nothing to add.
+   * **`Array.isArray` FIRST -- AND THE MEASUREMENT SAYS THIS CANNOT CURRENTLY
+   * FIRE, WHICH IS WHY IT SAYS SO RATHER THAN IMPLYING A REACHABLE CASE.**
+   *
+   * Task 4 recorded that "a zod `.refine` runs even when the object's own fields
+   * failed, and it is handed the RAW value", and generalised it: "any `.refine`
+   * in this codebase that does more than compare already-parsed primitives can
+   * be handed rubbish, and one that throws converts a 4xx into a 5xx". That
+   * generalisation is TOO BROAD, and Task 5 probed the exact rule on the same
+   * zod (4.4.3) rather than inheriting it. A refine on a `z.object` runs after a
+   * field failure in exactly ONE case:
+   *
+   *   - a FORMAT failure on a value of the right type -- `z.iso.date()` given
+   *     `"2026-09"` -- **runs the refine**, with that raw string in hand. This
+   *     is the case Task 4 met, and its finding is sound for it.
+   *   - a wrong TYPE, a MISSING key, a non-array where an array belongs, or an
+   *     array whose ELEMENT fails: **the refine does not run at all.**
+   *
+   * So `v.links` here is always a real array by the time this executes, and the
+   * guard is unreachable. It is kept for the reason `timesheetDays`' "a row fell
+   * outside the range" throw is kept: it costs one comparison, it is what makes
+   * the function total rather than accidentally safe, and zod's abort behaviour
+   * is a library's choice that an upgrade may revise. A mutation deleting it is
+   * GREEN, deliberately, and this comment is the record of why -- not a claim
+   * that a test is missing.
+   *
+   * What Task 4's finding still means here: a refine may see a FORMAT-failed
+   * string. Nothing below touches one -- the id fields are compared with
+   * `!= null`, which is total over every value.
    */
   .refine((v) => {
     if (!Array.isArray(v.links)) return true;

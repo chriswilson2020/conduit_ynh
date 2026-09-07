@@ -1054,29 +1054,369 @@ UTC−11**: 14 passed in each.
 
 ## Task 5: The timer — LAST, AND THE RISK IS NOT THE TIMING
 
-- [ ] **`minutes <= 1440` MEANS THE 62-HOUR WEEKEND CANNOT BE STORED.** The bound is one day
+- [x] **`minutes <= 1440` MEANS THE 62-HOUR WEEKEND CANNOT BE STORED.** The bound is one day
       because `work_date` is one day. So a timer that stops after a weekend has no "save the
       elapsed time and move on" branch available to it — the recovery interaction has to produce
       a real answer. That is the spec's own intent made unavoidable rather than merely
       recommended, and it is a constraint on the design rather than a bug to route around.
-- [ ] **A timer that produces entries is a DIRECT SERVICE CALLER**, which is why
+- [x] **A timer that produces entries is a DIRECT SERVICE CALLER**, which is why
       `createTimeEntry` re-asserts the at-least-one rule itself rather than trusting the wire
       schema's refine. It also has to supply `billable`: the column has no default.
-- [ ] **Timer columns added to `time_entries` must reach `time_entries.csv`.** The
+- [x] **Timer columns added to `time_entries` must reach `time_entries.csv`.** The
       `information_schema` column-coverage guard in `services/export.test.ts` fails by name if
       they do not — which is precisely the miss Phase 9 made three times.
 
-- [ ] **Running state must survive a restart, a closed tab and a second device.** Conduit is one
+- [x] **Running state must survive a restart, a closed tab and a second device.** Conduit is one
       process with no swap; a timer in memory dies with a deploy.
-- [ ] **The weekend problem is the common failure, not an edge case.** "You left this running for
+- [x] **The weekend problem is the common failure, not an edge case.** "You left this running for
       62 hours" — and **the recovery interaction is most of the feature**: what the operator is
       offered, what the default is, what happens if they ignore it.
-- [ ] **Two capture paths can double-count each other.** A timer entry and a hand entry for the
+- [x] **Two capture paths can double-count each other.** A timer entry and a hand entry for the
       same afternoon are exactly what Task 2 makes impossible for meetings, arriving by a
       different door. **Same treatment: impossible, not discouraged.**
-- [ ] **If this turns out to be a phase of its own, say so and stop.** Four tasks shipped and one
+- [x] **If this turns out to be a phase of its own, say so and stop.** Four tasks shipped and one
       honestly reported beats five half-built — the instruction Phase 9's Task 4 was given, and it
       was right to have it.
+
+### WAS IT A PHASE OF ITS OWN? NO — AND THE REASON IS THAT THE SCHEMA HAD ALREADY DECIDED THE HARD PART
+
+**It is one new table, four routes, one service, one strip and one dialog.** The
+instruction to stop was real and was weighed at the point it mattered — after the
+double-count accounting, which is where a phase-sized answer would have appeared
+— and it did not. What made this task ordinary is a decision Task 1 made for a
+different reason: **`time_entries.minutes` is NOT NULL and `> 0`, so a duration
+that is still accruing is unspellable.** That is what settles, in one line, the
+question a timer usually turns into a phase:
+
+- A running timer cannot be a draft entry, so there is no half-written row to
+  reconcile, no "is this a real hour" flag on a shipped table, and no reader
+  anywhere that has to learn to skip one.
+- It therefore cannot be summed by anything, so `timesheetTotals`, `timesheetDays`,
+  `taskEffort` and `time_entries.csv` are **untouched** — no filter added to any of
+  them, and none needed.
+- And `time_entries` gains **no column at all**, so the plan's own warning about
+  timer columns reaching `time_entries.csv` turned out to have nothing to cover.
+
+**WHAT WOULD HAVE MADE IT PHASE-SIZED, AND WAS REJECTED ON EVIDENCE RATHER THAN ON
+TIME:** giving every entry a start and an end instant, so that overlapping hours
+became visible. See the double-count section — it is not a cut, it is wrong.
+
+### Task 5 as built — migration 0023, `timers`
+
+**ONE NEW TABLE, THIRTEEN COLUMNS.** `id`, `owner_user_id`, `started_at`,
+`stopped_at`, `time_entry_id`, `description`, the five record links,
+`created_at`, `updated_at`. Three CHECKs, one UNIQUE constraint, seven foreign
+keys and one partial unique index. **`time_entries` is not altered**, so
+`time_entries.csv` is unchanged — no column added, and not one line of
+`timeEntriesSheet` touched — and the export's `information_schema` column guard
+has nothing new to cover there. (The ARCHIVE does change: it gains an eleventh
+member. `EXPORT_FORMAT_VERSION` stays at 1, because a new member is additive in
+the way a new column is.)
+
+`services/timers.ts`, `routes/timers.ts` (four routes),
+`components/timer-strip.tsx` and `components/timer-lib.ts` are the new files;
+`pages/timesheet.tsx` gains the Start control and `components/shell.tsx` renders
+the strip.
+
+**`createTimeEntry` SPLITS INTO `insertTimeEntry` PLUS ITS HINT**, which is the
+only change to a shipped write path. The stop claims its timer and inserts the
+entry in ONE transaction, and a hint published inside a transaction sends clients
+to refetch over a connection that may not see the row yet (services/sse.ts's
+contract). Every rule an entry has stays in `insertTimeEntry`, so the two capture
+paths cannot come to disagree about what an hour may be attached to.
+
+### Where the running state lives, and how it survives the three things
+
+**IT IS `timers.started_at` AND THERE IS NO OTHER COPY OF IT.** A restart, a
+closed tab and a second device are one question to a row in Postgres, and the
+e2e drives all three as gestures rather than as queries: four navigations, a
+reload, and a genuinely separate browser context.
+
+**THE WIRE CARRIES NO DURATION AT ALL**, which is the decision that keeps it
+honest rather than merely correct. An elapsed figure in a JSON body is stale by
+the time it is parsed, and a payload carrying one would mean two definitions of
+"how long has this run" — one ticking in the browser and one frozen in the
+response. There is one, `timerElapsedMinutes`, and the server calls it with its
+own clock while the strip calls it with the device's. A device behind the server
+clamps to nought rather than rendering `formatMinutes(-1)`, which reads "-1h 59m".
+
+**`started_at` DEFAULTS TO THE DATABASE'S `now()` AND THE STOP USES SQL `now()`,
+AND THAT PAIRING IS A MEASUREMENT RATHER THAN A STYLE.** The first draft of the
+schema drill set `stopped_at: new Date()` and let `started_at` take its default;
+three cases went red on `timers_stopped_after_start`, because the JS instant is
+taken when the VALUES are built and the default when the statement RUNS. An
+interval measured against two clocks is not an interval.
+
+### The recovery interaction, which is most of the feature
+
+**THE RULE IS ONE FUNCTION.** `timerProposedMinutes` offers the clock's answer
+only while it is a storable number of minutes — so it is withheld under one
+minute (`time_entries_minutes_range` forbids zero) and over a day
+(`MAX_TIME_ENTRY_MINUTES`, which is one day because `work_date` is one day). The
+62-hour weekend and the nine-second mis-tap are the same refusal seen from two
+sides, which is why there is one function rather than a threshold each.
+
+**WHAT THE OPERATOR IS OFFERED.** The strip is in the SHELL, on every route, and
+renders `timerSummary` — one string carrying how long it has run, whether that
+figure can be logged, and that nothing is counted until it stops. Stop opens a
+dialog with four things on it: a minutes box, the day the hours will land on, the
+records they are going to, and Discard beside Save.
+
+**WHAT THE DEFAULT IS.** The clock's figure when an entry could hold it — an
+ordinary stop is one tap. **Past a day there is no default, because there is no
+legal figure to default to**, and the box opens empty. A form that pre-filled 1440
+for a forgotten weekend would be proposing a full day nobody worked, and a
+proposal is what gets accepted without reading. `billable` has no default either,
+ever: `TimeEntryDraft`'s rule inherited, for `time_entries.billable`'s reason.
+
+**AND THE DAY IS STATED BEFORE ANYTHING IS COMMITTED, WHICH IS THE REAL
+SURPRISE.** A timer left running since Friday books FRIDAY — the day comes off
+`started_at` in the organisation's calendar. The START day, never the stop day,
+and the argument is not accuracy: the start day is the only one knowable WHILE
+THE TIMER RUNS, which is what lets the strip and the dialog say where the hours
+are going before they are committed. It also cannot produce a future-dated entry
+(`started_at` is the server's `now()`), so the timer path never reaches the
+asymmetry Task 4 recorded between a future entry and a future meeting.
+
+**WHAT HAPPENS IF THEY IGNORE IT: IT KEEPS RUNNING.** There is no sweeper, no
+deadline, and no automatic entry. That sounds like doing nothing and is the only
+option that writes no number nobody gave — the same refusal `billable` has no
+DEFAULT for. What changes as it runs is what the browser will OFFER. Closing the
+stop dialog, closing the tab or losing the connection leaves the clock exactly
+where it was: there is no half-stopped state, because the claim and the INSERT
+are one transaction.
+
+**AND DISCARD HAS TO EXIST.** The other honest answer to a timer that ran all
+weekend is that it represents no work at all, and without that control the only
+way to clear the strip is to invent a number — which is worse than nothing,
+because afterwards it is indistinguishable from a real hour. The row is kept
+(Conduit never expunges), which is why `timers.csv` is in the export.
+
+### A 62-HOUR TIMER BECOMES NOTHING UNTIL THE OPERATOR SAYS OTHERWISE
+
+It is not split, not truncated and not saved. **Splitting it across the days it
+spanned was considered and is wrong**, not merely unbuilt: Friday 15:00 to Monday
+08:00 becomes 9h Friday, 24h Saturday, 24h Sunday, 8h Monday — four entries the
+database WOULD accept, two of them claiming a person worked around the clock. It
+converts an obvious refusal into plausible-looking rubbish spread over a week's
+report, which is the failure this phase keeps refusing.
+
+What it becomes is what the operator types, on the day it started, or nothing at
+all if they discard it. `stopTimer` writes the minutes it is given and
+**deliberately never compares them against the elapsed time** — a cross-check
+would refuse exactly the correction the recovery exists to allow.
+
+### DOUBLE COUNTING: FIVE ROUTES CLOSED, ONE OPEN, AND THE OPEN ONE CANNOT BE CLOSED
+
+The spec asks for Task 2's treatment — impossible, not discouraged. Five of the
+six routes get it. The sixth does not, and the reason is structural rather than a
+gap that can be patched:
+
+| route | what closes it |
+|---|---|
+| two timers running at once, each stopping into an entry | **impossible**: `timers_one_running_per_owner`, a partial unique index. A second start is 23505, mapped to a 409 that names the running timer |
+| one timer stopped twice | **impossible**: the claim is `UPDATE ... WHERE stopped_at IS NULL` in the same transaction as the INSERT |
+| two timers claiming one entry | **impossible**: `timers_time_entry_unique` |
+| a running timer counted as an hour | **impossible**: it is not a `time_entries` row and cannot be one, and `timesheetTotals` reads `time_entries` and `meetings` |
+| a timer entry naming a meeting | **impossible**: no `meeting_id` on either table (42703, Task 1) |
+| **a timer entry and a HAND entry for the same afternoon** | **NOTHING CLOSES IT** |
+
+**THE LAST ROW IS THE HONEST ANSWER AND IT IS TASK 1'S CENTRAL DECISION RATHER
+THAN AN OVERSIGHT HERE.** A `time_entries` row records a DAY and a QUANTITY, not
+an interval — `work_date`'s whole argument. "The same afternoon" is not a thing
+the schema can see: two 120-minute rows against one project on one Tuesday are,
+to every column that exists, two genuine sessions. Making the overlap visible
+would mean giving EVERY entry a start and an end instant, which the hand path
+cannot truthfully supply ("the operator recorded a day, not a moment") and which
+would make `org_profile.time_zone` load-bearing on every read of every hour ever
+typed. **Discouraged, not impossible, and it is written down rather than glossed.**
+
+What was done instead: the timer path cannot duplicate ITSELF, which is where the
+new exposure actually was — "a second device" is the thing this feature adds. And
+the hours a timer produced are not anonymous: `timers.time_entry_id` records which
+entry came off a clock and between which two instants, `timers.csv` carries it,
+and the correction is the one the phase already relies on — archive it.
+
+### `timers.csv`, AND WHY IT IS A SHEET RATHER THAN A DECLARED ABSENCE
+
+Nineteen columns, every column of the table under its own name (so it needs no
+line in `COLUMNS_NOT_NAMED_IN_A_HEADER`), plus a readable name beside each of the
+six ids. All six record joins LEFT.
+
+It carries two things `time_entries.csv` cannot. **The wall-clock interval**: an
+entry records a day, so nowhere else in the archive does it say WHEN in the day an
+hour was worked. And **a discarded timer**: the clock ran, the operator decided it
+represented nothing, and no entry was ever written — a row with a `stopped_at` and
+no `time_entry_id` is exactly that.
+
+**NO `elapsed_minutes` COLUMN**, `time_entries.csv`'s no-`hours` rule — and here it
+would be worse than redundant, because the elapsed time and the minutes actually
+logged are DELIBERATELY allowed to differ. A derived column would read as a
+contradiction of `time_entries.csv` rather than as the two true numbers they are.
+
+**AND TASK 1'S CLAIM ABOUT THE DERIVED LIST HELD, MEASURED.** Adding the member
+and its builder made no test go red — the import preview's note, the Settings
+sentence, the archive's member list, the coverage map and the e2e journey all
+followed it. `EXPORT_FORMAT_VERSION` stays at 1.
+
+### The phone, and what was rejected
+
+The strip is a `flex-wrap` row between the header and `<main>`, present only while
+something is running. Its sentence takes a whole line below the breakpoint so the
+controls beside it stay at the 44px floor; the e2e reads
+`scrollWidth - clientWidth` at 390px with the strip up.
+
+- **REJECTED: a bottom-bar tab or a rail tab.** `PRIMARY_NAV_IDS` is four by spec
+  with More in the fifth slot, and Task 4 declined a fifth bottom tab and a SIXTH
+  rail tab against measurements. This costs no nav slot at all.
+- **REJECTED: a floating pill.** It would overlay content at the width where there
+  is least of it, and the bottom bar is already `fixed` there.
+- **REJECTED: showing seconds.** `formatMinutes` is this app's one duration
+  spelling, and a seconds counter would be a second one on the surface most likely
+  to be glanced at rather than read.
+- **REJECTED: starting a timer from the strip.** A start needs a record picker,
+  which needs width. Starting is on /timesheet; STOPPING is what has to be
+  reachable from anywhere, because that is the half an operator forgets.
+- **REJECTED: pause and resume.** A paused timer is two intervals and `started_at`
+  is one instant, so it would need a second table — and it makes the recovery
+  question strictly harder rather than easier ("you left this paused for 62 hours"
+  has all the same problems and one more state).
+
+### FOUR THINGS THE SPEC AND THE PLAN ARE WRONG OR SILENT ABOUT
+
+**1. "SAME TREATMENT: IMPOSSIBLE, NOT DISCOURAGED" CANNOT BE DELIVERED FOR THE TWO
+CAPTURE PATHS, AND THE REASON IS A DECISION THIS PHASE ALREADY MADE.** See the
+table above. The spec reads Risk 2 as the same shape as decision 3, and it is not:
+the meeting case was closable because a meeting's minutes live in a DIFFERENT
+table, so "one hour, one source row" is a statement about the schema. A timer
+entry and a hand entry are the same table, the same columns and the same shape,
+by construction — and the construction is `work_date` being a date, which is
+argued at length and is right. **A decision for Chris only if he wants entries to
+carry instants, which would be a different product.**
+
+**2. THE PLAN'S "TIMER COLUMNS ADDED TO `time_entries` MUST REACH
+`time_entries.csv`" ANTICIPATED A DESIGN THAT WOULD HAVE BEEN WORSE.** There are
+no timer columns on `time_entries`: the link points the other way, which is what
+lets the uniqueness constraint (`timers_time_entry_unique`) be created on the day
+its table is created rather than added over live rows. The obligation the bullet
+was really about — a new table reaching the readable export — is met by
+`timers.csv`, and the guard that would have caught its absence is the coverage map
+rather than the column check.
+
+**3. TASK 4'S ZOD FINDING IS SOUND AND ITS GENERALISATION IN THIS PLAN IS TOO
+BROAD, MEASURED ON THE SAME ZOD.** Task 4 recorded that a `.refine` "runs even
+when the object's own fields failed, and it is handed the RAW value", and drew
+from it: "**this is general** ... any `.refine` in this codebase that does more
+than compare already-parsed primitives can be handed rubbish". Probed directly on
+zod 4.4.3, a refine on a `z.object` runs after a field failure in exactly one
+case — **a FORMAT failure on a value of the right type** (`z.iso.date()` given
+`"2026-09"`, which is the case Task 4 met). A wrong TYPE, a MISSING key, a
+non-array where an array belongs, and an array whose ELEMENT fails all suppress
+it entirely. So the class of refine that can be handed rubbish is narrower than
+"anything that reads a field": it is one that reads a field whose validator is a
+FORMAT check. `runningTimerSchema`'s consistency refine keeps its `Array.isArray`
+guard anyway and its comment now records that the guard is unreachable rather
+than implying it is not — `timesheetDays`' unreachable throw, one task later.
+
+**4. NOTHING IN THE SPEC OR THE PLAN ASKS WHICH DAY A TIMER'S HOURS LAND ON, AND
+IT IS THE RECOVERY INTERACTION'S REAL SURPRISE.** A timer that straddles midnight,
+or a weekend, has to land somewhere and both readings are defensible. The start day
+is taken, and the argument is written at `runningTimerSchema`: it is the only one
+knowable WHILE THE TIMER RUNS. **This is not in the spec. If Chris wants a
+straddling timer to land on the day it stopped, it is one expression to change —
+and the strip and the stop dialog would then be unable to say where the hours are
+going until the moment they went.**
+
+
+### Mutation evidence
+
+**Eighty mutations plus a control. Seventy-eight killed, TWO SURVIVE AND BOTH ARE
+EXPLAINED RATHER THAN RECORDED AS GAPS, and none was refused.** Of the four that
+survived the first pass, **two were real and are now closed**; the two that
+remain are a measured no-op and an equivalent mutant, and the source says so in
+both places.
+
+The harness reads vitest's exit status from `spawnSync`'s `status` **before any
+output is piped anywhere** (Phase 9 lost a result to a `| tail`) and refuses to
+edit unless its search string occurs **exactly once** in the target file — a
+mutation applied to nothing, or to the wrong occurrence, is an error here rather
+than a green result. **THE CONTROL RAN FIRST AND WAS WATCHED GREEN.**
+
+**AND THE DDL MUTATIONS ARE AIMED AT `drizzle/0023_timers.sql`, NOT AT
+`db/schema.ts`** — Task 3 paid for that lesson with four bad instruments: every
+database in this suite is built by `migrate(migrationsFolder)`, so a CHECK
+deleted in `db/schema.ts` is still enforced.
+
+| mutation | answered by |
+|---|---|
+| `timerElapsedMinutes` rounds instead of flooring; loses its clamp so a slow device clock reads negative; counts seconds | the shared tests, 1–5 each |
+| `timerProposedMinutes` offers a nought; its ceiling is off by one; **the ceiling is removed, so the weekend is proposed** | the shared tests and `timer-lib`'s, 2–4 each |
+| the under-a-minute branch stops saying nothing is counted (**the defect the e2e found**) | the cross-branch invariant test |
+| the over-the-bound branch offers to log what the clock says; the bound test is inverted; the sentence stops naming discard, or stops naming the bound | `timerSummary`'s tests, one clause each |
+| `runningTimerSchema`'s day becomes a free-form string; the at-least-one refine is removed; **the resolved links need not be the records the timer names** | the shared tests, and the service's `timerStateSchema.parse` |
+| `timerStartInputSchema` loses its refine; `timerStopInputSchema` admits a nought, **loses its upper bound**, or defaults `billable` | the shared tests and the route's 400s |
+| **MIGRATION: `timers_one_running_per_owner` is never created**; is not partial; is keyed on the row rather than the owner | the 0023 drill and "allows one running timer per person, refuses a second" |
+| MIGRATION: `timers_has_link` removed, or forgetting `task_id`; `timers_entry_needs_stop` removed; `timers_stopped_after_start` removed; `timers_time_entry_unique` removed | the 0023 drill, each by constraint name |
+| MIGRATION: `started_at` loses its DEFAULT; becomes a `date`; the owner or the `time_entry` foreign key is never added | the catalogue assertions and the seven-column FK loop |
+| **THE JOURNAL TRAP: 0023's `when` put back to what drizzle-kit generated** | the strictly-increasing journal test, and the drill finding no table |
+| `getRunningTimer` answers a finished timer, or somebody else's | the service tests |
+| **THE STOP'S CLAIM LOSES ITS GUARD, so a second stop writes a second entry** | "refuses a second stop and produces no second entry" |
+| **THE HOURS LAND ON TODAY rather than on the day the timer started** | the backdated-timer test, which reads the day AFTER backdating |
+| the stop never claims the entry it produced; **the stop is not a transaction**, so a failed entry leaves the timer stopped | "leaves the timer running when the entry cannot be written", and the export's three-state test |
+| the start stops checking the records exist; its at-least-one re-assertion is removed; the 409 becomes a 500; the 409 stops naming the running timer | the service tests and the route's 404/409 |
+| a blank description is stored as whitespace; discard loses its guard, or stops checking whose timer it is; `mustGetOwn` stops checking the owner | 1–2 tests each |
+| **the stop stops publishing `["timer"]`, or stops publishing the entry's keys**; the discard stops publishing | the three hint tests |
+| the links are never resolved; the organisation's clock is ignored and UTC assumed | the link test and the two-zone test |
+| ROUTES: never registered; the stop answers 200; the stop stops validating its body; **the stop takes whichever timer is running rather than the one named**; `GET /api/timer` answers everyone's | the route tests |
+| EXPORT: the member's table is re-pointed; the header drops `stopped_at`; **an `elapsed_minutes` column is derived**; the entry a timer produced is blanked; the company join becomes INNER | the coverage guard, the column guard, and the sheet's own tests |
+| **EXPORT: a member with no builder** | `tsc` (exit 2): `TS2741: Property '"invoices.csv"' is missing`. Nothing had to run |
+| WEB: the stop form proposes the elapsed time however long it ran; pre-ticks billable; drops its upper bound; its refusal stops naming discard; it stops asking about billable | `timer-lib`'s tests |
+| WEB: the landing sentence stops saying which day it is; a conflict reads the same whichever call made it; the label prefers the record over the operator's words; the tick becomes a minute | `timer-lib`'s tests |
+| WEB: a timer may be started against nothing | `timesheet-lib`'s test |
+| **WEB: THE STRIP PRINTS THE STOPWATCH AND CALLS IT THE ANSWER**; the strip is moved onto the timesheet; the strip is moved inside `<main>`; the dialog composes the landing sentence; the discard control is removed | `timer-render.test.ts`, reading the component and the shell off disk |
+| a comment-only change (**the control**) | green, watched first |
+
+#### THE TWO REAL SURVIVORS, AND BOTH ARE PHASE 9's FIRST MISS IN A NEW COSTUME
+
+**1. `leftJoin` → `innerJoin` ON THE RUNNING TIMER'S LABELS WAS GREEN ACROSS THE
+WHOLE FILE.** At-least-one means the ORDINARY timer names one record and leaves
+four null, so an inner join drops the row and `linksOf` falls back to the raw
+uuid — a chip on the strip that reads as an id, and a stop dialog that cannot say
+where the hours are going. The one test that read a label gave its timer THREE
+of them, so the row survived an inner join on any one. Closed by a loop that
+starts a timer against each of the four record types **alone** and asserts the
+label is the record's name and not its id. Killed.
+
+**2. DROPPING `timeZone: "UTC"` FROM THE LANDING SENTENCE'S FORMATTER WAS GREEN
+TOO, AND THE REASON IS THAT NO MACHINE THIS SUITE RUNS ON CAN SEE IT.**
+`new Date("2026-09-04")` is UTC midnight, so the day only slips in a zone BEHIND
+UTC, and the dev server and CI are both at or ahead of it. **Measured: at
+Pacific/Niue (UTC−11) the unpinned formatter renders "Thursday 3 September" for
+the stored day `2026-09-04`** — the class of bug `work_date` is a `date` to
+avoid, arriving on the one screen that tells the operator which day their hours
+are about to land on. Closed by a test that renders the sentence under
+Pacific/Kiritimati, UTC and Pacific/Niue and requires one answer. Killed.
+
+#### THE TWO THAT STILL SURVIVE, AND WHY NEITHER IS A GAP
+
+**GREEN BY DESIGN, AND THE SOURCE NOW SAYS SO: deleting the `Array.isArray`
+guard from `runningTimerSchema`'s consistency refine.** Probing zod 4.4.3
+directly says the guard cannot fire — a refine runs after a field failure only
+for a FORMAT failure on a value of the right type, never for a wrong type or a
+missing key — so `v.links` is always a real array by the time it executes. It is
+kept for the reason `timesheetDays`' unreachable throw is kept, and its comment
+records the probe rather than implying a reachable case. **This is also the
+correction to the plan's own generalisation of Task 4's finding — see finding 3
+above.**
+
+**AN EQUIVALENT MUTANT ON THIS HARDWARE: the stop stamping `new Date()` rather
+than SQL `now()`.** The property is that both of a timer's instants come from ONE
+clock, and it only bites when the API process's clock and Postgres's disagree —
+which on one box they do not. It is recorded rather than chased: the schema
+drill's `finishedTimer` helper documents the case where the difference IS
+observable (a JS instant taken when the VALUES are built is earlier than a
+`now()` evaluated when the statement runs, which tripped
+`timers_stopped_after_start` three times in that file's first draft).
 
 ---
 
