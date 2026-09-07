@@ -5656,3 +5656,240 @@ export function taskEffortSummary(effort: TaskEffort): string {
     ? `${estimate}: ${formatMinutes(-gap)} left.`
     : `${estimate}: ${formatMinutes(gap)} over.`;
 }
+
+/* -------------------------------------------------------------------------- *
+ *  The timer (Phase 10 Task 5)
+ * -------------------------------------------------------------------------- */
+
+/**
+ * **THE SECOND CAPTURE PATH, AND THE ONE THE SPEC CALLS THE PHASE'S REAL RISK.**
+ *
+ * "A start/stop timer sounds like a column. What it actually brings: running
+ * state that must survive a restart, a closed tab and a second device; the
+ * weekend problem, where the recovery interaction is most of the feature; and
+ * two paths that can produce the same hour."
+ *
+ * **NOTHING HERE IS A DURATION IN FLIGHT.** A running timer is `started_at` and
+ * a link set (api: db/schema.ts's `timers`), and every figure an operator reads
+ * is computed from that instant against a clock passed in. The wire payload
+ * deliberately carries NO elapsed figure: an elapsed time in a JSON body is
+ * stale by the time it is parsed, and having the server send one would mean two
+ * definitions of "how long has this run" -- one ticking in the strip and one
+ * fixed in the payload -- which is exactly how two numbers about one thing start
+ * disagreeing. {@link timerElapsedMinutes} is the single definition; the server
+ * calls it with its own clock and the browser with the device's.
+ *
+ * **A RUNNING TIMER IS NOT AN HOUR AND CANNOT BE COUNTED AS ONE.** It is not a
+ * `time_entries` row -- it cannot be, since `minutes` is NOT NULL and
+ * `minutes > 0`, so the schema has no way to hold a duration that is still
+ * accruing -- and `timesheetTotals` reads `time_entries` and `meetings` and
+ * nothing else. That is why every sentence below ends by saying nothing is
+ * counted until the timer stops: the figure on the strip is real and is
+ * deliberately in no total, and an operator has to be told which.
+ */
+
+/**
+ * How long a running timer has run, in whole minutes.
+ *
+ * **FLOORED, AND CLAMPED AT NOUGHT.** Flooring is {@link formatMinutes}' own
+ * rule at the other end of the same pipeline: a stopwatch reading 1m59s has not
+ * produced two minutes of work, and the proposal an operator accepts without
+ * reading must never exceed what the clock actually ran. The clamp is for the
+ * DEVICE clock rather than for a paradox -- `started_at` is stamped by Postgres
+ * and the strip ticks against the browser, so a phone a few seconds behind the
+ * server would otherwise render `formatMinutes(-1)`, which reads "-1h 59m".
+ */
+export function timerElapsedMinutes(startedAt: Date, now: Date): number {
+  const elapsedMs = now.getTime() - startedAt.getTime();
+  return elapsedMs <= 0 ? 0 : Math.floor(elapsedMs / 60_000);
+}
+
+/**
+ * The figure the stop form offers, or `null` when the clock's answer is not a
+ * storable number of minutes.
+ *
+ * **ONE RULE COVERING BOTH ENDS OF THE FEATURE'S RISK.** The proposal is
+ * withheld exactly when the elapsed figure could not be an entry:
+ *
+ *   UNDER ONE MINUTE, because `time_entries_minutes_range` forbids zero. A timer
+ *   started and stopped by mistake has produced nothing, and rounding nine
+ *   seconds up to a minute would be this schema inventing a quantity of work --
+ *   the same guess `billable` has no default in order to refuse.
+ *
+ *   OVER {@link MAX_TIME_ENTRY_MINUTES}, which is one day because `work_date` is
+ *   one day. This is the spec's "you left this running for 62 hours", and the
+ *   bound is what makes the recovery interaction unavoidable rather than merely
+ *   recommended: there is no "save the elapsed time and move on" branch for a
+ *   weekend, because the database will not hold it.
+ *
+ * **AND IT IS ONE FUNCTION RATHER THAN A THRESHOLD EACH**, because the two are
+ * the same refusal seen from opposite sides: the clock's answer is not a number
+ * of minutes an entry can carry, so it is not offered. What differs is what the
+ * operator is told, and that is {@link timerSummary}'s job.
+ *
+ * **REJECTED: SPLITTING A LONG TIMER ACROSS THE DAYS IT SPANNED.** A Friday
+ * 15:00 to Monday 08:00 timer would become 9h on Friday, 24h on Saturday, 24h on
+ * Sunday and 8h on Monday -- four entries the database WOULD accept, two of them
+ * claiming a person worked around the clock. It converts an obvious refusal into
+ * plausible-looking rubbish spread over a week's report, which is the one
+ * failure mode this phase keeps refusing.
+ */
+export function timerProposedMinutes(elapsedMinutes: number): number | null {
+  if (elapsedMinutes < 1) return null;
+  return elapsedMinutes > MAX_TIME_ENTRY_MINUTES ? null : elapsedMinutes;
+}
+
+/**
+ * A timer that is running now: the instant it started, what it is attached to,
+ * and the day its hours will land on.
+ *
+ * **`workDate` IS THE SERVER'S ANSWER AND NOT THE CLIENT'S**, derived from
+ * `started_at` in `org_profile.time_zone` -- Task 2's rule for which calendar day
+ * an instant belongs to, applied to the one instant this table stores. A phone
+ * in another zone deriving it locally would put one running timer on two
+ * different days, and on the last hour of a week that is two different WEEKS.
+ *
+ * **THE START DAY, NEVER THE STOP DAY.** A timer that runs from 23:00 to 01:00
+ * has to land somewhere and both readings are defensible, so the argument is not
+ * about which is more accurate: the START day is the only one that is knowable
+ * WHILE THE TIMER RUNS, which is what lets the strip and the stop dialog tell the
+ * operator where the hours are going before they commit them. A stop-day rule
+ * would make that sentence unwriteable until the moment it stopped being useful.
+ * It also cannot produce a future-dated entry -- `started_at` is `now()` on the
+ * server -- which is the asymmetry Task 4 recorded between entries (a future day
+ * counts) and meetings (a future one does not): the timer path simply never
+ * reaches it.
+ */
+export const runningTimerSchema = z.object({
+  id: z.uuid(),
+  /** The instant Postgres stamped when the operator pressed Start. THE ONE
+   * PIECE OF STATE, and the reason a restart, a closed tab and a second device
+   * all see the same timer: nothing about a running timer lives in a process. */
+  startedAt: z.iso.datetime(),
+  description: nullableString,
+  companyId: z.uuid().nullable(), contactId: z.uuid().nullable(),
+  dealId: z.uuid().nullable(), projectId: z.uuid().nullable(), taskId: z.uuid().nullable(),
+  /** The calendar day, in the organisation's clock, that stopping this timer
+   * will book its minutes to. A bare date, like `time_entries.work_date`. */
+  workDate: z.iso.date(),
+  ...timestamps,
+}).refine(timeEntryAtLeastOneLink, { message: TIME_ENTRY_NO_LINK_MESSAGE });
+export type RunningTimer = z.infer<typeof runningTimerSchema>;
+
+/**
+ * `GET /api/timer`: what is running for the calling operator, and nothing else.
+ *
+ * **A NULLABLE FIELD RATHER THAN A 404**, because "no timer is running" is the
+ * ordinary state of this endpoint and not a missing resource -- and a strip that
+ * had to distinguish a 404 from a network failure would show a stopwatch when
+ * the server was down.
+ *
+ * `timeZone` is the clock `workDate` was decided in, carried for the same reason
+ * the timesheet carries it: a day computed in a zone the reader cannot see is a
+ * claim rather than an answer (`formatDocumentInstant`'s rule).
+ */
+export const timerStateSchema = z.object({
+  timer: runningTimerSchema.nullable(),
+  timeZone: z.string(),
+});
+export type TimerState = z.infer<typeof timerStateSchema>;
+
+/**
+ * **WHAT THE OPERATOR IS TOLD ABOUT A RUNNING TIMER, IN ONE STRING.**
+ *
+ * `timesheetSummary`'s and `taskEffortSummary`'s arrangement, and their reason:
+ * the figure and its caveat travel together, so a surface cannot render the
+ * stopwatch without the sentence that says what it can and cannot become. The
+ * three branches ARE the recovery interaction:
+ *
+ *   **A STORABLE FIGURE.** The clock proposes and says so -- "unless you change
+ *   it" is not politeness, it is the statement that the operator is the
+ *   authority on how long they worked and the timer merely watched.
+ *
+ *   **UNDER A MINUTE.** There is nothing to log, and the sentence says so rather
+ *   than reading "0m", which is `durationLabel`'s and `uncountedLabel`'s rule:
+ *   an unknown or absent quantity rendered as a zero is a claim.
+ *
+ *   **PAST THE BOUND -- the weekend.** The elapsed figure is stated (the
+ *   operator needs to know it ran for 62 hours; that IS the news) and is
+ *   simultaneously withdrawn as a proposal, with both ways out named. There is
+ *   deliberately no third option here and no default: a timer left running is
+ *   never stopped for the operator, never guesses a duration, and never becomes
+ *   an entry on its own. What changes if they ignore it is only this sentence
+ *   and what the stop form will accept.
+ */
+export function timerSummary(timer: RunningTimer, now: Date): string {
+  const elapsed = timerElapsedMinutes(new Date(timer.startedAt), now);
+  if (elapsed < 1) {
+    return "Running for less than a minute. There is nothing to log yet: an entry is "
+      + "at least one minute.";
+  }
+  const ran = formatMinutes(elapsed);
+  if (timerProposedMinutes(elapsed) === null) {
+    return `Running for ${ran}, which is longer than the `
+      + `${formatMinutes(MAX_TIME_ENTRY_MINUTES)} one entry can hold. Say how long you `
+      + "actually worked, or discard the timer; nothing is counted until you do.";
+  }
+  return `Running for ${ran}. Stopping it logs ${ran} unless you change the figure, and `
+    + "nothing is counted until you do.";
+}
+
+/**
+ * `POST /api/timer`: the links the hours will belong to, and optionally what the
+ * work is.
+ *
+ * **THE AT-LEAST-ONE RULE BITES HERE, AT THE START.** A timer with no link could
+ * not become an entry -- `time_entries_has_link` would refuse it -- so refusing
+ * it at STOP would hand that refusal to an operator already recovering from a
+ * forgotten weekend, holding hours they cannot save. Refused at start it costs
+ * one tap, while the picker is still on the screen. `timers_has_link` (api:
+ * db/schema.ts) is the same rule in the database, so the two-place arrangement
+ * `time_entries_has_link` has is repeated rather than trusted.
+ *
+ * **NO `minutes`, NO `billable`, NO `workDate`**, and each absence is somebody
+ * else's answer: the duration is what the clock is for, the flag is asked at stop
+ * (the column has no default and this phase never guesses it), and the day is
+ * derived by the server from `started_at`.
+ */
+export const timerStartInputSchema = z.object({
+  description: nullableString.optional(),
+  companyId: z.uuid().nullable().optional(), contactId: z.uuid().nullable().optional(),
+  dealId: z.uuid().nullable().optional(), projectId: z.uuid().nullable().optional(),
+  taskId: z.uuid().nullable().optional(),
+}).superRefine((v, ctx) => {
+  if (!timeEntryAtLeastOneLink(v)) {
+    ctx.addIssue({ code: "custom", message: TIME_ENTRY_NO_LINK_MESSAGE });
+  }
+});
+export type TimerStartInput = z.infer<typeof timerStartInputSchema>;
+
+/**
+ * `POST /api/timer/:id/stop`: the answers the clock cannot give.
+ *
+ * **`minutes` IS REQUIRED AND IS NOT DEFAULTED TO THE ELAPSED TIME**, which is
+ * the recovery interaction expressed as a schema. A default would have to be
+ * computed somewhere, and for the 62-hour timer the only figure available to
+ * compute is one `time_entries_minutes_range` refuses -- so the endpoint would
+ * have a case with no legal default, which is precisely the case the spec says
+ * the whole feature is about. The client proposes (see
+ * {@link timerProposedMinutes}); the operator states; the server writes what it
+ * is told. Bounded exactly as an entry is, because that is what it becomes.
+ *
+ * **`billable` IS REQUIRED FOR THE COLUMN'S OWN REASON**, inherited unchanged
+ * from Task 1: `time_entries.billable` has no DEFAULT, both its values are
+ * ordinary, and a timer that decided it silently would put the guess back one
+ * layer out where the database's refusal cannot reach it.
+ *
+ * **AND THERE ARE NO LINKS**, which is the difference from
+ * `timeEntryCreateInputSchema` rather than an omission. The records were chosen
+ * when the operator started the clock and are the timer's own; changing them at
+ * stop would make the strip's "on Rollout" a claim that could be false by the
+ * time the hours landed. An entry booked to the wrong record is corrected where
+ * every other entry is corrected -- on the timesheet, which already edits them.
+ */
+export const timerStopInputSchema = z.object({
+  minutes: z.number().int().positive().max(MAX_TIME_ENTRY_MINUTES),
+  billable: z.boolean(),
+  description: nullableString.optional(),
+});
+export type TimerStopInput = z.infer<typeof timerStopInputSchema>;

@@ -1847,3 +1847,106 @@ export const timeEntries = pgTable("time_entries", {
   check("time_entries_minutes_range", sql`minutes > 0 AND minutes <= 1440`),
 ]);
 export type TimeEntryRow = typeof timeEntries.$inferSelect;
+
+// --- The timer (Phase 10 Task 5) -------------------------------------------
+//
+// ONE ROW IS ONE RUN OF THE CLOCK. It starts, it stops, and if it produced
+// anything it names the `time_entries` row it produced. A timer is NOT a time
+// entry in progress, and this table exists because it cannot be one:
+// `time_entries.minutes` is NOT NULL and `> 0`, so the schema has no way to
+// spell a duration that is still accruing -- which is a property worth having
+// rather than an obstacle, because it means a running timer can never be summed
+// by anything. `timesheetTotals` reads `time_entries` and `meetings`; nothing
+// in this table is reachable from either.
+//
+// **THE STATE IS `started_at` AND NOTHING ELSE, AND THAT IS THE POINT.** The
+// spec: "running state that must survive a restart, a closed tab, and a second
+// device. Conduit is one process with no swap; a timer held in memory dies with
+// a deploy." There is no in-memory half of this: the elapsed figure on any
+// screen is `now - started_at` computed at render time by the SAME function on
+// both sides of the wire (@conduit/shared's timerElapsedMinutes), and the wire
+// payload carries no duration at all, so there is nothing to go stale, nothing
+// to resume and nothing to lose. `started_at` DEFAULTs to now() so the instant
+// is the DATABASE's clock rather than whichever process took the request.
+//
+// **AT MOST ONE RUNNING TIMER PER PERSON, ENFORCED BY A PARTIAL UNIQUE INDEX**
+// (`timers_one_running_per_owner`, in drizzle/0023, hand-written there with
+// every other index in this codebase). It is the double-count the two capture
+// paths make available that CAN be closed in the schema: two devices each
+// starting a timer would otherwise each stop into an entry, and the same
+// afternoon would be booked twice by one person who did nothing wrong. The
+// second start is a unique violation, which the service turns into a 409 naming
+// the timer already running rather than a 500.
+//
+// **AND ONE ENTRY PER TIMER, ENFORCED BY `timers_time_entry_unique`.** A stop
+// claims the timer and inserts the entry in ONE transaction, so a stop that
+// arrives twice -- a double tap, a retried request, two devices -- finds
+// `stopped_at` already set and writes nothing. The unique constraint is the
+// belt to that braces: even a caller reaching past the service cannot point two
+// timers at one entry, and a timer cannot come to name two.
+export const timers = pgTable("timers", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  // NOT NULL, like time_entries.owner_user_id: a clock is running for somebody.
+  // It is also the column the partial unique index is on, so "whose timer is
+  // running" and "only one may be" are the same fact.
+  ownerUserId: uuid("owner_user_id").notNull().references(() => users.id),
+  // THE ONE PIECE OF STATE. An instant, unlike time_entries.work_date -- and the
+  // contrast is the whole reason both columns exist. A timer's truth IS a
+  // moment; an entry's truth is a day and a quantity. What a stop does is turn
+  // the first into the second, and the day it picks is this instant read in
+  // `org_profile.time_zone` (services/timers.ts).
+  startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
+  // NULL means running. Set by a stop AND by a discard, so "has this timer
+  // finished" is one column rather than a state machine: what tells the two
+  // apart is whether it produced an entry.
+  stoppedAt: timestamp("stopped_at", { withTimezone: true }),
+  // What it became, or NULL for a timer that was discarded (or that has not
+  // stopped yet). NOT a duplicate of the entry's own data: the entry is the
+  // hours, this is the provenance -- the wall-clock interval the entry's
+  // `work_date` cannot hold.
+  //
+  // A DISCARDED TIMER IS KEPT, because Conduit never expunges and because it is
+  // the only record that the clock ever ran. `timers.csv` carries it into the
+  // export for that reason.
+  timeEntryId: uuid("time_entry_id").references(() => timeEntries.id),
+  // What the operator said they were starting, so the strip on every page says
+  // something better than "a timer is running". It seeds the entry's own
+  // description at stop and can be corrected there.
+  description: text("description"),
+  companyId: uuid("company_id").references(() => companies.id),
+  contactId: uuid("contact_id").references(() => contacts.id),
+  dealId: uuid("deal_id").references(() => deals.id),
+  projectId: uuid("project_id").references(() => projects.id),
+  taskId: uuid("task_id").references(() => tasks.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  // THE SAME FIVE, THE SAME RULE, AND DELIBERATELY THE SAME SPELLING as
+  // `time_entries_has_link` -- because a timer that could not become an entry
+  // must not be startable. Enforcing it here means the refusal reaches the
+  // operator while the record picker is still on the screen; enforcing it only
+  // at stop would hand it to somebody recovering from a forgotten weekend, with
+  // hours they cannot save and no way to attach them.
+  //
+  // NO `meeting_id` HERE EITHER, for Task 1's reason exactly: a timer is a
+  // second front door to `time_entries`, and a door that could name a meeting
+  // would put back the double count the missing column makes unspellable.
+  check(
+    "timers_has_link",
+    sql`num_nonnulls(company_id, contact_id, deal_id, project_id, task_id) >= 1`,
+  ),
+  // A timer cannot stop before it started. Cheap, and it is what stops a bad
+  // clock or a hand-written row producing a negative elapsed time that
+  // timerElapsedMinutes would then clamp to nought in silence.
+  check("timers_stopped_after_start", sql`stopped_at IS NULL OR stopped_at >= started_at`),
+  // AND A RUNNING TIMER CANNOT HAVE PRODUCED ANYTHING. Without this, a row with
+  // an entry and no `stopped_at` would be counted by the timesheet (through the
+  // entry) AND still be running on the strip -- the double count arriving as an
+  // inconsistency rather than as a second row.
+  check("timers_entry_needs_stop", sql`time_entry_id IS NULL OR stopped_at IS NOT NULL`),
+  // ONE ENTRY, ONE TIMER. Postgres treats NULLs as distinct in a UNIQUE
+  // constraint, so every running and every discarded timer is exempt and only
+  // the claim itself is unique -- which is exactly the rule wanted.
+  unique("timers_time_entry_unique").on(t.timeEntryId),
+]);
+export type TimerRow = typeof timers.$inferSelect;

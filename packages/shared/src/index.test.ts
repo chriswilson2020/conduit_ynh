@@ -18,6 +18,12 @@ import {
   timeEntryAtLeastOneLink,
   timeEntryCreateInputSchema,
   timeEntryUpdateInputSchema,
+  timerElapsedMinutes,
+  timerProposedMinutes,
+  timerStartInputSchema,
+  timerStateSchema,
+  timerStopInputSchema,
+  timerSummary,
   csvImportFieldSchema,
   formatDocumentInstant,
   userSchema,
@@ -3420,5 +3426,216 @@ describe("taskEffortSummary", () => {
     for (const fragment of ["1m booked", "1 entry", "1h 1m", "1h left"]) {
       expect(sentence, fragment).toContain(fragment);
     }
+  });
+});
+
+/* -------------------------------------------------------------------------- *
+ *  The timer (Phase 10 Task 5)
+ * -------------------------------------------------------------------------- */
+
+describe("timerElapsedMinutes", () => {
+  const start = new Date("2026-09-07T09:00:00.000Z");
+  const at = (ms: number) => new Date(start.getTime() + ms);
+
+  // FLOORED, NEVER ROUNDED, which is `formatMinutes`' own rule one function
+  // over: a timer stopped at 1m59s has not produced two minutes of work, and a
+  // proposal an operator accepts without reading must never be larger than the
+  // clock actually ran.
+  it("floors to whole minutes rather than rounding", () => {
+    expect(timerElapsedMinutes(start, at(0))).toBe(0);
+    expect(timerElapsedMinutes(start, at(59_999))).toBe(0);
+    expect(timerElapsedMinutes(start, at(60_000))).toBe(1);
+    expect(timerElapsedMinutes(start, at(119_999))).toBe(1);
+    expect(timerElapsedMinutes(start, at(90 * 60_000))).toBe(90);
+  });
+
+  // A DEVICE CLOCK THAT DISAGREES WITH THE SERVER'S IS THE ORDINARY CASE, not a
+  // fault: `started_at` is stamped by Postgres and the strip ticks against the
+  // browser, so a phone a few seconds behind would otherwise render a negative
+  // duration -- `formatMinutes(-1)` reads "-1h 59m".
+  it("clamps a clock that is behind the start to nought", () => {
+    expect(timerElapsedMinutes(start, at(-1))).toBe(0);
+    expect(timerElapsedMinutes(start, at(-86_400_000))).toBe(0);
+  });
+
+  it("counts a weekend in minutes without saturating", () => {
+    expect(timerElapsedMinutes(start, at(62 * 60 * 60_000))).toBe(62 * 60);
+  });
+});
+
+describe("timerProposedMinutes", () => {
+  /**
+   * **ONE RULE, AND IT COVERS BOTH ENDS OF THE FEATURE'S RISK.** The proposal is
+   * withheld exactly when the elapsed figure is not a storable number of
+   * minutes -- under one (`time_entries_minutes_range` forbids zero) and over a
+   * day (MAX_TIME_ENTRY_MINUTES, which is one day because `work_date` is one
+   * day). The weekend the spec is about and the mis-tap that ran for nine
+   * seconds are the same refusal seen from two sides, which is why this is one
+   * function rather than a threshold each.
+   */
+  it("offers the elapsed figure only while it is a storable number of minutes", () => {
+    expect(timerProposedMinutes(0)).toBeNull();
+    expect(timerProposedMinutes(1)).toBe(1);
+    expect(timerProposedMinutes(125)).toBe(125);
+    expect(timerProposedMinutes(MAX_TIME_ENTRY_MINUTES)).toBe(MAX_TIME_ENTRY_MINUTES);
+    expect(timerProposedMinutes(MAX_TIME_ENTRY_MINUTES + 1)).toBeNull();
+    expect(timerProposedMinutes(62 * 60)).toBeNull();
+  });
+});
+
+describe("timerSummary", () => {
+  const startedAt = "2026-09-04T07:00:00.000Z";
+  const timer = {
+    id: randomUUID(),
+    startedAt,
+    description: "Rewrite the ingest",
+    companyId: null, contactId: null, dealId: null,
+    projectId: randomUUID(), taskId: null,
+    workDate: "2026-09-04",
+    createdAt: startedAt, updatedAt: startedAt,
+  };
+  const after = (minutes: number) =>
+    new Date(new Date(startedAt).getTime() + minutes * 60_000);
+
+  it("says how long it has run and that nothing is counted yet", () => {
+    const sentence = timerSummary(timer, after(126));
+    expect(sentence).toContain("2h 6m");
+    expect(sentence).toContain("nothing is counted");
+  });
+
+  /**
+   * **THE WEEKEND, WHICH THE SPEC CALLS THE COMMON FAILURE RATHER THAN AN EDGE
+   * CASE.** The sentence has to do three things at once: say the figure, say why
+   * it cannot be logged, and say what the operator's two ways out are. A page
+   * that printed the elapsed time on its own would be offering a number the
+   * database will refuse.
+   */
+  it("withdraws the figure as a proposal once it is longer than one entry can hold", () => {
+    const sentence = timerSummary(timer, after(62 * 60 + 14));
+    expect(sentence).toContain("62h 14m");
+    expect(sentence).toContain(formatMinutes(MAX_TIME_ENTRY_MINUTES));
+    expect(sentence).toMatch(/how long you actually worked/);
+    expect(sentence).toMatch(/discard/);
+    // And it must NOT read as an offer to save what the clock says.
+    expect(sentence).not.toMatch(/Stopping it logs/);
+  });
+
+  it("says there is nothing to log yet under a minute", () => {
+    const sentence = timerSummary(timer, after(0));
+    expect(sentence).toMatch(/less than a minute/);
+    expect(sentence).toMatch(/at least one minute/);
+    expect(sentence).not.toContain("0m");
+  });
+
+  // THE EXACT EDGES, because "longer than a day" is the whole recovery branch
+  // and an off-by-one here either refuses a legal 24h entry or offers an illegal
+  // one.
+  it("changes its mind at exactly the bound and nowhere else", () => {
+    expect(timerSummary(timer, after(MAX_TIME_ENTRY_MINUTES))).toContain("Stopping it logs");
+    expect(timerSummary(timer, after(MAX_TIME_ENTRY_MINUTES + 1))).not.toContain("Stopping it logs");
+    expect(timerSummary(timer, after(1))).toContain("Stopping it logs");
+    expect(timerSummary(timer, after(0))).not.toContain("Stopping it logs");
+  });
+});
+
+describe("timerStartInputSchema", () => {
+  const id = randomUUID();
+
+  /**
+   * **A TIMER THAT COULD NOT BECOME AN ENTRY CANNOT BE STARTED**, which is where
+   * the at-least-one rule has to bite for the timer path. Refusing it at STOP
+   * would put the refusal in front of an operator already recovering from a
+   * forgotten weekend, holding hours they cannot save; refusing it at START
+   * costs them one tap while they are looking at the picker.
+   */
+  it("refuses a timer attached to nothing, naming all five links", () => {
+    const result = timerStartInputSchema.safeParse({});
+    expect(result.success).toBe(false);
+    const message = result.error?.issues[0]?.message ?? "";
+    for (const field of ["companyId", "contactId", "dealId", "projectId", "taskId"]) {
+      expect(message, `the refusal does not name ${field}`).toContain(field);
+    }
+    expect(timerStartInputSchema.safeParse({ projectId: id }).success).toBe(true);
+  });
+
+  // NO `billable`, NO `minutes` AND NO `workDate` ON THE WIRE. Each is answered
+  // somewhere else and by somebody else: the flag at stop (it has no default
+  // anywhere in this phase), the minutes at stop (the clock proposes, the
+  // operator states), and the day by the server out of `started_at`.
+  it("takes no duration, no day and no billable flag", () => {
+    const parsed = timerStartInputSchema.parse({
+      projectId: id, minutes: 60, billable: true, workDate: "2026-09-01",
+    });
+    expect(parsed).not.toHaveProperty("minutes");
+    expect(parsed).not.toHaveProperty("billable");
+    expect(parsed).not.toHaveProperty("workDate");
+  });
+
+  it("treats an empty description as no description at all", () => {
+    expect(timerStartInputSchema.safeParse({ projectId: id, description: null }).success).toBe(true);
+    expect(timerStartInputSchema.safeParse({ projectId: id, description: "" }).success).toBe(false);
+  });
+});
+
+describe("timerStopInputSchema", () => {
+  /**
+   * **THE OPERATOR STATES THE MINUTES; THE CLOCK ONLY PROPOSED THEM.** The field
+   * is required rather than defaulted to the elapsed time, and that is the
+   * recovery interaction expressed as a schema: a default would have to be
+   * computed on the server, and for the 62-hour timer the only figure it could
+   * compute is one the database refuses.
+   */
+  it("requires the minutes and the billable flag, and bounds the minutes like an entry", () => {
+    expect(timerStopInputSchema.safeParse({ billable: true }).success).toBe(false);
+    expect(timerStopInputSchema.safeParse({ minutes: 30 }).success).toBe(false);
+    expect(timerStopInputSchema.safeParse({ minutes: 30, billable: false }).success).toBe(true);
+    expect(timerStopInputSchema.safeParse({ minutes: 0, billable: false }).success).toBe(false);
+    expect(
+      timerStopInputSchema.safeParse({ minutes: MAX_TIME_ENTRY_MINUTES, billable: false }).success,
+    ).toBe(true);
+    expect(
+      timerStopInputSchema.safeParse({ minutes: MAX_TIME_ENTRY_MINUTES + 1, billable: false }).success,
+    ).toBe(false);
+    expect(timerStopInputSchema.safeParse({ minutes: 1.5, billable: false }).success).toBe(false);
+  });
+
+  // The links are the TIMER'S and are not re-stated at stop: they were chosen
+  // when the operator started the clock, and they are corrected on the entry
+  // afterwards, on the page that already edits entries.
+  it("carries no links", () => {
+    const parsed = timerStopInputSchema.parse({
+      minutes: 30, billable: true, projectId: randomUUID(),
+    });
+    expect(parsed).not.toHaveProperty("projectId");
+  });
+});
+
+describe("timerStateSchema", () => {
+  const base = {
+    id: randomUUID(), startedAt: "2026-09-04T07:00:00.000Z", description: null,
+    companyId: null, contactId: null, dealId: null, projectId: randomUUID(), taskId: null,
+    createdAt: "2026-09-04T07:00:00.000Z", updatedAt: "2026-09-04T07:00:00.000Z",
+  };
+
+  it("admits an install with no timer running", () => {
+    expect(timerStateSchema.parse({ timer: null, timeZone: "Europe/Amsterdam" }).timer).toBeNull();
+  });
+
+  // `workDate` IS A DAY THE SERVER DECIDED, not one the client derives: it comes
+  // out of `started_at` read in the ORGANISATION's calendar, so a phone in
+  // another zone cannot put one running timer on two different days.
+  it("carries the day the hours will land on, as a bare date", () => {
+    expect(timerStateSchema.safeParse({
+      timer: { ...base, workDate: "2026-09-04" }, timeZone: "UTC",
+    }).success).toBe(true);
+    expect(timerStateSchema.safeParse({
+      timer: { ...base, workDate: "2026-09-04T07:00:00.000Z" }, timeZone: "UTC",
+    }).success).toBe(false);
+  });
+
+  it("refuses a running timer attached to nothing", () => {
+    expect(timerStateSchema.safeParse({
+      timer: { ...base, projectId: null, workDate: "2026-09-04" }, timeZone: "UTC",
+    }).success).toBe(false);
   });
 });
