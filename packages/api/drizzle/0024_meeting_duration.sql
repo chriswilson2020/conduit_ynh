@@ -1,0 +1,12 @@
+-- A MEETING IS AT LEAST A MINUTE AND AT MOST A WEEK (v1.9.1).
+--
+-- A VALIDATED CHECK, ADDED TO A COLUMN THAT ALREADY EXISTS, WHICH IS THE ONE
+-- THING THIS FILE COULD DO THAT FAILS AT SOMEBODY'S BOOT. src/db/client.ts runs
+-- migrate() on start-up, so a single row of 999999999 anywhere would turn an
+-- upgrade into an install that does not come back. The live install was
+-- therefore measured before this was written, read-only and without any
+-- privilege on the table itself: pg_stat_all_tables reports n_tup_ins = 0 and
+-- pg_relation_size('meetings') is 0 BYTES -- zero heap pages, so the table has
+-- never held a row. See src/db/schema.ts on meetings_duration_range for the full
+-- reading and for why NOT VALID was rejected rather than used.
+ALTER TABLE "meetings" ADD CONSTRAINT "meetings_duration_range" CHECK (duration_minutes IS NULL OR (duration_minutes > 0 AND duration_minutes <= 10080));

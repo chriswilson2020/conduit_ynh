@@ -1,7 +1,7 @@
 import type {
   MeetingAttendee, MeetingAttendeeInput, MeetingCreateInput, MeetingTaskCreateInput,
 } from "@conduit/shared";
-import { formatMinutes, meetingAtLeastOneLink } from "@conduit/shared";
+import { formatMinutes, meetingAtLeastOneLink, MAX_MEETING_DURATION_MINUTES } from "@conduit/shared";
 import { ApiError } from "../../api";
 import type { PendingArrivals } from "../../lib";
 import { newArrivalsLabel } from "../../lib";
@@ -279,6 +279,13 @@ export function buildMeetingInput(draft: MeetingFormDraft, links: RecordLinks): 
   if (durationMinutes === "invalid") {
     return { ok: false, error: "Duration must be a whole number of minutes, or left blank." };
   }
+  if (durationMinutes === "too-long") {
+    return {
+      ok: false,
+      error: `A meeting can be at most ${String(MAX_MEETING_DURATION_MINUTES)} minutes `
+        + "(one week). Log anything longer as several meetings, or as a project.",
+    };
+  }
 
   if (draft.attendees.some((a) => a.kind === "guest" && a.name.trim() === "")) {
     return { ok: false, error: "A guest attendee needs a name." };
@@ -304,12 +311,21 @@ export function buildMeetingInput(draft: MeetingFormDraft, links: RecordLinks): 
 
 /** null for a blank field (the API's "unknown", and what the column stores),
  * "invalid" for anything that is not a positive whole number -- 0 and 12.5 are
- * both 400s against `.int().positive()`, so neither may be sent. */
-function parseDurationMinutes(raw: string): number | null | "invalid" {
+ * both 400s against `.int().positive()`, so neither may be sent.
+ *
+ * "too-long" is a THIRD outcome rather than a second kind of invalid, because
+ * the two need different sentences: "that is not a number of minutes" does not
+ * help somebody who typed a real number that is merely too big, and the number
+ * they need to hear is MAX_MEETING_DURATION_MINUTES. Bounded here at all
+ * because `meetingInputShape` carries the same `.max()` (v1.9.1) -- a form that
+ * let the value through would turn the schema's rule into a bare 400 from the
+ * server, which is the one thing this whole function exists to avoid. */
+function parseDurationMinutes(raw: string): number | null | "invalid" | "too-long" {
   const trimmed = raw.trim();
   if (trimmed === "") return null;
   const parsed = Number(trimmed);
   if (!Number.isInteger(parsed) || parsed <= 0) return "invalid";
+  if (parsed > MAX_MEETING_DURATION_MINUTES) return "too-long";
   return parsed;
 }
 

@@ -12,7 +12,7 @@ import {
   shiftResultSchema, ganttPayloadSchema,
   meetingSchema, meetingDetailSchema, meetingSummarySchema, timeEntrySchema,
   timesheetBillableSummary, timesheetSummary, timesheetTotalsSchema, timesheetWeekSchema,
-  timerStateSchema, MAX_TIME_ENTRY_MINUTES, MAX_TIMESHEET_DAY_SPAN,
+  timerStateSchema, MAX_MEETING_DURATION_MINUTES, MAX_TIME_ENTRY_MINUTES, MAX_TIMESHEET_DAY_SPAN,
   documentSchema, orgProfileSchema,
   agreementSchema, letterSchema, recordDocumentSchema, statusReportSchema,
   documentTemplateSchema, CONTACT_FIELD_CAPS, DEFAULT_TIME_ZONE,
@@ -1845,6 +1845,49 @@ describe("meetings routes", () => {
     });
     expect(response.statusCode).toBe(400);
     expect(errorResponseSchema.parse(response.json()).error).toBe("validation");
+    await a.close();
+  });
+
+  /**
+   * **THE DURATION BOUND IS ON THE WIRE AS WELL AS IN THE DATABASE (v1.9.1)**,
+   * so the figure Phase 10 Task 2 named is a 400 naming the field rather than a
+   * 500 out of `meetings_duration_range` -- the arrangement `tasks_estimate_range`
+   * already has, and which the comment beside that test said this column had NOT
+   * got.
+   *
+   * ON CREATE AND ON PATCH, because they are the same input shape partial'd and
+   * a bound on only one of them lets the second request write what the first
+   * refused.
+   */
+  it("refuses a duration past the bound, and a zero, with a 400 on create and on patch", async () => {
+    const a = await app();
+    const company = await makeCompany(a);
+    const meeting = await makeMeeting(a, { title: "Kickoff", occurredAt, companyId: company.id });
+
+    for (const durationMinutes of [0, -1, MAX_MEETING_DURATION_MINUTES + 1, 999999999, 90.5]) {
+      const created = await a.inject({
+        method: "POST", url: "/api/meetings", headers: authHeaders,
+        payload: { title: "Kickoff", occurredAt, companyId: company.id, durationMinutes },
+      });
+      expect(created.statusCode, `create ${String(durationMinutes)}`).toBe(400);
+      expect(errorResponseSchema.parse(created.json()).error).toBe("validation");
+
+      const patched = await a.inject({
+        method: "PATCH", url: `/api/meetings/${meeting.id}`, headers: authHeaders,
+        payload: { durationMinutes },
+      });
+      expect(patched.statusCode, `patch ${String(durationMinutes)}`).toBe(400);
+    }
+    // The premise: the exact edges of the same range go through, so the loop
+    // above is not being satisfied by a route that refuses every duration.
+    for (const durationMinutes of [1, MAX_MEETING_DURATION_MINUTES]) {
+      const ok = await a.inject({
+        method: "PATCH", url: `/api/meetings/${meeting.id}`, headers: authHeaders,
+        payload: { durationMinutes },
+      });
+      expect(ok.statusCode, String(durationMinutes)).toBe(200);
+      expect(meetingSchema.parse(ok.json()).durationMinutes).toBe(durationMinutes);
+    }
     await a.close();
   });
 

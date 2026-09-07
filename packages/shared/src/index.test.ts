@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import {
   CSV_IMPORT_FIELDS,
   DEFAULT_TIME_ZONE,
+  MAX_MEETING_DURATION_MINUTES,
   MAX_TASK_ESTIMATE_MINUTES,
   MAX_TIME_ENTRY_MINUTES,
   MAX_TIMESHEET_DAY_SPAN,
@@ -1980,12 +1981,33 @@ describe("meetingSchema", () => {
   });
 
   // A zero-length meeting is not a meeting, and a negative one is nonsense.
-  // The DB column carries no matching CHECK (see meetingSchema's comment):
-  // this schema is the only gate, so it is pinned here.
+  // `meetings_duration_range` says the same thing in the database since v1.9.1,
+  // so this is now belt and braces rather than the only gate.
   it("rejects a zero, negative or fractional duration", () => {
     for (const durationMinutes of [0, -30, 1.5]) {
       expect(() => meetingSchema.parse({ ...meeting, durationMinutes })).toThrow();
     }
+  });
+
+  /**
+   * **THE READ SCHEMA HAS NO UPPER BOUND, AND THAT IS AN ASSERTION, NOT A GAP.**
+   * v1.9.1 bounds the duration on the way in and in the database; if somebody
+   * later "completes" the job by adding the same `.max()` here, this is what
+   * says no, and `meetingSchema.durationMinutes`' comment says why -- a restore
+   * loads the dump before it migrates (api: services/restore.ts), so an
+   * operator can genuinely end up reading a row the CHECK would have refused,
+   * and a bounded read schema would make that row unopenable instead of
+   * visible.
+   *
+   * 999999999 specifically, because that is the figure Phase 10 Task 2 named as
+   * the exposure -- the same number `taskSchema`'s test uses for the opposite
+   * expectation, which is the contrast worth being able to see in one grep.
+   */
+  it("still parses a duration far past the bound, because a stored row must stay readable", () => {
+    expect(meetingSchema.parse({ ...meeting, durationMinutes: 999999999 }).durationMinutes)
+      .toBe(999999999);
+    expect(meetingSchema.parse({ ...meeting, durationMinutes: MAX_MEETING_DURATION_MINUTES + 1 })
+      .durationMinutes).toBe(MAX_MEETING_DURATION_MINUTES + 1);
   });
 
   // The rail's list rows render an attendee summary, so the collection is
@@ -2090,6 +2112,37 @@ describe("meetingCreateInputSchema and meetingUpdateInputSchema", () => {
   // with nothing" -- and must survive parsing rather than being stripped.
   it("keeps an empty attendees array on a patch (replace-with-empty)", () => {
     expect(meetingUpdateInputSchema.parse({ attendees: [] })).toEqual({ attendees: [] });
+  });
+
+  /**
+   * **THE BOUND IS ON THE WAY IN, ON BOTH INPUT SHAPES (v1.9.1).** Both, because
+   * they are the same object partial'd and a bound added to only one of them is
+   * the shape of exposure this whole item exists to close: create refuses the
+   * figure, update writes it.
+   *
+   * The exact edges rather than a round pair, `tasks_estimate_range`'s
+   * arrangement: MAX_MEETING_DURATION_MINUTES goes through and +1 does not, so
+   * this fails if the bound is off by one in either direction rather than only
+   * if it is absent.
+   */
+  it("refuses a duration past MAX_MEETING_DURATION_MINUTES on create and on update", () => {
+    for (const durationMinutes of [MAX_MEETING_DURATION_MINUTES + 1, 999999999]) {
+      expect(() => meetingCreateInputSchema.parse({
+        ...base, companyId: uuid1, durationMinutes,
+      }), `create ${String(durationMinutes)}`).toThrow();
+      expect(() => meetingUpdateInputSchema.parse({ durationMinutes }),
+        `update ${String(durationMinutes)}`).toThrow();
+    }
+    // The premise: the edge itself, and the null that clears it, both go through
+    // -- without which the assertions above would be satisfied by a schema that
+    // refused every duration.
+    for (const durationMinutes of [1, MAX_MEETING_DURATION_MINUTES]) {
+      expect(meetingCreateInputSchema.parse({ ...base, companyId: uuid1, durationMinutes })
+        .durationMinutes, `create ${String(durationMinutes)}`).toBe(durationMinutes);
+      expect(meetingUpdateInputSchema.parse({ durationMinutes }).durationMinutes,
+        `update ${String(durationMinutes)}`).toBe(durationMinutes);
+    }
+    expect(meetingUpdateInputSchema.parse({ durationMinutes: null }).durationMinutes).toBeNull();
   });
 
   // The exported predicate is what updateMeeting re-asserts against the
@@ -3282,6 +3335,50 @@ describe("MAX_TASK_ESTIMATE_MINUTES", () => {
     expect(MAX_TASK_ESTIMATE_MINUTES).toBeGreaterThan(MAX_TIME_ENTRY_MINUTES);
     expect(MAX_TASK_ESTIMATE_MINUTES % MAX_TIME_ENTRY_MINUTES).toBe(0);
     expect(MAX_TASK_ESTIMATE_MINUTES / MAX_TIME_ENTRY_MINUTES).toBe(365);
+  });
+});
+
+describe("MAX_MEETING_DURATION_MINUTES", () => {
+  /**
+   * **THE VALUE, PINNED, BECAUSE THE MIGRATION CARRIES THE LITERAL.**
+   * `meetings_duration_range` says 10080 in SQL and this constant says
+   * `7 * 24 * 60`; nothing makes them the same number except this assertion and
+   * the schema test that probes the CHECK's own edges. MAX_TIME_ENTRY_MINUTES'
+   * and MAX_TASK_ESTIMATE_MINUTES' arrangement.
+   */
+  it("is one week of wall-clock minutes, the number the CHECK carries", () => {
+    expect(MAX_MEETING_DURATION_MINUTES).toBe(10080);
+  });
+
+  /**
+   * **IT IS NEITHER OF THE OTHER TWO, AND BOTH REJECTIONS ARE LOAD-BEARING.**
+   *
+   * NOT 1440. db/schema.ts spent a release arguing that an entry's day-long
+   * bound cannot be lifted onto a meeting -- `occurred_at` is a start instant,
+   * and an offsite logged as one meeting honestly runs past a day. That argument
+   * still stands and this constant honours it with six days to spare.
+   *
+   * NOT 525600. A year is the bound already in the repo and the tempting one to
+   * reuse, and it fails at the only job this bound has: 525600 minutes is 52
+   * weeks of work reported inside one seven-day week, so the swamping survives
+   * it. If somebody ever tidies these three into one constant, this is what says
+   * no -- and which one they would have reached for.
+   */
+  it("sits strictly between the entry bound and the estimate bound", () => {
+    expect(MAX_MEETING_DURATION_MINUTES).toBeGreaterThan(MAX_TIME_ENTRY_MINUTES);
+    expect(MAX_MEETING_DURATION_MINUTES).toBeLessThan(MAX_TASK_ESTIMATE_MINUTES);
+    expect(MAX_MEETING_DURATION_MINUTES / MAX_TIME_ENTRY_MINUTES).toBe(7);
+  });
+
+  /**
+   * THE PROPERTY THE NUMBER WAS CHOSEN FOR, asserted as a property rather than
+   * as the number again: one meeting cannot outweigh the week the timesheet
+   * reports it in. Written against MAX_TIME_ENTRY_MINUTES * 7 -- the wall clock
+   * in seven days -- so it keeps meaning what it says if either constant moves.
+   */
+  it("cannot exceed the week that reports it, which is the harm it exists to exclude", () => {
+    expect(MAX_MEETING_DURATION_MINUTES).toBeLessThanOrEqual(MAX_TIME_ENTRY_MINUTES * 7);
+    expect(MAX_TASK_ESTIMATE_MINUTES).toBeGreaterThan(MAX_TIME_ENTRY_MINUTES * 7);
   });
 });
 

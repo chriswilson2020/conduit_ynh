@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import type { MeetingAttendee } from "@conduit/shared";
-import { meetingCreateInputSchema, meetingTaskCreateInputSchema } from "@conduit/shared";
+import {
+  meetingCreateInputSchema, meetingTaskCreateInputSchema, MAX_MEETING_DURATION_MINUTES,
+} from "@conduit/shared";
 import { ApiError } from "../../api";
 import {
   MEETING_ARCHIVED_REASON,
@@ -185,6 +187,37 @@ describe("buildMeetingInput", () => {
     expect(buildMeetingInput(draft({ durationMinutes: "1.5" }), { companyId: COMPANY }).ok).toBe(false);
     expect(buildMeetingInput(draft({ attendees: [{ kind: "guest", name: "   " }] }), { companyId: COMPANY }).ok)
       .toBe(false);
+  });
+
+  /**
+   * **THE UPPER BOUND, AND A SENTENCE OF ITS OWN (v1.9.1).** The form is the
+   * third place the rule lives -- `meetingInputShape` and
+   * `meetings_duration_range` are the other two -- and the only one that can say
+   * anything useful about it. Every case is checked against the real schema
+   * rather than only against the form, so the form's answer and the server's
+   * cannot come apart: a value this form accepts must be one the schema accepts.
+   *
+   * The exact edge goes through, so a bound narrowed by one would fail here and
+   * not merely a bound that is absent.
+   */
+  it("refuses a duration past one week, with its own sentence, and accepts the exact edge", () => {
+    const tooLong = buildMeetingInput(
+      draft({ durationMinutes: String(MAX_MEETING_DURATION_MINUTES + 1) }), { companyId: COMPANY },
+    );
+    expect(tooLong.ok).toBe(false);
+    if (tooLong.ok) return;
+    // Not the "whole number of minutes" sentence, which would be no help at all
+    // to somebody who typed a whole number of minutes.
+    expect(tooLong.error).toContain("10080");
+    expect(tooLong.error).not.toContain("whole number");
+
+    const edge = buildMeetingInput(
+      draft({ durationMinutes: String(MAX_MEETING_DURATION_MINUTES) }), { companyId: COMPANY },
+    );
+    expect(edge.ok).toBe(true);
+    if (!edge.ok) return;
+    expect(edge.input.durationMinutes).toBe(MAX_MEETING_DURATION_MINUTES);
+    expect(meetingCreateInputSchema.safeParse(edge.input).success).toBe(true);
   });
 
   it("refuses a meeting with no record link at all", () => {

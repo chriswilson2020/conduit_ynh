@@ -590,13 +590,18 @@ export const TASK_STATUS_LABEL: Record<TaskStatus, string> = {
  *   working day -- the one place the schema would have had to guess at it
  *   (`time_entries.billable`) it refused to.
  *
- *   AND UNBOUNDED IS `meetings.duration_minutes`' POSITION, WHOSE COST TASK 2
- *   MEASURED. `meetingSchema.durationMinutes` is `z.number().int().positive()`
- *   with no ceiling, so one meeting can carry 999,999,999 minutes and dominate a
- *   week's total; it cannot be tightened NOW, because a `.max()` would make the
- *   client refuse to parse rows that already exist -- turning a silly figure
- *   into a broken page. A bound is free exactly once, on the day the column is
- *   created empty, and for this column that day is today.
+ *   AND UNBOUNDED WAS `meetings.duration_minutes`' POSITION, WHOSE COST TASK 2
+ *   MEASURED -- `z.number().int().positive()` accepts 999,999,999, which
+ *   dominates a week's total. **v1.9.1 BOUNDED IT, AND THE "CANNOT BE TIGHTENED
+ *   NOW" THAT USED TO STAND HERE WAS WRONG TWICE.** It was an argument about the
+ *   READ schema ("a `.max()` would make the client refuse to parse rows that
+ *   already exist") applied to the bound as a whole; the bound went on the input
+ *   shape and on a CHECK, and only the read schema stayed open. And the premise
+ *   was never checked: that column's table had never held a row on the one
+ *   install that exists. "A bound is free exactly once, on the day the column is
+ *   created empty" is still true -- what was missed is that a column can still
+ *   be empty long after the day it was created. See
+ *   MAX_MEETING_DURATION_MINUTES.
  */
 export const MAX_TASK_ESTIMATE_MINUTES = 365 * 24 * 60;
 
@@ -2219,17 +2224,73 @@ export function meetingAtLeastOneLink(
   return [v.companyId, v.contactId, v.dealId, v.projectId].some((x) => x != null);
 }
 
+/**
+ * **THE LONGEST ONE MEETING MAY BE, IN MINUTES: ONE WEEK.**
+ *
+ * v1.9.1. Phase 10 Task 2 found this column unbounded, measured what that costs
+ * -- `z.number().int().positive()` accepts 999999999, and since v1.9.0 the
+ * duration is summed into the timesheet (api: services/timesheet.ts), so one
+ * mistyped meeting dominates a week -- and deliberately did not fix it, because
+ * a `.max()` on the READ schema turns a wrong number into a record the client
+ * cannot open. That objection is answered by WHERE the bound goes, not by
+ * leaving it out; see `meetingInputShape` below and `meetings_duration_range`
+ * (api: db/schema.ts).
+ *
+ * **A WEEK, AND THE NUMBER IS CHOSEN AGAINST THE HARM RATHER THAN ROUNDED TO
+ * IT.** The harm is a single row swamping the period it is reported in, and the
+ * period is the timesheet's week (`isoWeekRange`; the page asks for seven days
+ * and nothing else). A bound of one week is the largest one under which a single
+ * meeting cannot exceed the week that reports it -- the same sentence
+ * MAX_TIME_ENTRY_MINUTES gets from `work_date` being one day, lifted to the unit
+ * a meeting is actually read in. `occurred_at` is a START, not a day, so the
+ * entry's own 1440 is not available here.
+ *
+ * **AND MAX_TASK_ESTIMATE_MINUTES WOULD NOT HAVE WORKED.** A year is the other
+ * bound this repo already has and it is the tempting one to reuse. It does not
+ * fix this: 525600 minutes inside a seven-day week is still 52 weeks of work
+ * reported in one, so the swamping the bound exists to stop survives it intact.
+ * A bound that does not exclude the harm is decoration.
+ *
+ * WHAT IT DELIBERATELY DOES NOT CATCH, said plainly because db/schema.ts's old
+ * comment used this as the reason to have no bound at all: the mistype that
+ * actually happens is 60 typed as 600, and no bound this column could carry
+ * refuses that. This one is not aimed at the slip; it is aimed at the figure
+ * that makes a whole report unreadable, which is a different failure with a
+ * different fix.
+ *
+ * SPELLED HERE AND AS THE `meetings_duration_range` DB CHECK, with
+ * schema.test.ts probing the exact edges so the literal in the migration and
+ * this constant cannot come to mean different things -- MAX_TIME_ENTRY_MINUTES'
+ * and MAX_TASK_ESTIMATE_MINUTES' arrangement.
+ */
+export const MAX_MEETING_DURATION_MINUTES = 7 * 24 * 60;
+
 export const meetingSchema = z.object({
   id: z.uuid(), title: z.string().min(1),
   // Past OR future: logging a meeting just had and noting one just arranged
   // are the same act (spec). No ordering constraint against createdAt.
   occurredAt: z.iso.datetime(),
-  // Positive, and NULL for the honest "nobody recorded how long it ran"
-  // (spec). The DB column carries no matching CHECK -- deliberately, since
-  // the spec's data model lists none: this schema is the gate, the way
-  // contacts.emails' format is zod-only (see that column's comment in api:
-  // db/schema.ts), rather than the belt-and-braces pattern
-  // projects.color/tasks.progress_pct use.
+  /**
+   * Positive, and NULL for the honest "nobody recorded how long it ran" (spec).
+   *
+   * **NO `.max()` HERE, AND ITS ABSENCE IS THE DECISION.** v1.9.1 bounds this
+   * value at one week on the way IN (`meetingInputShape`) and in the database
+   * (`meetings_duration_range`). It is not bounded on the way OUT, because a
+   * read schema's job is to describe what the database can hand back, and the
+   * database can still hand back a row that predates the constraint.
+   *
+   * THAT IS NOT HYPOTHETICAL, AND THE PATH IS NAMED: a restore loads the dump
+   * FIRST and migrates SECOND (api: services/restore.ts), and its own comment
+   * calls "a constraint that a years-old install violates" an ordinary way to
+   * fail. When that happens the operator is left running against a restored
+   * database that holds the offending row and has NOT got the CHECK. A `.max()`
+   * here would make the Meetings rail throw on parse at exactly the moment the
+   * operator needs to see the row in order to fix it -- Phase 10 Task 2's cost,
+   * arriving through the restore door instead of the upgrade door.
+   *
+   * The floor stays: a zero-length meeting is not a meeting and a negative one
+   * is nonsense, and no row can carry either, so refusing them costs nothing.
+   */
   durationMinutes: z.number().int().positive().nullable(),
   // Rich-text HTML, sanitized server-side on write (api: services/meetings.ts,
   // Task 2). "" is not a value: an empty note is NULL.
@@ -2276,7 +2337,19 @@ export type MeetingDetail = z.infer<typeof meetingDetailSchema>;
 const meetingInputShape = z.object({
   title: z.string().min(1),
   occurredAt: z.iso.datetime(),
-  durationMinutes: z.number().int().positive().nullable().optional(),
+  /**
+   * **BOUNDED HERE AND NOT ON `meetingSchema`, WHICH IS THE WHOLE SHAPE OF THIS
+   * FIX** -- `taskSchema`/`taskInputShape`'s split, used for the thing that
+   * split was built for. Bounding what can be WRITTEN makes a new 999999999
+   * impossible; leaving what can be READ alone keeps a row that predates the
+   * bound openable. See MAX_MEETING_DURATION_MINUTES for the number and
+   * `meetingSchema.durationMinutes` for why the read half stays open.
+   *
+   * An explicit null CLEARS the duration, which is how a mistyped one is
+   * withdrawn; absent means "leave it alone" -- the three-state patch semantics
+   * every other field here has, and `tasks.estimateMinutes`' exactly.
+   */
+  durationMinutes: z.number().int().positive().max(MAX_MEETING_DURATION_MINUTES).nullable().optional(),
   notes: nullableString.optional(),
   companyId: z.uuid().nullable().optional(), contactId: z.uuid().nullable().optional(),
   dealId: z.uuid().nullable().optional(), projectId: z.uuid().nullable().optional(),
@@ -4906,13 +4979,15 @@ export type ImportOutcome = z.infer<typeof importOutcomeSchema>;
  *
  * SPELLED HERE AND AS A DB CHECK, and schema.test.ts probes the exact edges so
  * the two cannot drift -- the belt-and-braces arrangement projects.color and
- * tasks.progress_pct use, NOT meetings.duration_minutes' zod-only one.
+ * tasks.progress_pct use, and which meetings.duration_minutes joined in v1.9.1.
  *
- * **THE DIFFERENCE IS NOT "NOTHING SUMS A MEETING'S DURATION" ANY MORE.** That
- * was the reason when this was written and v1.9.0's timesheet made it false:
- * both numbers are now summed into one week (api: services/timesheet.ts). What
- * still differs is that this bound is DEFINITIONAL and that column has none
- * available to it -- see below, and db/schema.ts on both columns.
+ * **THE DIFFERENCE IS NOT "NOTHING SUMS A MEETING'S DURATION" ANY MORE, AND IT
+ * IS NOT "THAT COLUMN HAS NO BOUND" EITHER.** Both of those stood here in turn
+ * and both are now false: v1.9.0's timesheet sums the two numbers into one week,
+ * and v1.9.1 bounded the other column. What still differs is where each bound
+ * comes from -- this one is DEFINITIONAL (`work_date` is one day), while
+ * MAX_MEETING_DURATION_MINUTES is argued from the period the value is reported
+ * in, because `occurred_at` is a start instant and offers no such day.
  *
  * ONE DAY, because `work_date` is one day. An entry is a quantity of work
  * attributed to a calendar date, and no date holds more than 24 hours -- so

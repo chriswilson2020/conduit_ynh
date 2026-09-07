@@ -10,7 +10,7 @@ import {
   mailAuthMethodSchema, mailOAuthProviderOf, documentTypeSchema, documentTypeFreezes,
   documentTypeNumbered,
   CONTACT_FIELD_CAPS, DEFAULT_TIME_ZONE, MAX_LOGO_DATA_URI_CHARS, MAX_TEMPLATE_BYTES,
-  MAX_TASK_ESTIMATE_MINUTES, MAX_TIME_ENTRY_MINUTES,
+  MAX_MEETING_DURATION_MINUTES, MAX_TASK_ESTIMATE_MINUTES, MAX_TIME_ENTRY_MINUTES,
   type DocumentType,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
@@ -1146,6 +1146,86 @@ describe("meetings schema (0008)", () => {
       expect(mailThreadIdIndex?.indexdef).toMatch(/\(mail_thread_id\)/i);
       expect(mailThreadIdIndex?.indexdef).toMatch(/WHERE.*mail_thread_id IS NOT NULL/i);
       expect(mailThreadIdIndex?.indexdef).not.toMatch(/UNIQUE/i);
+    });
+  }, 30000);
+
+  /**
+   * **THE EXACT EDGES (v1.9.1)**, `tasks_estimate_range`'s pattern and its
+   * reason: a bound narrowed or widened by one is invisible to every test that
+   * inserts a plausible number, and this is the number a week's total is read
+   * against.
+   *
+   * The upper edge is MAX_MEETING_DURATION_MINUTES, imported rather than
+   * restated, so the constant in @conduit/shared and the literal 10080 in the
+   * migration cannot drift into meaning different things.
+   *
+   * **AND 999999999 IS PROBED BY NAME**, because it is the specific figure
+   * Phase 10 Task 2 recorded as the exposure. A test that only probes
+   * `MAX + 1` would pass against a bound of a million.
+   */
+  it("enforces meetings_duration_range at the exact edges, and that edge is MAX_MEETING_DURATION_MINUTES", async () => {
+    expect(MAX_MEETING_DURATION_MINUTES).toBe(10080);
+    const company = await createCompany(handle.db, userId, { name: "Acme" });
+    const link = { ownerUserId: userId, companyId: company.id };
+
+    for (const durationMinutes of [1, MAX_MEETING_DURATION_MINUTES, null]) {
+      const [row] = await handle.db.insert(meetings)
+        .values({ title: "Kickoff", occurredAt, ...link, durationMinutes }).returning();
+      expect(row?.durationMinutes, `${String(durationMinutes)} was refused`).toBe(durationMinutes);
+    }
+    for (const durationMinutes of [0, -1, MAX_MEETING_DURATION_MINUTES + 1, 999999999]) {
+      await expect(
+        handle.db.insert(meetings).values({ title: "Kickoff", occurredAt, ...link, durationMinutes }),
+        `${String(durationMinutes)} was accepted`,
+      ).rejects.toMatchObject({ cause: { constraint_name: "meetings_duration_range" } });
+    }
+  });
+
+  /**
+   * **THE CONSTRAINT REACHES A DATABASE THAT ALREADY HAS MEETINGS IN IT**, which
+   * is the half the edge test above cannot see: it inserts into a database where
+   * the CHECK has always existed, and says nothing about the upgrade.
+   *
+   * The live install's `meetings` table was measured empty before this
+   * constraint was written (see db/schema.ts on `meetings_duration_range` for
+   * the catalogue reads), so what has to be proved here is not that a violating
+   * row survives -- none exists -- but that a POPULATED table migrates forward
+   * at all. `withPreMigrationDatabase` seeds meetings in the pre-constraint
+   * shape, including one at the exact edge, and then applies the real
+   * migrations: the moment `db/client.ts`'s boot-time migrate() has to survive.
+   */
+  it("adds the duration CHECK to a database that already holds meetings", async () => {
+    // "0024", the migration that adds the constraint, rather than "the newest
+    // one": withPreMigrationDatabase derives the cut from the real journal, so
+    // this keeps working unmodified once 0025 ships.
+    await withPreMigrationDatabase("0024", async (scratch) => {
+      const user = (await resolveUser(scratch.db, { username: "chris", email: null, fullName: null }));
+      const [company] = await scratch.db.insert(companies).values({ name: "Acme" }).returning();
+      // PIN THE PREMISE: the constraint really is absent here, or every
+      // assertion below would also pass against a fully-migrated database.
+      const before = await scratch.db.execute<{ conname: string }>(sql`
+        SELECT conname FROM pg_constraint WHERE conname = 'meetings_duration_range'
+      `);
+      expect(before).toEqual([]);
+
+      for (const durationMinutes of [45, MAX_MEETING_DURATION_MINUTES, null]) {
+        await scratch.db.insert(meetings).values({
+          title: "Kickoff", occurredAt: new Date("2026-09-01T09:00:00Z"),
+          ownerUserId: user.id, companyId: company?.id ?? "", durationMinutes,
+        });
+      }
+
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      const rows = await scratch.db.select({ d: meetings.durationMinutes }).from(meetings);
+      expect(rows.map((r) => r.d).sort((a, b) => (a ?? 0) - (b ?? 0)))
+        .toEqual([null, 45, MAX_MEETING_DURATION_MINUTES]);
+      // And the constraint is live over them afterwards.
+      await expect(scratch.db.insert(meetings).values({
+        title: "Too long", occurredAt: new Date("2026-09-01T09:00:00Z"),
+        ownerUserId: user.id, companyId: company?.id ?? "",
+        durationMinutes: MAX_MEETING_DURATION_MINUTES + 1,
+      })).rejects.toMatchObject({ cause: { constraint_name: "meetings_duration_range" } });
     });
   }, 30000);
 
