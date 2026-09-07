@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Meeting, MeetingAttendee, MeetingDetail, Task } from "@conduit/shared";
+import { MAX_MEETING_DURATION_MINUTES } from "@conduit/shared";
 import {
   useArchiveMeeting,
   useContact,
@@ -517,9 +518,14 @@ function MeetingForm({ links, onDone }: { links: RecordLinks; onDone: () => void
         </label>
         <label className="flex w-28 flex-col gap-1 text-xs font-medium text-slate-500 max-md:w-full">
           Minutes
+          {/* `max` is the same bound meetingInputShape and
+              meetings_duration_range carry, and it is a HINT rather than the
+              gate: a typed value ignores it. buildMeetingInput is what refuses
+              the number, with a sentence naming the limit. */}
           <Input
             type="number"
             min={1}
+            max={MAX_MEETING_DURATION_MINUTES}
             step={1}
             data-testid="meeting-duration"
             value={draft.durationMinutes}
