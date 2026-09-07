@@ -47,17 +47,43 @@ import type { BrowserContext, Locator, Page } from "@playwright/test";
 
 const IPHONE_13 = devices["iPhone 13"];
 
-/** The organisation's zone is the install default, UTC, and this suite never
- * changes it -- so the week is UTC's, computed the way `isoWeekRange` computes it
- * rather than imported from it, so a broken helper cannot make its own journey
- * agree with it. */
-function mondayOf(now: Date): Date {
-  const day = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
-  const back = (new Date(day).getUTCDay() + 6) % 7;
-  return new Date(day - back * 86_400_000);
+/**
+ * **THE ORGANISATION'S ZONE IS READ, NOT ASSUMED, AND CI TAUGHT THIS FILE THAT.**
+ *
+ * The first version took the install default (UTC) for granted.
+ * `e2e/documents.spec.ts` sets `org_profile.time_zone` to **Europe/Amsterdam** as
+ * part of its own journey, and it sorts before this file — so by the time these
+ * tests ran the week's instant bounds were `[Sun 22:00Z, Sun 22:00Z)`, and the
+ * meeting placed at `Sunday 23:59Z` to be "later this week" was in the NEXT one.
+ * CI failed it three times with the not-yet clause simply absent.
+ *
+ * That setting is GLOBAL AND ANOTHER FILE OWNS IT, and this journey must not
+ * fight for it: writing UTC back here would make `documents.spec.ts` flaky the
+ * moment the two files run in parallel (they do, outside CI, where `workers` is
+ * the core count). So the zone is fetched and every fixture is derived from it.
+ *
+ * `todayInZone` is computed here with `Intl` rather than imported from
+ * `@conduit/shared`, deliberately: an independent oracle, so a broken helper
+ * cannot make its own journey agree with it.
+ */
+function todayIn(timeZone: string, now: Date): string {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone, year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(now);
+  const part = (type: string): string => parts.find((p) => p.type === type)?.value ?? "";
+  return `${part("year")}-${part("month")}-${part("day")}`;
 }
 
-const iso = (at: Date): string => at.toISOString().slice(0, 10);
+/** The Monday of `day`'s week, and the days either side of it, as `YYYY-MM-DD`.
+ * UTC arithmetic on a naive date: no zone is involved in counting pages of a
+ * calendar, which is `nextDay`'s rule in @conduit/shared. */
+function shiftDay(day: string, days: number): string {
+  return new Date(Date.parse(`${day}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);
+}
+
+function mondayOfDay(day: string): string {
+  return shiftDay(day, -((new Date(`${day}T00:00:00Z`).getUTCDay() + 6) % 7));
+}
 
 test.describe.serial("Timesheet, on a phone", () => {
   const runId = Date.now().toString(36);
@@ -77,27 +103,26 @@ test.describe.serial("Timesheet, on a phone", () => {
   let projectId = "";
   let otherProjectId = "";
 
-  // The week under test is the one containing NOW; both instants below are inside
-  // it. One minute after the week begins is in the past and one minute before it
-  // ends is in the future, for every instant of the week except its own first and
-  // last minute -- about two minutes in ten thousand, which CI's two retries would
-  // have to lose three times running.
-  const NOW = new Date();
-  const MONDAY = mondayOf(NOW);
-  const SUNDAY = new Date(MONDAY.getTime() + 6 * 86_400_000);
-  const STARTED = new Date(MONDAY.getTime() + 60_000).toISOString();
-  const ARRANGED = new Date(SUNDAY.getTime() + 86_340_000).toISOString();
+  /**
+   * The organisation's today and its week, filled in from the fetched zone.
+   *
+   * **THE TWO FIXTURE INSTANTS ARE CHOSEN SO NEITHER CLOCK NOR ZONE CAN MOVE
+   * THEM.** The past meetings are at `now`, which is inside the organisation's
+   * current week by construction (it IS now) and is in the past by the time the
+   * server evaluates `occurred_at <= now()`. The arranged meeting is next
+   * WEDNESDAY at 06:00Z: this week ends at the latest at `Sunday+1d 12:00Z`
+   * (UTC−12 is the furthest any zone runs behind), so next Wednesday is always in
+   * the future, and it is inside next week's own bounds for every zone tzdata has.
+   * The first draft put it at "Sunday 23:59Z" and that was only safe in UTC.
+   */
+  let today = "";
+  let weekFrom = "";
+  let nextWeekFrom = "";
+  let arranged = "";
+  const startedAt = new Date().toISOString();
 
   test.beforeAll(async ({ browser }, testInfo) => {
-    // **UTC, TO MATCH THE ORGANISATION'S OWN CLOCK.** `org_profile.time_zone`
-    // defaults to UTC and this suite never changes it, so pinning the browser
-    // there makes "this meeting is in the past" a statement about the fixture
-    // rather than about where the runner happens to be. The divergence that
-    // matters -- a browser in another zone asking for a different week from the
-    // organisation's -- is a DECISION rather than a rendering, and it is pinned
-    // where the decision lives (web: pages/timesheet-lib.test.ts's weekAt cases,
-    // which run Amsterdam against UTC across a midnight).
-    context = await browser.newContext({ ...IPHONE_13, timezoneId: "UTC" });
+    context = await browser.newContext({ ...IPHONE_13 });
     page = await context.newPage();
     attemptId = `${runId}x${testInfo.retry}`;
     projectName = `Timesheet ${attemptId}`;
@@ -157,10 +182,21 @@ test.describe.serial("Timesheet, on a phone", () => {
     await expect(page.getByTestId("time-entry-dialog")).toHaveCount(0);
   }
 
-  test("creates the two projects this journey runs on", async () => {
+  test("reads the organisation's clock, and creates the two projects this journey runs on", async () => {
+    await page.goto("/");
+    // THE ZONE THE REPORT WILL USE, from the same field the page reads. Another
+    // file owns this setting (see the header); this one adapts to it.
+    const profile = await page.request.get("/api/org-profile");
+    expect(profile.status()).toBe(200);
+    const timeZone = ((await profile.json()) as { timeZone: string }).timeZone;
+    expect(timeZone, "the organisation must have a zone").not.toBe("");
+    today = todayIn(timeZone, new Date());
+    weekFrom = mondayOfDay(today);
+    nextWeekFrom = shiftDay(weekFrom, 7);
+    arranged = `${shiftDay(nextWeekFrom, 2)}T06:00:00.000Z`;
+
     // Posted rather than typed: creating a project is e2e/tasks.spec.ts's journey,
     // and here it is the fixture rather than the subject.
-    await page.goto("/");
     projectId = (await create("/api/projects", { name: projectName })).id;
     otherProjectId = (await create("/api/projects", { name: otherProjectName })).id;
   });
@@ -209,7 +245,7 @@ test.describe.serial("Timesheet, on a phone", () => {
   test("refuses to log an hour until it has been told whether it is billable", async () => {
     await page.getByTestId("log-time").click();
     await expect(page.getByTestId("time-entry-dialog")).toBeVisible();
-    await page.getByTestId("entry-date").fill(iso(MONDAY));
+    await page.getByTestId("entry-date").fill(today);
     await page.getByTestId("entry-minutes").fill("90");
     await page.getByTestId("entry-description").fill(entryText);
     await page.getByTestId("entry-link-project").click();
@@ -229,7 +265,7 @@ test.describe.serial("Timesheet, on a phone", () => {
     await page.getByTestId("entry-save").click();
     await expect(page.getByTestId("time-entry-dialog")).toHaveCount(0);
 
-    const monday = page.getByTestId(`timesheet-day-${iso(MONDAY)}`);
+    const monday = page.getByTestId(`timesheet-day-${today}`);
     await expect(monday.getByText(entryText)).toBeVisible();
     await expect(monday.getByTestId("day-total")).toHaveText("1h 30m");
     await expect(row(entryText).getByTestId("row-billable")).toBeVisible();
@@ -246,11 +282,11 @@ test.describe.serial("Timesheet, on a phone", () => {
    * it the week would pass every assertion above.
    */
   test("splits billable from the rest", async () => {
-    await logTime(iso(MONDAY), "30", adminText, "no", projectName, projectId);
+    await logTime(today, "30", adminText, "no", projectName, projectId);
     await expect(page.getByTestId("counted-summary")).toContainText("2h counted");
     await expect(page.getByTestId("billable-summary"))
       .toHaveText("1h 30m of the 2h logged by hand is billable, across 1 entry.");
-    await expect(page.getByTestId(`timesheet-day-${iso(MONDAY)}`).getByTestId("day-total"))
+    await expect(page.getByTestId(`timesheet-day-${today}`).getByTestId("day-total"))
       .toHaveText("2h");
   });
 
@@ -261,9 +297,11 @@ test.describe.serial("Timesheet, on a phone", () => {
    * Task 2 built three buckets and put the two uncounted ones into the same string
    * as the figure, on the reasoning that a page cannot drop a clause it never had
    * -- and said in as many words that nothing could test it until a page existed.
-   * Here are all three: a meeting with a duration in the past (it counts), one with
-   * no duration at all (it does not, and the sentence says so), and one arranged
-   * for the end of the week (it does not, for a different reason).
+   * Two of the three are here: a meeting with a duration that has happened (it
+   * counts), and one with no duration at all (it does not, and the sentence says
+   * so). The third -- a meeting that has not happened -- is asserted on NEXT week
+   * in the test below, because an instant that is reliably both in the future AND
+   * inside the current week does not exist for every clock and every zone.
    *
    * Both the SENTENCE and the ROWS are asserted. A page could render the sentence
    * and show no rows, or show the rows and print `countedMinutes` alone; neither is
@@ -273,11 +311,11 @@ test.describe.serial("Timesheet, on a phone", () => {
    * journey and is driven there, and typing one here would add that form's own
    * `datetime-local` conversion to a test about somebody else's arithmetic.
    */
-  test("counts a meeting, and says out loud which meetings it could not count", async () => {
+  test("counts a meeting, and says out loud the one it could not count", async () => {
     for (const [title, durationMinutes, occurredAt] of [
-      [countedMeeting, 45, STARTED],
-      [untimedMeeting, null, STARTED],
-      [futureMeeting, 60, ARRANGED],
+      [countedMeeting, 45, startedAt],
+      [untimedMeeting, null, startedAt],
+      [futureMeeting, 60, arranged],
     ] as const) {
       await create("/api/meetings", { title, occurredAt, durationMinutes, projectId });
     }
@@ -289,10 +327,8 @@ test.describe.serial("Timesheet, on a phone", () => {
     // 2h of entries plus the one counted meeting.
     await expect(summary).toContainText("2h 45m counted");
     await expect(summary).toContainText("45m across 1 meeting");
-    // THE CLAUSE. Both halves, in the sentence the operator reads.
-    await expect(summary).toContainText("Not counted:");
-    await expect(summary).toContainText("1 meeting with no recorded length");
-    await expect(summary).toContainText("1 meeting that has not happened yet");
+    // THE CLAUSE, in the sentence the operator reads.
+    await expect(summary).toContainText("Not counted: 1 meeting with no recorded length.");
     // Meetings are in neither half of the billable split, and it says so.
     await expect(page.getByTestId("billable-summary")).toHaveText(
       "1h 30m of the 2h logged by hand is billable, across 1 entry. Meetings carry no "
@@ -303,9 +339,39 @@ test.describe.serial("Timesheet, on a phone", () => {
     // operator can look at rather than a number to take on trust.
     await expect(row(untimedMeeting).getByTestId("row-uncounted")).toHaveText("no recorded length");
     await expect(row(untimedMeeting).getByTestId("row-minutes")).toHaveText("—");
-    await expect(row(futureMeeting).getByTestId("row-uncounted")).toHaveText("has not happened yet");
     await expect(row(countedMeeting).getByTestId("row-minutes")).toHaveText("45m");
     await expect(row(countedMeeting).getByTestId("row-uncounted")).toHaveCount(0);
+    // The arranged meeting is next week's, and it is not in this week at all.
+    await expect(row(futureMeeting)).toHaveCount(0);
+  });
+
+  /**
+   * **THE THIRD BUCKET: A MEETING THAT HAS NOT HAPPENED, REPORTED AND NOT
+   * COUNTED.** `occurred_at` is free in both directions -- Phase 5 decided that
+   * noting a meeting you have just had and one you have just arranged are the same
+   * act -- and no column distinguishes them, so a week holds its own arranged
+   * meetings. Counting them would answer "where did the week go" with work nobody
+   * has done. The clause says so, and the row says which.
+   */
+  test("reports next week's arranged meeting without counting it", async () => {
+    await page.getByTestId("week-next").click();
+
+    const summary = page.getByTestId("counted-summary");
+    await expect(summary).toContainText("0m counted");
+    await expect(summary).toContainText("Not counted: 1 meeting that has not happened yet.");
+    await expect(row(futureMeeting).getByTestId("row-uncounted")).toHaveText("has not happened yet");
+    // It HAS a recorded length and still does not count -- so the two uncounted
+    // buckets are told apart by their REASON rather than by a missing figure.
+    await expect(row(futureMeeting).getByTestId("row-minutes")).toHaveText("1h");
+    // No day of that week has a figure, which is what "0m counted" means read a
+    // second way. (WHICH day the meeting is filed under is the organisation's
+    // clock's business and is asserted in the service tests, where the zone can be
+    // set; at UTC+14 an 06:00Z instant is the same calendar day and at UTC−12 it
+    // is the one before.)
+    await expect(page.getByTestId("day-total").filter({ hasNotText: "—" })).toHaveCount(0);
+
+    await page.getByTestId("week-today").click();
+    await expect(summary).toContainText("2h 45m counted");
   });
 
   /**
@@ -393,10 +459,10 @@ test.describe.serial("Timesheet, on a phone", () => {
    */
   test("narrows the week to one record, entries and meetings together", async () => {
     await create("/api/meetings", {
-      title: elsewhereMeeting, occurredAt: STARTED, durationMinutes: 90, projectId: otherProjectId,
+      title: elsewhereMeeting, occurredAt: startedAt, durationMinutes: 90, projectId: otherProjectId,
     });
     await page.goto("/timesheet");
-    await logTime(iso(MONDAY), "20", elsewhereText, "yes", otherProjectName, otherProjectId);
+    await logTime(today, "20", elsewhereText, "yes", otherProjectName, otherProjectId);
 
     // Unfiltered: both projects' rows are on the page.
     await expect(row(elsewhereText)).toBeVisible();

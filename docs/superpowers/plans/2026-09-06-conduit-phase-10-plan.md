@@ -1038,6 +1038,20 @@ to is a measurement of the whole suite. Every figure is now read through the pag
 record filter, narrowed to the journey's own project, and the filter's contrast is a SECOND
 project asserted by row rather than by total.
 
+**AND CI CAUGHT A SECOND ONE, WHICH IS A FINDING ABOUT THE SUITE RATHER THAN THIS FILE.**
+The next attempt failed with the not-yet-happened clause simply absent, because
+**`e2e/documents.spec.ts` sets `org_profile.time_zone` to Europe/Amsterdam** as part of its
+own journey and sorts before this one. The week's instant bounds are then
+`[Sun 22:00Z, Sun 22:00Z)`, and the meeting placed at "Sunday 23:59Z, later this week" was
+in the NEXT week. **That setting is global and another file owns it**, and this journey may
+not fight for it — writing UTC back would make `documents.spec.ts` flaky the moment the two
+run in parallel, which they do outside CI. So the zone is FETCHED and every fixture derives
+from it: the past meetings sit at `now` (inside the current week by construction, past by
+the time the server evaluates), and the arranged one is next WEDNESDAY, which is in the
+future for every clock and inside next week's bounds for every zone. Verified on the dev
+server against a real browser at **UTC, Europe/Amsterdam (CI's own value), UTC+14 and
+UTC−11**: 14 passed in each.
+
 ## Task 5: The timer — LAST, AND THE RISK IS NOT THE TIMING
 
 - [ ] **`minutes <= 1440` MEANS THE 62-HOUR WEEKEND CANNOT BE STORED.** The bound is one day
