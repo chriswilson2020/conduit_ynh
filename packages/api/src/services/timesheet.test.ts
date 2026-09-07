@@ -919,6 +919,45 @@ describe("timesheetDays: the week, row by row", () => {
   });
 
   /**
+   * **THE STROKE OF MIDNIGHT, ON THE LIST -- AND THIS TEST EXISTS BECAUSE THE
+   * MUTATION SURVIVED WITHOUT IT.** Turning the day list's
+   * `occurred_at < endExclusive` into `<=` was green across every other case in
+   * this file, for the reason Task 2 recorded when the identical mutation
+   * survived on the AGGREGATE: a meeting at 00:30 local is comfortably inside one
+   * week and no assertion can tell the two spellings apart. A meeting at exactly
+   * the first instant of the NEXT week belongs to that week and to that week only,
+   * and under `<=` it is listed in both -- so the same hour appears twice on the
+   * one surface built to let an operator check the figure.
+   *
+   * The instants are written out rather than computed, and they are the ones
+   * `zonedDayRange`'s own tests assert literally: this must fail if the boundary
+   * MOVES, not merely if the query and the helper agree about a boundary that has
+   * drifted.
+   */
+  it("lists a meeting on the stroke of midnight in the later week only", async () => {
+    await setOrgTimeZone("Europe/Amsterdam");
+    // Monday the 7th begins at 22:00Z on the 6th; Monday the 14th at 22:00Z on
+    // the 13th. One meeting at each instant.
+    await meeting("2026-09-06T22:00:00.000Z", 30);
+    await meeting("2026-09-13T22:00:00.000Z", 45);
+
+    const current = await timesheetDays(handle.db, WEEK, {}, NOW);
+    const next = await timesheetDays(
+      handle.db, { from: "2026-09-14", to: "2026-09-20" }, {},
+      new Date("2026-09-21T12:00:00.000Z"),
+    );
+
+    // The first instant of the week is IN it; the first instant of the NEXT week
+    // is not.
+    expect(current.days.flatMap((day) => day.rows).map((row) => [row.day, row.minutes]))
+      .toEqual([["2026-09-07", 30]]);
+    expect(next.days.flatMap((day) => day.rows).map((row) => [row.day, row.minutes]))
+      .toEqual([["2026-09-14", 45]]);
+    // ...and neither meeting is in two weeks at once.
+    expect(listedMinutes(current) + listedMinutes(next)).toBe(75);
+  });
+
+  /**
    * THE RECORD NAMES COME WITH THE ROWS, INCLUDING AN ARCHIVED RECORD'S. An
    * entry may legitimately name a project that has since been completed
    * (services/time-entries.ts's "existence, not activeness" rule), and a page

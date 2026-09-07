@@ -733,10 +733,10 @@ branch runs end to end.
 
 ### What Task 2 built for this task, and the three rules that come with it
 
-- [ ] **THE SUM IS ALREADY WRITTEN.** `GET /api/timesheet?from=&to=` →
+- [x] **THE SUM IS ALREADY WRITTEN.** `GET /api/timesheet?from=&to=` →
       `services/timesheet.ts`'s `timesheetTotals`. It is summed in SQL, COALESCEd and cast;
       **do not compute a total on the page.** The bullet below is answered, not pending.
-- [ ] **RENDER `timesheetSummary`, NOT `countedMinutes`.** The uncounted meetings — the ones
+- [x] **RENDER `timesheetSummary`, NOT `countedMinutes`.** The uncounted meetings — the ones
       with no recorded length and the ones that have not happened yet — are in the same string
       as the figure precisely so a page cannot print the figure without them. A page that
       renders `countedMinutes` and calls it the week's total is the failure the spec names,
@@ -745,29 +745,298 @@ branch runs end to end.
       wants the numbers laid out rather than a sentence, the uncounted ones are not optional
       furniture — see `settings-data-lib.test.ts` for the shape of a test that reads a page off
       disk and fails if it typed out what it should have derived.
-- [ ] **IF YOU ADD A CONTACT FILTER, USE AN EXISTS AND NOT A JOIN.** `listMeetings` widens its
+- [x] **IF YOU ADD A CONTACT FILTER, USE AN EXISTS AND NOT A JOIN.** `listMeetings` widens its
       contact filter to attendance, and as a JOIN to `meeting_attendees` a meeting with three
       attendees is summed three times. The aggregate deliberately has no join; a mutation
       adding one is killed by a test, and that test is why it is worth reading before editing
       the query.
-- [ ] The record filters and the billable split are still this task's, and the five record
+- [x] The record filters and the billable split are still this task's, and the five record
       indexes with them. `meetings(occurred_at)` was measured and not built — see Task 2's
       figures; if your filters change the query's shape, that index joins yours.
 
-- [ ] **A list, not a weekly grid.** The grid is the classic and is the hardest thing in this
+- [x] **A list, not a weekly grid.** The grid is the classic and is the hardest thing in this
       product to operate on a phone, which is where Chris is. No approval workflow — single user.
-- [ ] It answers "where did the week go", summing entries and meetings without double-counting.
-- [ ] **SUM IN SQL, NOT OVER A PAGE.** `listTimeEntries` caps at 100 rows, so a JavaScript sum
+- [x] It answers "where did the week go", summing entries and meetings without double-counting.
+- [x] **SUM IN SQL, NOT OVER A PAGE.** `listTimeEntries` caps at 100 rows, so a JavaScript sum
       over `items` is correct until somebody logs 101 entries in a week and is then silently
       SHORT — this phase's own failure mode, arriving through the one number the phase exists to
       produce. `COALESCE` it too: `SUM` over no rows is NULL and an empty week is 0 hours, not an
       absent one. Task 1 wrote and then deleted such a function rather than ship one with no
       reader; the argument is left at the foot of `services/time-entries.ts`.
-- [ ] **The five record foreign keys on `time_entries` are deliberately unindexed** (0021 builds
+- [x] **The five record foreign keys on `time_entries` are deliberately unindexed** (0021 builds
       only `(work_date DESC, id DESC)`, for the list's own ordering and cursor). Task 4 is the
       first task with readers for them; build them then, with a measurement.
-- [ ] **A `billable` filter and an `ownerUserId` filter are deliberately absent** from
+- [x] **A `billable` filter and an `ownerUserId` filter are deliberately absent** from
       `timeEntryListFiltersSchema` for the same reason. The billable split is this task's.
+
+### Task 4 as built — `/timesheet`, and NO MIGRATION AT ALL
+
+**A list, day by day, one column, at a phone width.** `GET /api/timesheet` gains four
+record filters and a billable split; `GET /api/timesheet/days` is new and answers the week
+ROW BY ROW; `pages/timesheet.tsx` renders both, `pages/timesheet-lib.ts` holds every
+decision, and `/timesheet` is the ninth nav destination. **`drizzle/` is untouched** — no
+column, no index, no journal entry, no stamper run — so this task changes no schema and the
+export's `information_schema` column guard has nothing new to cover.
+
+**THE ROW LIST IS THE PART THE PLAN DID NOT ASK FOR, AND IT IS WHY THE PAGE IS HONEST.**
+The summary says "and 2h 30m across 3 meetings. Not counted: 2 meetings with no recorded
+length" — and a page listing only `time_entries` under that sentence gives the reader no
+way to check a third of the figure, and nothing at all to look at for the uncounted two.
+So `timesheetDays` reads BOTH tables over the same range with the same predicates, and
+every row says whether it counted and why not. `timesheetWeekSchema` refuses a payload
+where a day's figure is not its own rows, where a day falls outside the range, or where a
+row is uncounted for no stated reason.
+
+**THE BUCKETS ARE NOT DECIDED TWICE.** `meetingBuckets(now)` returns the two `sql`
+expressions and the row list SELECTs them back as booleans, rather than comparing
+`occurredAt` to `now` in JavaScript with its own choice of `<` or `<=`. A test seeds one of
+everything — counted, unmeasured, not-yet, archived on both sides, rows outside the range —
+and holds the list against the aggregate bucket for bucket.
+
+### The four rules, and where each is now held
+
+| the rule | what holds it |
+|---|---|
+| render `timesheetSummary`, not `countedMinutes` | `pages/timesheet-render.test.ts` — reads the page off disk, refuses nine figure names, refuses `totals.data.countedMinutes` **and its destructured form**, and refuses every clause of both sentences as literal text |
+| an unmeasured or not-yet meeting must be visible | the sentence, AND a row carrying the same words, AND an e2e that asserts both |
+| sum in SQL and COALESCE it | neither the page nor its lib may `reduce` or add minutes — the same source guard — and a day's figure comes off the payload |
+| the week is the ORGANISATION's calendar | `weekAt` goes through `todayInZone(org.timeZone)`, never `todayLocalIso`; a unit case runs Amsterdam against UTC across `23:30Z` and gets two DIFFERENT WEEKS |
+
+### The billable split, and the clause that stops it reading as a share of the week
+
+`billable` has had no default since Task 1 and **until this task nothing in the product
+could read it back** — the spec says billable time "feeds reporting and export, not
+billing", and with no report it was a write-only column the operator is forced to answer on
+every entry. `timesheetTotals` now carries `billableEntryMinutes` and `billableEntryCount`,
+out of the SAME aggregate as the thing they split (a `FILTER` clause, not a second query),
+and `timesheetTotalsSchema` refuses a half larger than its whole.
+
+**IT IS A SENTENCE FOR `timesheetSummary`'S REASON.** "3h billable" printed beside a 7h 30m
+week invites `7h 30m − 3h = 4h 30m non-billable`, which is wrong by exactly the meetings:
+`meetings` has no billable column, so their minutes are in NEITHER half.
+`timesheetBillableSummary` says so in the same string, and drops the clause only when there
+are no meetings for it to be about.
+
+**AND THE FORM ASKS RATHER THAN PRE-TICKING.** `TimeEntryDraft.billable` is
+`boolean | null` and `buildTimeEntryInput` refuses the null: a pre-ticked checkbox would
+put the guess the column refuses back one layer out, where the database cannot reach it.
+
+### FOUR RECORD FILTERS, NOT FIVE — the plan says "the record filters" and there are five links
+
+**`taskId` IS REFUSED, AND THAT IS THE DECISION.** `meetings` carries four record links and
+`task_id` is not one of them, so a task-filtered timesheet answers "0m across 0 meetings"
+for **every task that has ever existed** — an uncounted-hours silence whose cause (no
+meeting CAN name a task) appears nowhere on the page. And Task 3 already answers the
+question better: `GET /api/tasks/:id/effort` gives a task's booked minutes *against its
+estimate*. A second, weaker answer on another surface is how two numbers about one thing
+start disagreeing. The web-side type is narrowed to four kinds, so a task filter does not
+compile.
+
+The contact arm on the meetings side is an **EXISTS**, widened to attendance exactly as
+`listMeetings` is — Task 2 wrote that hazard down for this task by name, and a mutation
+turning it into a `leftJoin(meetingAttendees)` is killed by "counts a filtered meeting once
+however many attendees it had", on the aggregate and on the row list.
+
+### `["timesheet"]`, AND TASK 2'S ROUTE COMMENT WAS WRONG
+
+`routes/timesheet.ts` said a client "refetches it on the `["time-entries"]` and
+`["meetings"]` hints the two mutators already publish". **That cannot work.** A TanStack
+query has ONE key: nested under `["meetings"]` the week goes stale after every entry write,
+and under `["time-entries"]` after every meeting. The report reads two tables, so it needs a
+key of its own — `publishTimeEntryHint` and `publishMeetingHint` both publish
+`["timesheet"]` now, and both have a test for it.
+
+### The phone, and what was rejected
+
+One column. Heading row, week controls, the two sentences, then seven day sections. Every
+control is at the 44px floor; the two week arrows are `min-h-11 min-w-11` at every width
+because the glyph inside them is a few pixels wide, and both carry an `aria-label`. Rows
+are `max-md:min-h-11` and wrap, the label's `max-md:basis-[calc(100%-5rem)]` forcing the
+break — my-tasks.tsx's measurement one row over. An e2e case reads
+`scrollWidth - clientWidth` at 390px and asserts the page does not scroll sideways, which
+is the one thing a list is supposed to buy over a grid.
+
+- **REJECTED: the weekly grid.** The spec's own decision, and its reason.
+- **REJECTED: a day-of-week strip (M T W T F S S) as the navigation.** It is the grid's top
+  edge under another name; seven targets across a 327px content box is 46px each, at the
+  floor with nothing spare; and it answers "which day", which scrolling answers better.
+- **REJECTED: a five-way segmented control for the filter.** The record rail's five labels
+  MEASURE 349px inside a 342px box at 390px (`e2e/mobile.spec.ts`), which is why that strip
+  had to become its own scroll container. Four wrapping buttons instead.
+- **REJECTED: a Time tab on the record rail.** Phase 9's Task 4 declined a SIXTH tab against
+  that measurement; this would be a seventh. A record's hours are reached by narrowing this
+  page instead, which costs no width on any record page.
+- **REJECTED: a fifth bottom-bar tab.** `PRIMARY_NAV_IDS` is four by spec and the fifth slot
+  is More. The timesheet joins the More sheet and the sidebar beside Pipelines, Projects and
+  the Gantt; `e2e/mobile.spec.ts`'s overflow journey now walks five.
+- **REJECTED: editing a meeting's minutes from this page.** Two front doors for
+  `duration_minutes` would give the correction this phase relies on — archive the meeting,
+  log the hour by hand — two front doors as well.
+
+**THE FORM HOLDS A LIST OF LINKS, NOT ONE**, and that is the spec's central example rather
+than a flourish: the rule is at-least-one and not exactly-one *because* "an hour can
+legitimately belong to a project AND the deal it came from". A single-link form would have
+silently CLEARED the others on every edit, because the patch sends all five columns —
+`timeEntryUpdateInputSchema` treats an absent field as "leave it alone", so the nulls are
+what clear a link the operator removed and they have to be spelled out.
+
+### THE INDEXES: MEASURED, NONE BUILT, AND ONE FIGURE SAYS THE PLAN WAS WRONG
+
+The plan assigns "the five record indexes" here because this is the first task with readers
+for them. There now are readers, so they were measured — dev server, database built by the
+real migrations, seven years of rows across 199 projects with an eighth of them on the
+project being filtered for, a seventh archived, a fifth of meetings untimed. Warm,
+`EXPLAIN (ANALYZE, BUFFERS)` on the four shapes the page issues, without and then with
+partial indexes on every record column and on `meetings(occurred_at)`:
+
+```
+  5,000 entries / 5,000 meetings (11 entries, 12 meetings in the week)
+    totals, entries, unfiltered      0.034ms /  15 buf  ->  0.031ms /  15
+    totals, entries, one project     0.053ms /  18      ->  0.051ms /  10
+    totals, meetings, unfiltered     0.441ms /  81      ->  0.028ms /  14
+    rows,   entries + 5 joins        0.182ms /  21      ->  0.202ms /  21
+    rows,   meetings + 4 joins       0.532ms /  87      ->  0.166ms /  20
+
+  200,000 / 200,000 (468 entries, 496 meetings in the week; 58 and 61 on the project)
+    totals, entries, unfiltered      0.52ms  / 552      ->  0.38ms  / 552
+    totals, entries, one project     0.41ms  / 555      ->  0.72ms  /  87
+    totals, meetings, unfiltered    21.6ms   / 3,226    ->  0.39ms  / 499
+    rows,   entries + 5 joins        1.56ms  / 558      ->  1.36ms  / 558
+    rows,   meetings + 4 joins      16.8ms   / 3,390    ->  0.99ms  / 505
+```
+
+**THE FIVE RECORD INDEXES DO NOT HELP THIS READER, AND AT 200k THEY MAKE IT SLOWER.** The
+project-filtered aggregate goes 0.41ms → 0.72ms with the index and the row list 0.39ms →
+0.84ms, on a sixth of the buffers. Repeated three times, consistently: 0.38/0.45/0.47
+against 0.84/0.87/1.04. The cause is structural rather than a planner accident, which is
+why it is written down as a conclusion: **the timesheet is DATE-RANGED FIRST**,
+`time_entries_work_date_idx` (0021) already exists and already reduces the table to one
+week, and the record predicate is then a filter over a few hundred rows — cheaper than a
+second index scan plus a BitmapAnd plus a heap fetch. An index earns its place when the
+record is the SELECTIVE half, and on this surface the date always is. **`taskEffort` is the
+one reader whose record predicate is all it has, which is exactly why Task 3's figures for
+the same column point the other way.**
+
+**`meetings(occurred_at)` IS THE ONE THAT WOULD MATTER, AND IT IS STILL NOT BUILT.** At 200k
+it turns two whole-table scans per page open into index scans. At 5,000 meetings — a decade
+of heavy single-operator use — the page's two meeting queries cost 0.97ms together and
+would cost 0.19ms, on a request that has already spent a network round trip. That is Task
+2's decision against the same evidence at the same scale, and one more caller does not
+entitle this task to a different answer. **It now has THREE readers waiting for it**
+(`listMeetings` since Phase 5, plus both halves of this report), so it is the first index
+anybody should build the day that table gets big.
+
+**THE INSTRUMENT LIED FIRST AND SAID SO.** Its first draft spread rows with `g % 199`,
+which gives the filtered project one row in 199 — about 25 of 5,000, over seven years, so
+**none in the measured week**. The "filtered" queries were measuring a project with nothing
+on it and came back instantly. Caught only because the probe PRINTS the row count it is
+about to measure: Task 3's lesson used rather than repeated.
+
+### THREE THINGS THE SPEC AND THE PLAN ARE WRONG OR SILENT ABOUT
+
+**1. A ZOD `.refine` RUNS EVEN WHEN THE OBJECT'S OWN FIELDS FAILED, AND IT IS HANDED THE RAW
+VALUE.** Measured on the deploy target, zod 4.4.3: `z.object({ from: z.iso.date(), … })
+.refine(fn)` called `fn` with `{ from: "2026-09" }` **after** `from` had produced an
+`invalid_format` issue, and a chained second refine ran too. So the rows route's span check
+— which calls `calendarDaySpan`, and that THROWS on anything that is not a calendar day —
+turned a 400 into a **500** for a request the field validators had already refused. Found by
+its own route test, closed with an `isCalendarDay` guard. **This is general, not this
+route's quirk: any `.refine` in this codebase that does more than compare already-parsed
+primitives can be handed rubbish, and one that throws converts a 4xx into a 5xx.** Recorded
+rather than audited in passing.
+
+**2. AN ENTRY DATED IN THE FUTURE COUNTS AND A MEETING DATED IN THE FUTURE DOES NOT, AND
+NOTHING SAYS SO.** `work_date` admits any day in either direction (its own comment argues
+why), and `timesheetTotals`' entries query has no `now` in it — so an hour typed against
+Friday is in Wednesday's total. Task 2's meeting half deliberately excludes the future,
+because `occurred_at` is free in both directions and no column distinguishes "had" from
+"arranged". Both readings are defensible on their own and the ASYMMETRY is inherited rather
+than chosen here; nothing in the spec or the plan notices it. It is left alone deliberately
+— excluding future entries would silently drop hours somebody typed on purpose, which is
+this phase's failure mode — and the day list makes such an entry visible within the week.
+**A decision for Chris if he wants them to agree.**
+
+**3. THE PLAN'S "Task 4 is the first task with readers for [the record foreign keys]; build
+them then" IS AN INSTRUCTION TO BUILD SOMETHING THAT MAKES THE READER SLOWER.** See the
+figures above. The premise was already corrected once by Task 3 (`taskEffort` arrived a task
+early); what the measurement adds is that the premise is wrong in the other direction too —
+this reader's record predicate is never the selective half.
+
+### Mutation evidence
+
+**Sixty-six mutations plus a control, watched GREEN first.** Sixty-two killed on the first
+pass. Of the four that survived: one was a **bad instrument**, re-aimed and killed; one is
+an **equivalent mutant**; one is **green by design** and now says so in the source; and
+**ONE WAS REAL and is closed**. The harness reads vitest's exit status from `spawnSync`'s
+`status` **before any output is piped anywhere** (Phase 9 lost a result to a `| tail`) and
+refuses to edit unless its search string occurs **exactly once** in the target file — none
+were refused this time.
+
+**THE REAL SURVIVOR, AND IT IS THE ONE TASK 2 ALREADY PAID FOR ONCE.** Turning the DAY
+LIST's `occurred_at < endExclusive` into `<=` was green across the whole file. It is the
+identical mutation Task 2 recorded surviving on the AGGREGATE, arriving on the second query
+built over the same range — a meeting at 00:30 local cannot tell the two spellings apart,
+and every fixture in the file sits comfortably inside a week. Closed the way Task 2 closed
+it: a meeting on the **stroke of midnight** at each end, asserting that the two weeks around
+it hold one row each and 75 minutes between them. Killed.
+
+**THE BAD INSTRUMENT.** "The contact filter becomes a JOIN" was written as
+`IN (SELECT … FROM meeting_attendees)`, which is a subquery and fans nothing out — a no-op
+dressed as a mutation, and it "survived" honestly. Re-aimed at the thing it was supposed to
+be, `.leftJoin(meetingAttendees, …)` on the aggregate, it is killed by "counts a filtered
+meeting once however many attendees it had".
+
+**THE EQUIVALENT MUTANT.** `label: link.label ?? link.id` → `?? ""`. The fallback is
+unreachable: nothing in this schema is ever hard-deleted, so a LEFT JOIN on a primary key
+always finds its row. Recorded rather than chased.
+
+**GREEN BY DESIGN, AND THE SOURCE NOW SAYS SO.** Deleting `timesheetDays`' "a row fell
+outside the range" throw is green, because the instant bounds and the day conversion are
+built from the SAME zone — nothing this function can be given puts a row outside its own
+range, not even a zone with a day that does not exist. It is the arrangement the file's two
+"an aggregate returned no row" throws already have, and its comment now records the probe
+rather than implying a reachable case.
+
+| mutation | answered by |
+|---|---|
+| `isoWeekRange`: Sunday starts its own week; the week is six days; the offset counts days; the day is not validated | `time-zone.test.ts`'s two-year sweep and its named cases, plus `weekAt`'s |
+| `calendarDaysBetween` drops the last day; `calendarDaySpan` excludes one end | the shared tests, the service's "every day of the range", the route's exact-span case |
+| `isCalendarDay` drops the round trip, so `2026-02-30` is a day | the shared test — and this guard is what keeps a 400 from being a 500 |
+| `zonedDayFormatter` uses the zone unresolved | "falls back to UTC for a zone that no longer resolves" |
+| the billable sum loses its FILTER / its COALESCE / its `::int`; the billable count becomes the entry count | 1–8 tests each, in the service, the routes and shared |
+| the schema stops holding the billable half against its whole | "refuses a billable half larger than the entries it is a half of" |
+| **`timesheetBillableSummary` drops its meetings clause**; splits nothing rather than saying so; names the whole where the half belongs | the shared tests, the service's, the route's, and an e2e that reads the sentence off the screen |
+| the filters never reach the entries / never reach the meetings | "narrows the entries AND the meetings to the same record", and the route's |
+| the contact filter stops reaching attendance | "reaches a meeting the contact merely attended" |
+| **the aggregate gains a real `leftJoin(meetingAttendees)`** | "counts a filtered meeting once however many attendees it had" |
+| the filter contract grows a `taskId`; the page offers a task filter | `timesheetFiltersSchema`'s key list, and `FILTER_KINDS`' |
+| the day list drops the meetings / drops the entries; an empty day is omitted | the cross-check against the aggregate, and the route's row counts |
+| a day's figure counts the rows it could not count | "says which meetings were not counted", and the wire schema's day refine |
+| an archived entry / an archived meeting is still listed | "leaves archived entries and archived meetings out of the list entirely" |
+| not-yet stops taking precedence over unmeasured; the two reasons are exchanged | the three-meeting bucket test, row by row |
+| an entry claims to be uncounted; a meeting gains `billable: false` | the cross-check, the route's parse, and `timesheetRowSchema` |
+| the record joins become INNER; an entry's links lose the task | "carries a readable name for every record a row names" |
+| **the day list joins `meeting_attendees`** | "lists a meeting once however many attendees it had" |
+| **the meeting range's upper bound is made inclusive** | **THE REAL SURVIVOR** — closed by the stroke-of-midnight test above |
+| a meeting's day is taken from the instant rather than the organisation's clock | "puts a meeting on the day the organisation's calendar has it" |
+| the rows list gains a `.limit(100)` | "lists every entry of the week, past the page size the entries list stops at" |
+| `timesheetWeekSchema` stops holding a day's figure against its rows / admits a day outside the range; `timesheetRowSchema` admits an uncounted row with no reason, or a billable meeting | the shared tests, one per refine |
+| the span bound is dropped; **the `isCalendarDay` guard is removed, so a malformed day is a 500**; the rows route is never registered; the route drops the filters | the route tests |
+| **a time-entry write, or a meeting write, stops publishing `["timesheet"]`** | the two hint tests |
+| **the page prints `countedMinutes` and calls it the week's total**; drops the billable sentence; adds up the day's rows itself; types out the bound | `timesheet-render.test.ts`, reading the page off disk |
+| the form defaults billable to false; lets an hour be booked to nothing; appends a second link of one kind; a patch omits the links it is clearing; takes the device's today; the bound off by one; a blank description stored as `""`; an unmeasured meeting reads "0m"; `weekLabel` drops the year; the conflict message stops saying what to do | `timesheet-lib.test.ts`, 1–4 tests each |
+| **the timesheet is not a nav destination, so it is desktop-only**; the sidebar and the sheet disagree about its name | `nav-lib.test.ts`'s partition and its sidebar scrape |
+| a comment-only change (**the control**) | green, watched first |
+
+### AND THE E2E'S FIRST DRAFT WAS A BAD INSTRUMENT TOO, WHICH CI CAUGHT
+
+It asserted the week's **absolute** total. CI failed it three times with 2h, then 3h 30m,
+then 5h: this suite shares one database, `e2e/tasks.spec.ts` books an hour of its own, and
+a `describe.serial` RE-RUNS FROM THE TOP on retry — so each attempt added its own entry to
+the figure the next attempt asserted. An absolute total over a database other journeys write
+to is a measurement of the whole suite. Every figure is now read through the page's own
+record filter, narrowed to the journey's own project, and the filter's contrast is a SECOND
+project asserted by row rather than by total.
 
 ## Task 5: The timer — LAST, AND THE RISK IS NOT THE TIMING
 

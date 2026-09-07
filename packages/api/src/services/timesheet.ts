@@ -556,11 +556,21 @@ export async function timesheetDays(
       rows: dayRows,
     };
   });
-  // A ROW ON A DAY OUTSIDE THE RANGE IS A BUG, NOT A ROW TO DROP. The only way
-  // one can arise is the zone conversion disagreeing with the instant bounds
-  // both of them came from, which would mean a meeting counted by the aggregate
-  // and invisible in the list. Dropping it silently is the failure; saying so is
-  // not. `timesheetWeekSchema` refuses such a payload at the wire as well.
+  // A ROW ON A DAY OUTSIDE THE RANGE IS A BUG, NOT A ROW TO DROP -- a meeting
+  // counted by the aggregate and invisible in the list. Dropping it silently is
+  // the failure; saying so is not.
+  //
+  // **UNREACHABLE TODAY, AND UNTESTED FOR THAT REASON RATHER THAN BY OVERSIGHT.**
+  // It was probed by mutation: deleting this check is GREEN across the whole
+  // suite, because the instant bounds and the day conversion come from the SAME
+  // zone (`zonedDayRange` and `dayOf` are both built from `timeZone` above), so
+  // nothing this function can be given puts a row outside its own range -- not
+  // even a zone with a day that does not exist (Pacific/Kiritimati has no
+  // 1994-12-31; the range for it comes out empty, which is true). It is the
+  // arrangement the two "an aggregate returned no row" throws above already have,
+  // and it is recorded as a deliberate survivor rather than dressed up as a kill.
+  // `timesheetWeekSchema` refuses an out-of-range DAY at the wire, which is the
+  // half a schema can see; a dropped row is the half it cannot.
   const placed = days.reduce((total, day) => total + day.rows.length, 0);
   if (placed !== rows.length) {
     throw new Error(
