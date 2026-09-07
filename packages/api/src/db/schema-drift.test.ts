@@ -398,8 +398,11 @@ const SQL_ONLY_INDEXES: Record<string, string> = {
     + "WHERE (meeting_id IS NOT NULL)",
 
   // A semantic constraint expressed as a partial unique index, which is why it
-  // is not in schema.ts with the other uniques: an archived account may share an
-  // address with the live one that replaced it.
+  // is not in schema.ts with the other uniques. It stops one mailbox being added
+  // twice and re-synced under a second account_id (0004); PARTIAL so re-adding a
+  // previously-archived copy of the same address still works, and per-user
+  // because two users sharing one mailbox is legitimate. Every clause of it is
+  // load-bearing, which is why the definition is pinned and not the name.
   mail_accounts_user_email_active_unique:
     "CREATE UNIQUE INDEX mail_accounts_user_email_active_unique ON public.mail_accounts "
     + "USING btree (user_id, lower(email)) WHERE (archived_at IS NULL)",
