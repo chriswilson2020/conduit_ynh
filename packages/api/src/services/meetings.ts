@@ -40,8 +40,22 @@ import { publish } from "./sse.js";
  * the key anyway rather than carrying a second hint shape -- a client refetch
  * of an unchanged timeline, not a missed one. Meetings are not searchable in
  * v0.9.0, so no `search` key -- unlike companies.ts's hint. */
+/**
+ * **`["timesheet"]` SINCE v1.9.0, AND IT IS NOT A TIDY-UP.** A meeting's
+ * `duration_minutes` is half the week's figure (api: services/timesheet.ts), so a
+ * meeting logged, retimed or archived changes a number on a page that listens to
+ * neither of the keys above.
+ *
+ * **AND THE ROUTE'S FIRST COMMENT ABOUT THIS WAS WRONG.** routes/timesheet.ts
+ * said a client "refetches it on the ["time-entries"] and ["meetings"] hints the
+ * two mutators already publish" -- which cannot work: a TanStack query has ONE
+ * key, so nesting the timesheet under `["meetings"]` would miss every time-entry
+ * write and nesting it under `["time-entries"]` would miss every meeting. The
+ * report reads two tables, so it needs a key of its own that both mutators
+ * publish; this is that key, and publishTimeEntryHint carries the other half.
+ */
 function publishMeetingHint(id: string): void {
-  publish({ keys: [["meetings"], ["meeting", id], ["events"]] });
+  publish({ keys: [["meetings"], ["meeting", id], ["events"], ["timesheet"]] });
 }
 
 function toAttendee(row: MeetingAttendeeRow): MeetingAttendee {

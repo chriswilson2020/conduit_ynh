@@ -190,7 +190,11 @@ test.describe.serial("Phone navigation and the record rail", () => {
     }
   });
 
-  test("reaches the other four from the More sheet, which closes behind them", async ({ page }) => {
+  // FIVE SINCE v1.9.0: the timesheet joined the overflow rather than the bar
+  // (components/nav-lib.ts argues why). The list is exhaustive on purpose --
+  // this is the phase's "nothing is reachable at a desk and nowhere else" guard,
+  // and a destination added without a line here would be exactly that.
+  test("reaches the other five from the More sheet, which closes behind them", async ({ page }) => {
     await page.goto("/");
 
     // Radix does not forceMount, so the overflow destinations do not exist
@@ -202,6 +206,7 @@ test.describe.serial("Phone navigation and the record rail", () => {
       ["pipelines", "/pipelines"],
       ["projects", "/projects"],
       ["gantt", "/gantt"],
+      ["timesheet", "/timesheet"],
       ["settings", "/settings/mail"],
     ] as const) {
       await page.getByTestId("bottom-nav-more").click();

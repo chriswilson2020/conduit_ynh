@@ -21,6 +21,7 @@ import { SettingsMailPage } from "./pages/settings-mail";
 import { SettingsOrgPage } from "./pages/settings-org";
 import { SettingsTemplatesPage } from "./pages/settings-templates";
 import { TaskBoardPage } from "./pages/task-board";
+import { TimesheetPage } from "./pages/timesheet";
 
 // Shared by both routes below that open the task drawer via a `?task=<id>`
 // deep link (the task board and My Tasks, Task 8) -- a malformed/absent
@@ -153,6 +154,21 @@ const globalGanttRoute = createRoute({
   component: GlobalGanttPage,
 });
 
+// The timesheet (Phase 10 Task 4): where the week went, as a list.
+//
+// NO SEARCH PARAMS, deliberately, unlike the task drawer's `?task=` and the
+// inbox's `?thread=`. The week and the record filter are transient view state
+// rather than a thing to link somebody to, and putting them in the URL would
+// make Back step through weeks instead of leaving the page -- which is the
+// behaviour `replace: true` exists to avoid at every other deep link in this
+// app. If "send me last week's timesheet" ever becomes a real request, the week
+// is the param to add and this note is where to start.
+const timesheetRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/timesheet",
+  component: TimesheetPage,
+});
+
 // The mail inbox (Phase 4). `?thread=<id>` preselects a conversation, the
 // same loosely-typed deep-link convention validateTaskSearch uses for the
 // task drawer -- a malformed or absent value degrades to "nothing selected".
@@ -255,6 +271,7 @@ const routeTree = rootRoute.addChildren([
   projectGanttRoute,
   globalGanttRoute,
   myTasksRoute,
+  timesheetRoute,
   mailRoute,
   settingsMailRoute,
   settingsTemplatesRoute,

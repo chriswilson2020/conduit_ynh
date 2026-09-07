@@ -1,11 +1,12 @@
 import { describe, it, expect, beforeEach, afterAll } from "vitest";
 import { sql } from "drizzle-orm";
 import {
-  taskEffortSchema, taskEffortSummary, timesheetSummary, timesheetTotalsSchema,
+  taskEffortSchema, taskEffortSummary, timesheetBillableSummary, timesheetSummary,
+  timesheetTotalsSchema, timesheetWeekSchema,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
 import { resolveUser } from "../users.js";
-import { taskEffort, timesheetTotals } from "./timesheet.js";
+import { taskEffort, timesheetDays, timesheetTotals } from "./timesheet.js";
 import { createTask, archiveTask } from "./tasks.js";
 import { NotFoundError } from "./errors.js";
 import { createTimeEntry, archiveTimeEntry, listTimeEntries } from "./time-entries.js";
@@ -83,7 +84,7 @@ const WEEK = { from: "2026-09-07", to: "2026-09-13" } as const;
 
 describe("timesheetTotals: what it counts", () => {
   it("answers an empty range with nought, not with nothing", async () => {
-    const totals = await timesheetTotals(handle.db, WEEK, NOW);
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
     expect(totals.countedMinutes).toBe(0);
     expect(totals.entryMinutes).toBe(0);
     expect(totals.meetingMinutes).toBe(0);
@@ -96,7 +97,7 @@ describe("timesheetTotals: what it counts", () => {
   it("adds a meeting's minutes to the entries' own", async () => {
     await entry("2026-09-08", 120);
     await meeting("2026-09-08T09:00:00.000Z", 45);
-    const totals = await timesheetTotals(handle.db, WEEK, NOW);
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
     expect(totals.entryMinutes).toBe(120);
     expect(totals.meetingMinutes).toBe(45);
     expect(totals.meetingsCounted).toBe(1);
@@ -115,7 +116,7 @@ describe("timesheetTotals: what it counts", () => {
   it("returns numbers rather than the bigint strings the driver would give", async () => {
     await entry("2026-09-08", 120);
     await meeting("2026-09-08T09:00:00.000Z", 45);
-    const totals = await timesheetTotals(handle.db, WEEK, NOW);
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
     for (const [name, value] of Object.entries(totals)) {
       if (name === "from" || name === "to" || name === "timeZone") continue;
       expect(typeof value, name).toBe("number");
@@ -144,7 +145,7 @@ describe("timesheetTotals: what it counts", () => {
     expect(page.items.length).toBe(100);
     expect(page.nextCursor).not.toBeNull();
 
-    const totals = await timesheetTotals(handle.db, WEEK, NOW);
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
     expect(totals.entryCount).toBe(101);
     expect(totals.entryMinutes).toBe(707);
   });
@@ -157,7 +158,7 @@ describe("timesheetTotals: what it counts", () => {
     await entry("2026-09-07", 20);
     await entry("2026-09-13", 40);
     await entry("2026-09-14", 80);
-    const totals = await timesheetTotals(handle.db, WEEK, NOW);
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
     expect(totals.entryMinutes).toBe(60);
     expect(totals.entryCount).toBe(2);
   });
@@ -177,7 +178,7 @@ describe("timesheetTotals: the meetings it cannot count", () => {
     await meeting("2026-09-08T09:00:00.000Z", 60);
     await meeting("2026-09-08T14:00:00.000Z", null);
     await meeting("2026-09-09T09:00:00.000Z", null);
-    const totals = await timesheetTotals(handle.db, WEEK, NOW);
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
     expect(totals.meetingMinutes).toBe(60);
     expect(totals.meetingsCounted).toBe(1);
     expect(totals.meetingsUnmeasured).toBe(2);
@@ -205,7 +206,7 @@ describe("timesheetTotals: the meetings it cannot count", () => {
   it("reports a meeting later in the week rather than counting it", async () => {
     await meeting("2026-09-08T09:00:00.000Z", 60);  // Tuesday, before NOW
     await meeting("2026-09-11T09:00:00.000Z", 90);  // Friday, after NOW
-    const totals = await timesheetTotals(handle.db, WEEK, NOW);
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
     expect(totals.meetingMinutes).toBe(60);
     expect(totals.meetingsCounted).toBe(1);
     expect(totals.meetingsNotYetOccurred).toBe(1);
@@ -217,7 +218,7 @@ describe("timesheetTotals: the meetings it cannot count", () => {
   it("counts a meeting that has begun and not one that begins a millisecond later", async () => {
     await meeting(NOW.toISOString(), 30);
     await meeting(new Date(NOW.getTime() + 1).toISOString(), 30);
-    const totals = await timesheetTotals(handle.db, WEEK, NOW);
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
     expect(totals.meetingsCounted).toBe(1);
     expect(totals.meetingsNotYetOccurred).toBe(1);
     expect(totals.meetingMinutes).toBe(30);
@@ -238,7 +239,7 @@ describe("timesheetTotals: the meetings it cannot count", () => {
     await meeting("2026-09-08T11:00:00.000Z", null);
     await meeting("2026-09-11T09:00:00.000Z", 90);
     await meeting("2026-09-11T11:00:00.000Z", null);
-    const totals = await timesheetTotals(handle.db, WEEK, NOW);
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
     expect(totals.meetingsInRange).toBe(4);
     expect(totals.meetingsCounted).toBe(1);
     expect(totals.meetingsUnmeasured).toBe(1);
@@ -282,7 +283,7 @@ describe("timesheetTotals: no hour is counted twice", () => {
         { kind: "guest", guestName: "their lawyer" },
       ],
     });
-    const totals = await timesheetTotals(handle.db, WEEK, NOW);
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
     expect(totals.meetingMinutes).toBe(60);
     expect(totals.meetingsCounted).toBe(1);
     expect(totals.meetingsInRange).toBe(1);
@@ -304,7 +305,7 @@ describe("timesheetTotals: no hour is counted twice", () => {
     await meeting("2026-09-08T09:00:00.000Z", 60, {
       companyId: company.id, contactId: contact.id, dealId: deal.id,
     });
-    const totals = await timesheetTotals(handle.db, WEEK, NOW);
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
     expect(totals.meetingMinutes).toBe(60);
     expect(totals.meetingsInRange).toBe(1);
   });
@@ -326,7 +327,7 @@ describe("timesheetTotals: no hour is counted twice", () => {
     await archiveMeeting(handle.db, actorId, filed);
     await archiveTimeEntry(handle.db, actorId, filedEntry);
 
-    const totals = await timesheetTotals(handle.db, WEEK, NOW);
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
     expect(totals.meetingMinutes).toBe(60);
     expect(totals.meetingsCounted).toBe(1);
     // Not merely uncounted: an archived meeting is not IN the range at all, so it
@@ -349,16 +350,16 @@ describe("timesheetTotals: no hour is counted twice", () => {
    */
   it("moves a meeting whose duration is cleared into the visible bucket, not out of sight", async () => {
     const id = await meeting("2026-09-08T09:00:00.000Z", 60);
-    expect((await timesheetTotals(handle.db, WEEK, NOW)).meetingMinutes).toBe(60);
+    expect((await timesheetTotals(handle.db, WEEK, {}, NOW)).meetingMinutes).toBe(60);
 
     await updateMeeting(handle.db, actorId, id, { durationMinutes: null });
-    const cleared = await timesheetTotals(handle.db, WEEK, NOW);
+    const cleared = await timesheetTotals(handle.db, WEEK, {}, NOW);
     expect(cleared.meetingMinutes).toBe(0);
     expect(cleared.meetingsUnmeasured).toBe(1);
     expect(cleared.meetingsInRange).toBe(1);
 
     await archiveMeeting(handle.db, actorId, id);
-    const filed = await timesheetTotals(handle.db, WEEK, NOW);
+    const filed = await timesheetTotals(handle.db, WEEK, {}, NOW);
     expect(filed.meetingsInRange).toBe(0);
     expect(filed.meetingsUnmeasured).toBe(0);
   });
@@ -379,7 +380,7 @@ describe("timesheetTotals: no hour is counted twice", () => {
     await createTimeEntry(handle.db, actorId, {
       workDate: "2026-09-09", minutes: 25, billable: true, taskId: task.id,
     });
-    const totals = await timesheetTotals(handle.db, WEEK, NOW);
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
     expect(totals.meetingMinutes).toBe(60);
     expect(totals.entryMinutes).toBe(25);
     expect(totals.countedMinutes).toBe(85);
@@ -404,13 +405,13 @@ describe("timesheetTotals: the day a meeting belongs to", () => {
 
     // In UTC that instant is 22:30 on Sunday the SIXTH -- the week before.
     await setOrgTimeZone("UTC");
-    const utc = await timesheetTotals(handle.db, WEEK, NOW);
+    const utc = await timesheetTotals(handle.db, WEEK, {}, NOW);
     expect(utc.timeZone).toBe("UTC");
     expect(utc.meetingsInRange).toBe(0);
 
     // In Amsterdam it is 00:30 on Monday the SEVENTH, so it belongs to this week.
     await setOrgTimeZone("Europe/Amsterdam");
-    const ams = await timesheetTotals(handle.db, WEEK, NOW);
+    const ams = await timesheetTotals(handle.db, WEEK, {}, NOW);
     expect(ams.timeZone).toBe("Europe/Amsterdam");
     expect(ams.meetingsInRange).toBe(1);
     expect(ams.meetingMinutes).toBe(60);
@@ -423,9 +424,9 @@ describe("timesheetTotals: the day a meeting belongs to", () => {
     await setOrgTimeZone("Europe/Amsterdam");
     await meeting(SUNDAY_LATE, 60);
     const previous = await timesheetTotals(
-      handle.db, { from: "2026-08-31", to: "2026-09-06" }, NOW,
+      handle.db, { from: "2026-08-31", to: "2026-09-06" }, {}, NOW,
     );
-    const current = await timesheetTotals(handle.db, WEEK, NOW);
+    const current = await timesheetTotals(handle.db, WEEK, {}, NOW);
     expect(previous.meetingsInRange + current.meetingsInRange).toBe(1);
     expect(current.meetingsInRange).toBe(1);
   });
@@ -452,10 +453,10 @@ describe("timesheetTotals: the day a meeting belongs to", () => {
     await meeting("2026-09-06T22:00:00.000Z", 30);
     await meeting("2026-09-13T22:00:00.000Z", 45);
 
-    const previous = await timesheetTotals(handle.db, { from: "2026-08-31", to: "2026-09-06" }, NOW);
-    const current = await timesheetTotals(handle.db, WEEK, NOW);
+    const previous = await timesheetTotals(handle.db, { from: "2026-08-31", to: "2026-09-06" }, {}, NOW);
+    const current = await timesheetTotals(handle.db, WEEK, {}, NOW);
     const next = await timesheetTotals(
-      handle.db, { from: "2026-09-14", to: "2026-09-20" }, new Date("2026-09-21T12:00:00.000Z"),
+      handle.db, { from: "2026-09-14", to: "2026-09-20" }, {}, new Date("2026-09-21T12:00:00.000Z"),
     );
 
     // The first instant of the week is IN it; the first instant of the next week
@@ -480,7 +481,7 @@ describe("timesheetTotals: the day a meeting belongs to", () => {
     // 2026-10-25T22:30Z is 23:30 local, after the clocks went back.
     await meeting("2026-10-25T22:30:00.000Z", 45);
     const totals = await timesheetTotals(
-      handle.db, { from: "2026-10-19", to: "2026-10-25" }, new Date("2026-10-26T09:00:00.000Z"),
+      handle.db, { from: "2026-10-19", to: "2026-10-25" }, {}, new Date("2026-10-26T09:00:00.000Z"),
     );
     expect(totals.meetingsInRange).toBe(1);
     expect(totals.meetingMinutes).toBe(45);
@@ -496,7 +497,7 @@ describe("timesheetTotals: the day a meeting belongs to", () => {
   it("falls back to UTC when the stored zone no longer resolves, and says that it did", async () => {
     await setOrgTimeZone("Factory");
     await meeting(SUNDAY_LATE, 60);
-    const totals = await timesheetTotals(handle.db, WEEK, NOW);
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
     expect(totals.timeZone).toBe("UTC");
     expect(totals.meetingsInRange).toBe(0);
   });
@@ -505,7 +506,7 @@ describe("timesheetTotals: the day a meeting belongs to", () => {
    * install that has never opened Settings. It must answer, not throw. */
   it("uses UTC when nobody has ever opened Settings", async () => {
     await meeting("2026-09-08T09:00:00.000Z", 60);
-    const totals = await timesheetTotals(handle.db, WEEK, NOW);
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
     expect(totals.timeZone).toBe("UTC");
     expect(totals.meetingMinutes).toBe(60);
   });
@@ -517,7 +518,7 @@ describe("timesheetTotals: the shape it answers with", () => {
     await meeting("2026-09-08T09:00:00.000Z", 45);
     await meeting("2026-09-08T14:00:00.000Z", null);
     await meeting("2026-09-11T09:00:00.000Z", 30);
-    const totals = await timesheetTotals(handle.db, WEEK, NOW);
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
     // The refines are the guarantee: a total that is not its own halves, or
     // meeting buckets that do not account for the range, fail here.
     expect(timesheetTotalsSchema.parse(totals)).toEqual(totals);
@@ -529,12 +530,479 @@ describe("timesheetTotals: the shape it answers with", () => {
    * an inverted range is refused rather than answered with an empty week that
    * looks exactly like an honest one. */
   it("refuses a range that runs backwards", async () => {
-    await expect(timesheetTotals(handle.db, { from: "2026-09-13", to: "2026-09-07" }, NOW))
+    await expect(timesheetTotals(handle.db, { from: "2026-09-13", to: "2026-09-07" }, {}, NOW))
       .rejects.toThrow(/runs backwards/);
   });
 
   it("refuses a range that is not made of calendar days", async () => {
-    await expect(timesheetTotals(handle.db, { from: "2026-09", to: "2026-09-13" }, NOW))
+    await expect(timesheetTotals(handle.db, { from: "2026-09", to: "2026-09-13" }, {}, NOW))
+      .rejects.toThrow(/calendar day/);
+  });
+});
+
+/* ========================================================================== *
+ *  PHASE 10 TASK 4: THE BILLABLE SPLIT, THE RECORD FILTERS, AND THE ROWS
+ * ========================================================================== */
+
+/**
+ * **THE FLAG THE OPERATOR IS MADE TO ANSWER ON EVERY ENTRY, READ BACK AT LAST.**
+ *
+ * `time_entries.billable` has had no default since Task 1 -- so nothing decides
+ * it on the operator's behalf -- and until this task nothing in the product could
+ * read it: the spec says billable time here "feeds reporting and export, not
+ * billing", and with no report it was a write-only column.
+ */
+describe("timesheetTotals: the billable split", () => {
+  it("splits the hand-entered half, and counts the same entries it sums", async () => {
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-08", minutes: 120, billable: true, projectId,
+    });
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-09", minutes: 30, billable: true, projectId,
+    });
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-09", minutes: 45, billable: false, projectId,
+    });
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
+    expect(totals.entryMinutes).toBe(195);
+    expect(totals.entryCount).toBe(3);
+    expect(totals.billableEntryMinutes).toBe(150);
+    expect(totals.billableEntryCount).toBe(2);
+    // The refines hold the split against the thing it splits.
+    expect(timesheetTotalsSchema.parse(totals)).toEqual(totals);
+  });
+
+  /**
+   * **A MEETING'S MINUTES ARE IN NEITHER HALF, AND THAT IS THE SENTENCE'S JOB TO
+   * SAY.** `meetings` has no billable column, so counting them as non-billable
+   * would be a claim nobody made -- the same failure as counting an unmeasured
+   * meeting as zero. Here the arithmetic proves it: countedMinutes is 210, the
+   * billable figure is 120, and 210 - 120 is not the non-billable time.
+   */
+  it("leaves meetings out of both halves of the split", async () => {
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-08", minutes: 120, billable: true, projectId,
+    });
+    await meeting("2026-09-08T09:00:00.000Z", 90);
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
+    expect(totals.countedMinutes).toBe(210);
+    expect(totals.billableEntryMinutes).toBe(120);
+    expect(totals.entryMinutes).toBe(120);
+    expect(timesheetBillableSummary(totals)).toContain("Meetings carry no billable flag");
+    expect(timesheetBillableSummary(totals)).toContain("1h 30m from meetings");
+  });
+
+  it("answers a week with nothing billable in it with nought, not with nothing", async () => {
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-08", minutes: 60, billable: false, projectId,
+    });
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
+    expect(totals.billableEntryMinutes).toBe(0);
+    expect(totals.billableEntryCount).toBe(0);
+    expect(typeof totals.billableEntryMinutes).toBe("number");
+    expect(typeof totals.billableEntryCount).toBe("number");
+  });
+
+  /** ARCHIVING IS HOW AN HOUR LEAVES A TOTAL, and it has to leave the split too
+   * -- otherwise the correction for a mis-booked billable afternoon works
+   * everywhere except on the one figure somebody would invoice from. */
+  it("drops an archived entry out of the billable half as well as the whole", async () => {
+    const id = await entry("2026-09-08", 120);
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-08", minutes: 30, billable: false, projectId,
+    });
+    await archiveTimeEntry(handle.db, actorId, id);
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
+    expect(totals.entryMinutes).toBe(30);
+    expect(totals.billableEntryMinutes).toBe(0);
+    expect(totals.billableEntryCount).toBe(0);
+  });
+});
+
+/**
+ * **NARROWING THE WEEK TO ONE RECORD, ON BOTH HALVES AT ONCE.**
+ *
+ * The filter that reached only the entries would answer "this project's week"
+ * with the project's hours plus everybody's meetings -- a total belonging to no
+ * record at all, and wrong in the direction that makes a project look busier
+ * than it is.
+ */
+describe("timesheetTotals: the record filters", () => {
+  let otherProjectId: string;
+  let companyId: string;
+  let contactId: string;
+
+  beforeEach(async () => {
+    otherProjectId = (await createProject(handle.db, actorId, { name: "Something else" })).id;
+    companyId = (await createCompany(handle.db, actorId, { name: "Acme" })).id;
+    contactId = (await createContact(handle.db, actorId, { firstName: "Ada", lastName: "Byron" })).id;
+  });
+
+  it("narrows the entries AND the meetings to the same record", async () => {
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-08", minutes: 120, billable: true, projectId,
+    });
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-08", minutes: 60, billable: true, projectId: otherProjectId,
+    });
+    await meeting("2026-09-08T09:00:00.000Z", 30);
+    await createMeeting(handle.db, actorId, {
+      title: "Elsewhere", occurredAt: "2026-09-08T11:00:00.000Z", durationMinutes: 90,
+      projectId: otherProjectId,
+    });
+
+    const all = await timesheetTotals(handle.db, WEEK, {}, NOW);
+    expect(all.countedMinutes).toBe(300);
+
+    const mine = await timesheetTotals(handle.db, WEEK, { projectId }, NOW);
+    expect(mine.entryMinutes).toBe(120);
+    // THE HALF A FILTER ON ONE SIDE ONLY WOULD GET WRONG: 120 in the meetings
+    // half rather than 30 is exactly what "narrowed the entries, left the
+    // meetings" produces.
+    expect(mine.meetingMinutes).toBe(30);
+    expect(mine.meetingsInRange).toBe(1);
+    expect(mine.countedMinutes).toBe(150);
+    expect(timesheetTotalsSchema.parse(mine)).toEqual(mine);
+  });
+
+  it("filters by company and by deal as well", async () => {
+    const pipeline = await createPipeline(handle.db, actorId, { name: "Sales", scope: "global" });
+    const stage = await createStage(handle.db, actorId, pipeline.id, { name: "New" });
+    const deal = await createDeal(
+      handle.db, actorId,
+      { title: "Renewal", pipelineId: pipeline.id, stageId: stage.id, companyId }, "EUR",
+    );
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-08", minutes: 45, billable: true, companyId,
+    });
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-08", minutes: 25, billable: true, dealId: deal.id,
+    });
+    await createMeeting(handle.db, actorId, {
+      title: "Acme", occurredAt: "2026-09-08T09:00:00.000Z", durationMinutes: 15, companyId,
+    });
+
+    const byCompany = await timesheetTotals(handle.db, WEEK, { companyId }, NOW);
+    expect(byCompany.countedMinutes).toBe(60);
+    const byDeal = await timesheetTotals(handle.db, WEEK, { dealId: deal.id }, NOW);
+    expect(byDeal.entryMinutes).toBe(25);
+    expect(byDeal.meetingMinutes).toBe(0);
+    expect(byDeal.countedMinutes).toBe(25);
+  });
+
+  /**
+   * **THE CONTACT FILTER WIDENS TO ATTENDANCE ON THE MEETINGS SIDE, AND THAT IS
+   * `listMeetings`' RULE RATHER THAN A NEW ONE.** "This contact's week" has to
+   * mean the same thing here as it does on their own Meetings tab: an hour in a
+   * meeting they attended is an hour spent with them, whether or not they are the
+   * row's `contact_id`. Time entries have no attendee table and their arm does
+   * not pretend to widen.
+   */
+  it("reaches a meeting the contact merely attended", async () => {
+    await createMeeting(handle.db, actorId, {
+      title: "Attended", occurredAt: "2026-09-08T09:00:00.000Z", durationMinutes: 40,
+      projectId, attendees: [{ contactId }],
+    });
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-08", minutes: 20, billable: true, contactId,
+    });
+    const totals = await timesheetTotals(handle.db, WEEK, { contactId }, NOW);
+    expect(totals.meetingMinutes).toBe(40);
+    expect(totals.entryMinutes).toBe(20);
+  });
+
+  /**
+   * **AND IT COUNTS THAT MEETING ONCE, HOWEVER MANY ATTENDEES IT HAD.** This is
+   * the hazard Task 2 wrote down for Task 4 by name: as a `leftJoin` to
+   * `meeting_attendees` the widening reads identically and turns one meeting into
+   * three rows whose duration is summed three times. Nothing about the resulting
+   * number looks wrong -- which is why the filter is an EXISTS and why this test
+   * exists at all.
+   */
+  it("counts a filtered meeting once however many attendees it had", async () => {
+    const second = (await createContact(handle.db, actorId, { firstName: "Grace" })).id;
+    const third = (await createContact(handle.db, actorId, { firstName: "Alan" })).id;
+    await createMeeting(handle.db, actorId, {
+      title: "Three of them", occurredAt: "2026-09-08T09:00:00.000Z", durationMinutes: 60,
+      projectId,
+      attendees: [{ contactId }, { contactId: second }, { contactId: third }],
+    });
+    const totals = await timesheetTotals(handle.db, WEEK, { contactId }, NOW);
+    expect(totals.meetingMinutes).toBe(60);
+    expect(totals.meetingsCounted).toBe(1);
+    expect(totals.meetingsInRange).toBe(1);
+  });
+
+  it("answers a record with nothing on it with a whole empty week", async () => {
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-08", minutes: 120, billable: true, projectId,
+    });
+    const totals = await timesheetTotals(handle.db, WEEK, { projectId: otherProjectId }, NOW);
+    expect(totals.countedMinutes).toBe(0);
+    expect(totals.meetingsInRange).toBe(0);
+    expect(timesheetTotalsSchema.parse(totals)).toEqual(totals);
+  });
+});
+
+/**
+ * **THE ROWS THE HEADLINE IS MADE OF.**
+ *
+ * `timesheetSummary` says "and 2h 30m across 3 meetings. Not counted: 2 meetings
+ * with no recorded length" -- and an operator who cannot see WHICH two has been
+ * handed an assertion rather than an answer. These tests are for the three
+ * things that makes true:
+ *
+ *   1. Every row of the week is here, entries and meetings alike, on the
+ *      organisation's calendar days, with every day of the range present.
+ *   2. The list AGREES WITH THE AGGREGATE -- same population, same buckets, same
+ *      minutes -- which is the property the whole surface rests on and the one a
+ *      second implementation of "has this meeting started" would break.
+ *   3. Nothing fans out. The joins that resolve record names are on primary keys
+ *      and `meeting_attendees` is not among them.
+ */
+describe("timesheetDays: the week, row by row", () => {
+  /** The counted minutes the list holds, added up over every day -- what the
+   * headline must equal. Written here once so no test re-spells it. */
+  function listedMinutes(week: Awaited<ReturnType<typeof timesheetDays>>): number {
+    return week.days.reduce((total, day) => total + day.countedMinutes, 0);
+  }
+
+  it("gives every day of the range a section, including the empty ones", async () => {
+    await entry("2026-09-08", 60);
+    const week = await timesheetDays(handle.db, WEEK, {}, NOW);
+    expect(week.days.map((day) => day.day)).toEqual([
+      "2026-09-07", "2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11", "2026-09-12", "2026-09-13",
+    ]);
+    // A week that omitted its quiet days would read as a week those days were
+    // not in -- "where did the week go" is a question a blank Wednesday answers.
+    expect(week.days.filter((day) => day.rows.length === 0)).toHaveLength(6);
+    expect(timesheetWeekSchema.parse(week)).toEqual(week);
+  });
+
+  it("puts an entry and a meeting on their own days, with their own labels", async () => {
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-07", minutes: 90, billable: true, description: "Wrote the thing", projectId,
+    });
+    // Tuesday, i.e. BEFORE NOW: a meeting on Thursday would be in the future and
+    // would come back not-yet-happened, which is a different test's subject.
+    await meeting("2026-09-08T09:00:00.000Z", 45);
+    const week = await timesheetDays(handle.db, WEEK, {}, NOW);
+    const monday = week.days.find((day) => day.day === "2026-09-07");
+    const tuesday = week.days.find((day) => day.day === "2026-09-08");
+    expect(monday?.rows).toMatchObject([{
+      kind: "entry", minutes: 90, label: "Wrote the thing", billable: true,
+      counted: true, uncountedReason: null,
+    }]);
+    expect(monday?.countedMinutes).toBe(90);
+    expect(tuesday?.rows).toMatchObject([{
+      kind: "meeting", minutes: 45, label: "Kickoff", billable: null,
+      counted: true, uncountedReason: null,
+    }]);
+    expect(tuesday?.countedMinutes).toBe(45);
+  });
+
+  /**
+   * **THE CROSS-CHECK, AND IT IS THE MOST LOAD-BEARING TEST IN THIS FILE.** The
+   * aggregate decides "counted" in SQL and the list carries the same expressions
+   * back as booleans; if the two ever stop agreeing, the page prints a figure
+   * over a list that does not add up to it and nothing else in this suite would
+   * notice. The seed deliberately contains one of everything: a counted meeting,
+   * an unmeasured one, one that has not happened yet, an archived one, an
+   * archived entry, and entries on both sides of the week's edges.
+   */
+  it("adds up to the aggregate, bucket for bucket", async () => {
+    await entry("2026-09-07", 30);
+    await entry("2026-09-13", 45);
+    await entry("2026-09-09", 120);
+    const archivedEntry = await entry("2026-09-09", 999);
+    await archiveTimeEntry(handle.db, actorId, archivedEntry);
+    // Outside the range on both sides.
+    await entry("2026-09-06", 60);
+    await entry("2026-09-14", 60);
+    await meeting("2026-09-08T09:00:00.000Z", 60);
+    await meeting("2026-09-08T15:00:00.000Z", null);
+    await meeting("2026-09-11T09:00:00.000Z", 30);
+    const archivedMeeting = await meeting("2026-09-09T09:00:00.000Z", 240);
+    await archiveMeeting(handle.db, actorId, archivedMeeting);
+
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
+    const week = await timesheetDays(handle.db, WEEK, {}, NOW);
+    const rows = week.days.flatMap((day) => day.rows);
+
+    expect(listedMinutes(week)).toBe(totals.countedMinutes);
+    expect(rows.filter((row) => row.kind === "entry")).toHaveLength(totals.entryCount);
+    expect(rows.filter((row) => row.kind === "meeting")).toHaveLength(totals.meetingsInRange);
+    expect(rows.filter((row) => row.kind === "meeting" && row.counted))
+      .toHaveLength(totals.meetingsCounted);
+    expect(rows.filter((row) => row.uncountedReason === "no-recorded-length"))
+      .toHaveLength(totals.meetingsUnmeasured);
+    expect(rows.filter((row) => row.uncountedReason === "not-yet-happened"))
+      .toHaveLength(totals.meetingsNotYetOccurred);
+    const entryMinutes = rows
+      .filter((row) => row.kind === "entry")
+      .reduce((total, row) => total + (row.minutes ?? 0), 0);
+    expect(entryMinutes).toBe(totals.entryMinutes);
+    // The seed is not vacuous: a week with nothing in it would satisfy every
+    // assertion above.
+    expect(totals.countedMinutes).toBeGreaterThan(0);
+    expect(totals.meetingsInRange).toBe(3);
+    expect(timesheetWeekSchema.parse(week)).toEqual(week);
+  });
+
+  /**
+   * THE TWO MEETINGS THE SENTENCE NAMES, AS ROWS SOMEBODY CAN LOOK AT. An
+   * unmeasured meeting carries `minutes: null` rather than 0 -- there is no such
+   * thing as a zero-length meeting, and a 0 there would be the "unknown treated
+   * as a claim" failure the spec names, arriving on the surface instead of in the
+   * query.
+   */
+  it("says which meetings were not counted, and why, one row at a time", async () => {
+    await meeting("2026-09-08T09:00:00.000Z", null);
+    // NOW is Wednesday the 9th at 12:00Z; this is Friday.
+    await meeting("2026-09-11T09:00:00.000Z", 60);
+    // ...and a future meeting with no duration is NOT-YET rather than unmeasured:
+    // its length is not yet a fact about anything.
+    await meeting("2026-09-12T09:00:00.000Z", null);
+    const week = await timesheetDays(handle.db, WEEK, {}, NOW);
+    const rows = week.days.flatMap((day) => day.rows);
+    expect(rows.map((row) => [row.day, row.minutes, row.counted, row.uncountedReason])).toEqual([
+      ["2026-09-08", null, false, "no-recorded-length"],
+      ["2026-09-11", 60, false, "not-yet-happened"],
+      ["2026-09-12", null, false, "not-yet-happened"],
+    ]);
+    expect(listedMinutes(week)).toBe(0);
+  });
+
+  /** A meeting that has started counts, and one starting exactly NOW has
+   * started -- the aggregate's `<=`, read back through the same expression
+   * rather than re-decided here. */
+  it("treats a meeting starting exactly now as one that has happened", async () => {
+    await meeting(NOW.toISOString(), 15);
+    const week = await timesheetDays(handle.db, WEEK, {}, NOW);
+    const rows = week.days.flatMap((day) => day.rows);
+    expect(rows).toMatchObject([{ counted: true, uncountedReason: null, minutes: 15 }]);
+    expect(listedMinutes(week)).toBe(15);
+  });
+
+  it("leaves archived entries and archived meetings out of the list entirely", async () => {
+    const e = await entry("2026-09-08", 60);
+    const m = await meeting("2026-09-08T09:00:00.000Z", 60);
+    await archiveTimeEntry(handle.db, actorId, e);
+    await archiveMeeting(handle.db, actorId, m);
+    const week = await timesheetDays(handle.db, WEEK, {}, NOW);
+    expect(week.days.flatMap((day) => day.rows)).toEqual([]);
+    expect(listedMinutes(week)).toBe(0);
+  });
+
+  /**
+   * **THE ORGANISATION'S CLOCK DECIDES WHICH DAY -- AND WHICH WEEK -- A MEETING
+   * FELL ON.** 2026-09-06T23:30Z is Sunday in UTC and Monday in Amsterdam. Under
+   * UTC this meeting is not in the week at all; under Amsterdam it is Monday's
+   * first row. A list that put it on the UTC day while the aggregate counted the
+   * Amsterdam one would be a row on a day the week does not contain, which
+   * `timesheetDays` throws over rather than dropping.
+   */
+  it("puts a meeting on the day the organisation's calendar has it", async () => {
+    await setOrgTimeZone("Europe/Amsterdam");
+    await meeting("2026-09-06T23:30:00.000Z", 60);
+    const week = await timesheetDays(handle.db, WEEK, {}, NOW);
+    expect(week.timeZone).toBe("Europe/Amsterdam");
+    expect(week.days[0]?.day).toBe("2026-09-07");
+    expect(week.days[0]?.rows).toHaveLength(1);
+    expect(week.days[0]?.countedMinutes).toBe(60);
+    expect(timesheetWeekSchema.parse(week)).toEqual(week);
+
+    // The same instant, read in UTC, is not in this week at all.
+    await setOrgTimeZone("UTC");
+    const utc = await timesheetDays(handle.db, WEEK, {}, NOW);
+    expect(utc.days.flatMap((day) => day.rows)).toEqual([]);
+  });
+
+  /**
+   * THE RECORD NAMES COME WITH THE ROWS, INCLUDING AN ARCHIVED RECORD'S. An
+   * entry may legitimately name a project that has since been completed
+   * (services/time-entries.ts's "existence, not activeness" rule), and a page
+   * resolving names from its own lists would render that row with nothing on it.
+   */
+  it("carries a readable name for every record a row names", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    const contact = await createContact(handle.db, actorId, { firstName: "Ada", lastName: "Byron" });
+    const task = await createTask(handle.db, actorId, { title: "Ship it", projectId });
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-08", minutes: 60, billable: true,
+      companyId: company.id, contactId: contact.id, projectId, taskId: task.id,
+    });
+    await archiveTask(handle.db, actorId, task.id);
+    const week = await timesheetDays(handle.db, WEEK, {}, NOW);
+    const [row] = week.days.flatMap((day) => day.rows);
+    expect(row?.links).toEqual([
+      { kind: "company", id: company.id, label: "Acme" },
+      { kind: "contact", id: contact.id, label: "Ada Byron" },
+      { kind: "project", id: projectId, label: "Rollout" },
+      // Archived, and still named: the drawer opens on it and the hour is real.
+      { kind: "task", id: task.id, label: "Ship it" },
+    ]);
+  });
+
+  /** A MEETING WITH THREE ATTENDEES IS ONE ROW. The joins that resolve names are
+   * on primary keys and cannot fan out; `meeting_attendees` is not joined at all,
+   * here or in the aggregate. A row appearing three times would treble the day's
+   * figure as surely as it would the week's. */
+  it("lists a meeting once however many attendees it had", async () => {
+    const one = (await createContact(handle.db, actorId, { firstName: "Ada" })).id;
+    const two = (await createContact(handle.db, actorId, { firstName: "Grace" })).id;
+    const three = (await createContact(handle.db, actorId, { firstName: "Alan" })).id;
+    await createMeeting(handle.db, actorId, {
+      title: "Three of them", occurredAt: "2026-09-08T09:00:00.000Z", durationMinutes: 60,
+      projectId, attendees: [{ contactId: one }, { contactId: two }, { contactId: three }],
+    });
+    const week = await timesheetDays(handle.db, WEEK, { contactId: one }, NOW);
+    expect(week.days.flatMap((day) => day.rows)).toHaveLength(1);
+    expect(listedMinutes(week)).toBe(60);
+  });
+
+  it("narrows to a record on both halves, exactly as the aggregate does", async () => {
+    const other = (await createProject(handle.db, actorId, { name: "Something else" })).id;
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-08", minutes: 120, billable: true, projectId,
+    });
+    await createTimeEntry(handle.db, actorId, {
+      workDate: "2026-09-08", minutes: 60, billable: true, projectId: other,
+    });
+    await meeting("2026-09-08T09:00:00.000Z", 30);
+    await createMeeting(handle.db, actorId, {
+      title: "Elsewhere", occurredAt: "2026-09-08T11:00:00.000Z", durationMinutes: 90,
+      projectId: other,
+    });
+    const week = await timesheetDays(handle.db, WEEK, { projectId }, NOW);
+    const totals = await timesheetTotals(handle.db, WEEK, { projectId }, NOW);
+    expect(week.days.flatMap((day) => day.rows)).toHaveLength(2);
+    expect(listedMinutes(week)).toBe(totals.countedMinutes);
+    expect(listedMinutes(week)).toBe(150);
+  });
+
+  /**
+   * **101 ENTRIES IN ONE WEEK, WHICH IS THE PLAN'S OWN EXAMPLE.** `listTimeEntries`
+   * caps at 100, so a page built over that list would show a hundred rows and a
+   * total short by one entry. This list has no cap -- the ROUTE bounds the span
+   * instead -- so the rows and the aggregate still agree past the page size that
+   * would have broken them.
+   */
+  it("lists every entry of the week, past the page size the entries list stops at", async () => {
+    for (let n = 0; n < 101; n += 1) await entry("2026-09-08", 1);
+    const page = await listTimeEntries(handle.db, { from: WEEK.from, to: WEEK.to, limit: 500 });
+    expect(page.items).toHaveLength(100);
+    const week = await timesheetDays(handle.db, WEEK, {}, NOW);
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
+    expect(week.days.flatMap((day) => day.rows)).toHaveLength(101);
+    expect(listedMinutes(week)).toBe(101);
+    expect(listedMinutes(week)).toBe(totals.countedMinutes);
+  });
+
+  it("refuses a backwards range and a day that is not one, exactly as the aggregate does", async () => {
+    await expect(timesheetDays(handle.db, { from: "2026-09-13", to: "2026-09-07" }, {}, NOW))
+      .rejects.toThrow(/runs backwards/);
+    await expect(timesheetDays(handle.db, { from: "2026-02-30", to: "2026-09-13" }, {}, NOW))
       .rejects.toThrow(/calendar day/);
   });
 });
@@ -664,7 +1132,7 @@ describe("taskEffort: booked versus estimated", () => {
     expect(effort.entryCount).toBe(1);
     // The meeting's own 90 minutes are in the WEEK, and in neither of the two
     // numbers above -- which is the whole shape of "counted once".
-    const totals = await timesheetTotals(handle.db, WEEK, NOW);
+    const totals = await timesheetTotals(handle.db, WEEK, {}, NOW);
     expect(totals.meetingMinutes).toBe(90);
     expect(totals.entryMinutes).toBe(30);
     expect(totals.countedMinutes).toBe(120);
@@ -696,16 +1164,16 @@ describe("taskEffort: booked versus estimated", () => {
    * answer "where did the week go" with work nobody has done.
    */
   it("changes no week's total, however large the estimate", async () => {
-    const before = await timesheetTotals(handle.db, WEEK, NOW);
+    const before = await timesheetTotals(handle.db, WEEK, {}, NOW);
     const id = await task({ estimateMinutes: 525600 });
-    const after = await timesheetTotals(handle.db, WEEK, NOW);
+    const after = await timesheetTotals(handle.db, WEEK, {}, NOW);
     expect(after).toEqual(before);
     expect(after.countedMinutes).toBe(0);
 
     // And once an hour IS booked to it, the week counts the HOUR and not the
     // estimate: 60, never 525660.
     await bookedTo(id, 60);
-    expect((await timesheetTotals(handle.db, WEEK, NOW)).countedMinutes).toBe(60);
+    expect((await timesheetTotals(handle.db, WEEK, {}, NOW)).countedMinutes).toBe(60);
   });
 
   /**

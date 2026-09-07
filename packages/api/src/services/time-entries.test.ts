@@ -483,6 +483,12 @@ describe("time entries archive", () => {
       expect(hints).toHaveLength(1);
       expect(hints[0]?.keys).toContainEqual(["time-entries"]);
       expect(hints[0]?.keys).toContainEqual(["time-entry", entry.id]);
+      // `["timesheet"]` (Task 4): the week's page reads time_entries AND
+      // meetings, and a TanStack query has ONE key -- so it cannot be nested
+      // under either table's and both mutators publish this one instead.
+      // Archiving is how an hour leaves a total, so the week has to hear about
+      // it as surely as the task does.
+      expect(hints[0]?.keys).toContainEqual(["timesheet"]);
       // The second archive changes nothing, so it must not tell every client to
       // refetch -- companies.ts's and meetings.ts's rule.
       await archiveTimeEntry(handle.db, actorId, entry.id);
@@ -524,6 +530,9 @@ describe("time entries: the task an hour was booked to hears about it", () => {
         workDate: "2026-09-08", minutes: 60, billable: true, taskId: id,
       });
       expect(hints[0]?.keys).toContainEqual(["task", id]);
+      // The week hears about every entry, task or no task -- see the archive
+      // test above for why the timesheet cannot listen to `["time-entries"]`.
+      expect(hints[0]?.keys).toContainEqual(["timesheet"]);
 
       // An entry on a project and no task has no task key to publish -- and a
       // key for a null id would be one every drawer in the app would refetch on.

@@ -70,7 +70,14 @@ import { publish } from "./sse.js";
  * site -- an entry linked to a project and no task has no task key to publish.
  */
 function publishTimeEntryHint(id: string, taskIds: (string | null)[] = []): void {
-  const keys: string[][] = [["time-entries"], ["time-entry", id]];
+  // `["timesheet"]` SINCE v1.9.0 TASK 4, and it is a key of its own rather than
+  // a nesting under either table's. The timesheet reads time_entries AND
+  // meetings, and a TanStack query has one key: under `["time-entries"]` it
+  // would miss every meeting write, and under `["meetings"]` every entry.
+  // services/meetings.ts publishes the same key for the other half. (The claim
+  // routes/timesheet.ts used to carry -- that the existing two hints were enough
+  // -- was never true; see publishMeetingHint.)
+  const keys: string[][] = [["time-entries"], ["time-entry", id], ["timesheet"]];
   for (const taskId of new Set(taskIds.filter((t): t is string => t !== null))) {
     keys.push(["task", taskId]);
   }

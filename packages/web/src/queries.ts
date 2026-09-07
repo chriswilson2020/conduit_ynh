@@ -49,6 +49,9 @@ import {
   taskDependencySchema,
   taskEffortSchema,
   taskSchema,
+  timeEntrySchema,
+  timesheetTotalsSchema,
+  timesheetWeekSchema,
   usersResponseSchema,
   type BulkThreadActionInput,
   type BulkMessageActionInput,
@@ -111,6 +114,10 @@ import {
   type StatusReportRecord,
   type Task,
   type TaskStatus,
+  type TimeEntry,
+  type TimeEntryCreateInput,
+  type TimeEntryUpdateInput,
+  type TimesheetFilters,
   type UpdateCompanyInput,
   type UpdateContactInput,
   type UpdateDealInput,
@@ -2712,4 +2719,124 @@ export async function applyImport(input: { planId: string; kind: "export" | "csv
  */
 export async function cancelImport(planId: string): Promise<void> {
   await deleteRequest(`/import/${planId}`);
+}
+
+// ---------------------------------------------------------------------------
+// Time entries and the timesheet (Phase 10)
+// ---------------------------------------------------------------------------
+
+/**
+ * **`["timesheet"]` IS A KEY OF ITS OWN, AND IT HAS TO BE.**
+ *
+ * The report reads `time_entries` AND `meetings`, and a TanStack query has ONE
+ * key -- so nesting these under `["time-entries"]` would leave the week stale
+ * after every meeting write, and under `["meetings"]` after every entry. The API
+ * publishes `["timesheet"]` from BOTH mutators for exactly that reason (api:
+ * services/time-entries.ts's publishTimeEntryHint and services/meetings.ts's
+ * publishMeetingHint), so components/sse.tsx invalidates both hooks below with no
+ * timesheet-specific case, and a meeting logged in another tab moves the figure
+ * in this one.
+ *
+ * The totals and the days are two queries against two routes rather than one
+ * payload, because only the rows grow with the range: the aggregate answers the
+ * same handful of numbers for a decade as for a day and carries no span bound,
+ * while the rows endpoint refuses more than MAX_TIMESHEET_DAY_SPAN. They cannot
+ * disagree -- the same module computes both from the same predicates, and a
+ * service test holds the day figures against the aggregate's own sum.
+ */
+export interface TimesheetParams extends TimesheetFilters {
+  from: string;
+  to: string;
+}
+
+function timesheetQueryString(params: TimesheetParams): string {
+  return toQueryString({
+    from: params.from, to: params.to,
+    company_id: params.companyId, contact_id: params.contactId,
+    deal_id: params.dealId, project_id: params.projectId,
+  });
+}
+
+export function useTimesheet(params: TimesheetParams) {
+  return useQuery({
+    queryKey: ["timesheet", "totals", params],
+    queryFn: async () => parseWith(
+      timesheetTotalsSchema,
+      await getJson<unknown>(`/timesheet${timesheetQueryString(params)}`),
+      "timesheet totals",
+    ),
+    enabled: params.from !== "" && params.to !== "",
+  });
+}
+
+export function useTimesheetDays(params: TimesheetParams) {
+  return useQuery({
+    queryKey: ["timesheet", "days", params],
+    queryFn: async () => parseWith(
+      timesheetWeekSchema,
+      await getJson<unknown>(`/timesheet/days${timesheetQueryString(params)}`),
+      "timesheet days",
+    ),
+    enabled: params.from !== "" && params.to !== "",
+  });
+}
+
+/**
+ * Mirrors publishTimeEntryHint (api: services/time-entries.ts): every entry
+ * mutation publishes `["time-entries"]`, `["time-entry", id]`, `["timesheet"]`
+ * and -- when the entry names a task -- `["task", <id>]`, which is the key the
+ * drawer's booked-versus-estimated line already listens to.
+ *
+ * BOTH TASKS ON AN UPDATE, pre-patch and post-patch, for the server's own
+ * reason: re-linking an hour moves it out of one booked total and into another,
+ * and a drawer open on the task it LEFT is exactly as stale as one open on the
+ * task it arrived at.
+ */
+function useInvalidateTimeEntry() {
+  const queryClient = useQueryClient();
+  return (entry: TimeEntry, extraTaskIds: (string | null)[] = []) => {
+    void queryClient.invalidateQueries({ queryKey: ["time-entries"] });
+    void queryClient.invalidateQueries({ queryKey: ["time-entry", entry.id] });
+    void queryClient.invalidateQueries({ queryKey: ["timesheet"] });
+    const tasks = new Set<string>();
+    if (entry.taskId !== null) tasks.add(entry.taskId);
+    for (const id of extraTaskIds) if (id !== null) tasks.add(id);
+    for (const id of tasks) void queryClient.invalidateQueries({ queryKey: ["task", id] });
+  };
+}
+
+export function useCreateTimeEntry() {
+  const invalidate = useInvalidateTimeEntry();
+  return useMutation({
+    mutationFn: async (input: TimeEntryCreateInput) =>
+      parseWith(timeEntrySchema, await postJson<unknown>("/time-entries", input), "time entry"),
+    onSuccess: (entry: TimeEntry) => invalidate(entry),
+  });
+}
+
+export function useUpdateTimeEntry() {
+  const invalidate = useInvalidateTimeEntry();
+  return useMutation({
+    // previousTaskId is passed by a caller holding the pre-patch entry -- the
+    // timesheet's edit form does -- so re-linking an hour refreshes the booked
+    // total of the task it left as well as the one it joined.
+    mutationFn: async (
+      { id, patch }: { id: string; patch: TimeEntryUpdateInput; previousTaskId?: string | null },
+    ) => parseWith(timeEntrySchema, await patchJson<unknown>(`/time-entries/${id}`, patch), "time entry"),
+    onSuccess: (entry: TimeEntry, { previousTaskId }) => invalidate(entry, [previousTaskId ?? null]),
+  });
+}
+
+/**
+ * ARCHIVE IS HOW AN HOUR COMES OUT OF A TOTAL, and it is the only way: Conduit
+ * never deletes, and an entry cannot be corrected to nothing either because
+ * `minutes > 0`. There is deliberately no delete mutation here to match.
+ */
+export function useArchiveTimeEntry() {
+  const invalidate = useInvalidateTimeEntry();
+  return useMutation({
+    mutationFn: async (id: string) =>
+      parseWith(timeEntrySchema, await postJson<unknown>(`/time-entries/${id}/archive`), "time entry"),
+    onSuccess: (entry: TimeEntry) => invalidate(entry),
+  });
 }

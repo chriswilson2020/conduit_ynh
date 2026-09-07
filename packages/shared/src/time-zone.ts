@@ -175,12 +175,35 @@ export function usableTimeZone(value: string): string {
  * promise; reading the year, month and day parts by NAME cannot drift.
  */
 export function todayInZone(timeZone: string, now: Date = new Date()): string {
-  const parts = new Intl.DateTimeFormat("en-GB", {
+  return zonedDayFormatter(timeZone)(now);
+}
+
+/**
+ * A reusable "which calendar day did this instant fall on, in this zone"
+ * function: build it once, call it per row.
+ *
+ * **BUILT ONCE PER CALLER BECAUSE CONSTRUCTING THE FORMATTER IS THE WHOLE COST,
+ * AND THAT IS MEASURED RATHER THAN ASSUMED.** `zonedDayStart` below records the
+ * finding: its first version constructed an `Intl.DateTimeFormat` inside its
+ * search loop, which is 0.04ms a call on a laptop and took the exhaustive zone
+ * test to **19.7s against a 20s timeout** on the dev server -- the two-core box
+ * this actually runs on. v1.9.0's timesheet has the same shape one table over:
+ * `timesheetDays` (api: services/timesheet.ts) has to put every meeting in the
+ * range on a calendar day, and calling `todayInZone` per row would build one
+ * formatter per meeting. So the formatter is hoisted here, `todayInZone` becomes
+ * its one-shot caller, and there is still exactly one implementation of
+ * "read the parts by NAME".
+ */
+export function zonedDayFormatter(timeZone: string): (at: Date) => string {
+  const format = new Intl.DateTimeFormat("en-GB", {
     timeZone: usableTimeZone(timeZone),
     year: "numeric", month: "2-digit", day: "2-digit",
-  }).formatToParts(now);
-  const part = (type: string): string => parts.find((p) => p.type === type)?.value ?? "";
-  return `${part("year")}-${part("month")}-${part("day")}`;
+  });
+  return (at: Date): string => {
+    const parts = format.formatToParts(at);
+    const part = (type: string): string => parts.find((p) => p.type === type)?.value ?? "";
+    return `${part("year")}-${part("month")}-${part("day")}`;
+  };
 }
 
 /**
@@ -302,16 +325,41 @@ function nextDay(day: string): string {
   return new Date(Date.UTC(year, month - 1, dayOfMonth + 1)).toISOString().slice(0, 10);
 }
 
-export function zonedDayRange(fromDay: string, toDay: string, timeZone: string): ZonedDayRange {
-  for (const day of [fromDay, toDay]) {
-    // The shape AND the round trip: "2026-13-01" and "2026-02-30" both match the
-    // pattern, and `Date.UTC` would roll each of them into a neighbouring month
-    // without complaining. Two-digit years are caught by the same trip --
-    // `Date.UTC` maps 0-99 onto 1900-1999.
-    if (!ISO_DAY.test(day) || !isRealDay(day)) {
-      throw new Error(`zonedDayRange: ${JSON.stringify(day)} is not a YYYY-MM-DD calendar day`);
-    }
+/**
+ * The shape AND the round trip: "2026-13-01" and "2026-02-30" both match the
+ * pattern, and `Date.UTC` would roll each of them into a neighbouring month
+ * without complaining. Two-digit years are caught by the same trip -- `Date.UTC`
+ * maps 0-99 onto 1900-1999.
+ *
+ * Extracted in v1.9.0 because `isoWeekRange` needs exactly this refusal and a
+ * second copy of it would be a second chance to weaken one of them. The caller's
+ * name is passed in so the message still says which function refused.
+ */
+function assertCalendarDay(day: string, caller: string): void {
+  if (!isCalendarDay(day)) {
+    throw new Error(`${caller}: ${JSON.stringify(day)} is not a YYYY-MM-DD calendar day`);
   }
+}
+
+/**
+ * Whether a string names a real calendar day: the pattern AND the round trip.
+ *
+ * **EXPORTED BECAUSE A ZOD `.refine` MUST NOT THROW, WHICH IS A MEASURED FACT
+ * RATHER THAN A STYLE RULE.** Zod 4.4.3 runs a schema-level `.refine` EVEN WHEN
+ * the object's own fields failed to parse, and hands the callback the RAW value:
+ * probed on the deploy target, `z.object({ from: z.iso.date(), … }).refine(fn)`
+ * called `fn` with `{ from: "2026-09" }` after `from` had already produced an
+ * `invalid_format` issue. So a refine that calls `calendarDaySpan` on unvalidated
+ * input turns a 400 into a 500 -- which is exactly what
+ * `GET /api/timesheet/days?from=2026-09` did, caught by its own route test. The
+ * span check in routes/timesheet.ts guards on this first.
+ */
+export function isCalendarDay(day: string): boolean {
+  return ISO_DAY.test(day) && isRealDay(day);
+}
+
+export function zonedDayRange(fromDay: string, toDay: string, timeZone: string): ZonedDayRange {
+  for (const day of [fromDay, toDay]) assertCalendarDay(day, "zonedDayRange");
   // An inverted range would otherwise answer with an empty one, which is
   // indistinguishable from an honest empty week -- a number that is wrong
   // without looking wrong, which is the failure this whole phase is about.
@@ -323,6 +371,88 @@ export function zonedDayRange(fromDay: string, toDay: string, timeZone: string):
     startInclusive: zonedDayStart(fromDay, zone),
     endExclusive: zonedDayStart(nextDay(toDay), zone),
   };
+}
+
+/**
+ * The Monday-to-Sunday week a calendar day falls in, shifted by whole weeks.
+ *
+ * **THE PAGE HAS TO NAME A RANGE BEFORE IT CAN ASK FOR ONE.** `timesheetTotals`
+ * takes a closed range of days and answers in the organisation's clock, but
+ * nothing tells the caller which range "this week" is -- so the timesheet's
+ * Previous/Next would otherwise be week arithmetic typed into a page, which is
+ * the one place a mistake moves an hour between weeks without anything saying
+ * so. It is here rather than in web/ because api: services/timesheet.test.ts
+ * uses it as the range under test, and a week the page and the tests each
+ * computed for themselves would be two weeks that agree today.
+ *
+ * **MONDAY, AND IT IS FIXED RATHER THAN LOCALE-DERIVED.** ISO 8601's week start,
+ * which is the Netherlands' and every Phase 10 test fixture's ("Monday to Sunday
+ * around NOW"). `Intl.Locale.prototype.getWeekInfo` would make the page's weeks
+ * depend on the browser's locale while the stored data and every test depend on
+ * nobody's, so two operators of one install could disagree about which week an
+ * hour is in. A single-user CRM has no reason to buy that.
+ *
+ * **PURE UTC ARITHMETIC ON A NAIVE DATE, WHICH IS `nextDay`'S RULE AND ITS
+ * REASON.** No zone is involved in "seven pages back in the calendar": the zone
+ * has already done its work by deciding what *today* is (`todayInZone`), and
+ * bringing it in here would make a 23-hour day skip a date. Note `getUTCDay`
+ * numbers Sunday 0, so the shift is `(dow + 6) % 7` -- Sunday belongs to the week
+ * that is ENDING, which is what "Monday to Sunday" means and is the off-by-one
+ * this function exists to have written down once.
+ */
+export function isoWeekRange(day: string, weekOffset = 0): { from: string; to: string } {
+  assertCalendarDay(day, "isoWeekRange");
+  if (!Number.isInteger(weekOffset)) {
+    throw new Error(`isoWeekRange: ${JSON.stringify(weekOffset)} is not a whole number of weeks`);
+  }
+  const [year, month, dayOfMonth] = day.split("-").map(Number) as [number, number, number];
+  const at = new Date(Date.UTC(year, month - 1, dayOfMonth));
+  const backToMonday = (at.getUTCDay() + 6) % 7;
+  const shift = (days: number): string =>
+    new Date(Date.UTC(year, month - 1, dayOfMonth + days)).toISOString().slice(0, 10);
+  const start = weekOffset * 7 - backToMonday;
+  return { from: shift(start), to: shift(start + 6) };
+}
+
+/**
+ * How many calendar days a closed range covers, counting both ends.
+ *
+ * **THE ROUTE'S BOUND, AND WHY THE ROWS ENDPOINT HAS ONE WHERE THE AGGREGATE
+ * DOES NOT.** `GET /api/timesheet` answers a fixed handful of numbers whatever
+ * the range, so a decade costs one scan and one row on the wire.
+ * `GET /api/timesheet/days` answers a row per entry and per meeting, so the same
+ * decade is a response nobody asked for and a page that will not render. The
+ * span is refused at the gate rather than the rows truncated, because a
+ * truncated list under an untruncated total is precisely the disagreement the
+ * whole surface exists to prevent -- see `timesheetWeekSchema`.
+ *
+ * UTC arithmetic on naive dates, `nextDay`'s rule: no zone is involved in
+ * counting pages of a calendar, and a day is 24 hours here whatever it is in
+ * anybody's clock.
+ */
+export function calendarDaySpan(fromDay: string, toDay: string): number {
+  assertCalendarDay(fromDay, "calendarDaySpan");
+  assertCalendarDay(toDay, "calendarDaySpan");
+  const ms = Date.parse(`${toDay}T00:00:00Z`) - Date.parse(`${fromDay}T00:00:00Z`);
+  return Math.round(ms / 86_400_000) + 1;
+}
+
+/**
+ * Every calendar day of a closed range, in order, both ends included.
+ *
+ * **EVERY DAY, INCLUDING THE ONES NOTHING HAPPENED ON.** The timesheet renders
+ * one section per day of the week, and a week that skipped its empty days would
+ * read as a week those days were not in -- "where did the week go" is a question
+ * a blank Wednesday answers as clearly as a full one.
+ */
+export function calendarDaysBetween(fromDay: string, toDay: string): string[] {
+  const span = calendarDaySpan(fromDay, toDay);
+  if (span < 1) {
+    throw new Error(`calendarDaysBetween: ${fromDay} is after ${toDay}, so the range runs backwards`);
+  }
+  const days: string[] = [];
+  for (let day = fromDay; days.length < span; day = nextDay(day)) days.push(day);
+  return days;
 }
 
 /** Whether `day` survives a round trip through the calendar -- i.e. names a day

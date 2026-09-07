@@ -11,7 +11,8 @@ import {
   projectSchema, taskSchema, taskDependencySchema, taskEffortSchema,
   shiftResultSchema, ganttPayloadSchema,
   meetingSchema, meetingDetailSchema, meetingSummarySchema, timeEntrySchema,
-  timesheetSummary, timesheetTotalsSchema,
+  timesheetBillableSummary, timesheetSummary, timesheetTotalsSchema, timesheetWeekSchema,
+  MAX_TIMESHEET_DAY_SPAN,
   documentSchema, orgProfileSchema,
   agreementSchema, letterSchema, recordDocumentSchema, statusReportSchema,
   documentTemplateSchema, CONTACT_FIELD_CAPS, DEFAULT_TIME_ZONE,
@@ -2447,6 +2448,153 @@ describe("timesheet route", () => {
     });
     expect(response.statusCode).toBe(401);
     expect(errorResponseSchema.parse(response.json()).error).toBe("unauthenticated");
+    await a.close();
+  });
+
+  /* ---------------------------------------------------------------------- *
+   *  Task 4: the record filters, the billable split, and the rows
+   * ---------------------------------------------------------------------- */
+
+  it("narrows the whole report to one record, on both halves at once", async () => {
+    const a = await app();
+    await seedWeek(a);
+    const other = projectSchema.parse((await a.inject({
+      method: "POST", url: "/api/projects", headers: authHeaders, payload: { name: "Elsewhere" },
+    })).json());
+    const query = `from=${yesterday}&to=${today}`;
+
+    const all = timesheetTotalsSchema.parse((await a.inject({
+      method: "GET", url: `/api/timesheet?${query}`, headers: authHeaders,
+    })).json());
+    const none = timesheetTotalsSchema.parse((await a.inject({
+      method: "GET", url: `/api/timesheet?${query}&project_id=${other.id}`, headers: authHeaders,
+    })).json());
+    expect(all.countedMinutes).toBe(225);
+    // Both halves narrowed: an entries-only filter would leave the meetings in.
+    expect(none.countedMinutes).toBe(0);
+    expect(none.meetingsInRange).toBe(0);
+    expect(none.entryCount).toBe(0);
+    await a.close();
+  });
+
+  /** The split rides the same payload and the same aggregate. `seedWeek` logs
+   * 120 billable minutes and 45 non-billable ones. */
+  it("carries the billable split, and a sentence that says what is in neither half", async () => {
+    const a = await app();
+    await seedWeek(a);
+    const totals = timesheetTotalsSchema.parse((await a.inject({
+      method: "GET", url: `/api/timesheet?from=${yesterday}&to=${today}`, headers: authHeaders,
+    })).json());
+    expect(totals.billableEntryMinutes).toBe(120);
+    expect(totals.billableEntryCount).toBe(1);
+    expect(timesheetBillableSummary(totals)).toBe(
+      "2h of the 2h 45m logged by hand is billable, across 1 entry. Meetings carry no billable "
+      + "flag, so the 1h from meetings is in neither figure.",
+    );
+    await a.close();
+  });
+
+  it("400s a record filter that is not an id", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "GET",
+      url: `/api/timesheet?from=${yesterday}&to=${today}&company_id=acme`,
+      headers: authHeaders,
+    });
+    expect(response.statusCode, response.body).toBe(400);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("validation");
+    await a.close();
+  });
+
+  /**
+   * **THE ROWS THE FIGURE IS MADE OF, OVER HTTP.** Parsed rather than
+   * shape-asserted: `timesheetWeekSchema` refuses a day whose figure is not its
+   * own rows, a row that is uncounted for no stated reason, and a row filed under
+   * a day the range does not contain -- so this is the contract biting rather
+   * than a spot check.
+   */
+  it("answers the week row by row, entries and meetings together", async () => {
+    const a = await app();
+    await seedWeek(a);
+    const response = await a.inject({
+      method: "GET", url: `/api/timesheet/days?from=${yesterday}&to=${today}`, headers: authHeaders,
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    const week = timesheetWeekSchema.parse(response.json());
+    expect(week.days.map((day) => day.day)).toEqual([yesterday, today]);
+    const rows = week.days.flatMap((day) => day.rows);
+    expect(rows.filter((row) => row.kind === "entry")).toHaveLength(2);
+    expect(rows.filter((row) => row.kind === "meeting")).toHaveLength(2);
+    // The meeting nobody timed is a ROW the operator can look at, not merely a
+    // number in the sentence above the list.
+    expect(rows.filter((row) => row.uncountedReason === "no-recorded-length"))
+      .toMatchObject([{ label: "Corridor", minutes: null, counted: false }]);
+    // Every row names the project it was booked to, already readable.
+    expect(rows.every((row) => row.links.some((link) => link.label === "Rollout"))).toBe(true);
+    // AND THE LIST ADDS UP TO THE HEADLINE, which is the property the whole
+    // surface rests on -- fetched over HTTP, from the two endpoints separately.
+    const totals = timesheetTotalsSchema.parse((await a.inject({
+      method: "GET", url: `/api/timesheet?from=${yesterday}&to=${today}`, headers: authHeaders,
+    })).json());
+    expect(week.days.reduce((sum, day) => sum + day.countedMinutes, 0))
+      .toBe(totals.countedMinutes);
+    await a.close();
+  });
+
+  /**
+   * **THE SPAN BOUND IS ON THE ROWS AND NOT ON THE AGGREGATE**, because only one
+   * of the two grows with the range. Refused rather than truncated: a short list
+   * under a full total is the one outcome this surface may not produce.
+   */
+  it("refuses to list more than a quarter at once, while the aggregate takes any range", async () => {
+    const a = await app();
+    const from = "2026-01-01";
+    const tooLong = addDays(from, MAX_TIMESHEET_DAY_SPAN);
+    const exactly = addDays(from, MAX_TIMESHEET_DAY_SPAN - 1);
+
+    const refused = await a.inject({
+      method: "GET", url: `/api/timesheet/days?from=${from}&to=${tooLong}`, headers: authHeaders,
+    });
+    expect(refused.statusCode, refused.body).toBe(400);
+    expect(errorResponseSchema.parse(refused.json()).error).toBe("validation");
+
+    const allowed = await a.inject({
+      method: "GET", url: `/api/timesheet/days?from=${from}&to=${exactly}`, headers: authHeaders,
+    });
+    expect(allowed.statusCode, allowed.body).toBe(200);
+    expect(timesheetWeekSchema.parse(allowed.json()).days).toHaveLength(MAX_TIMESHEET_DAY_SPAN);
+
+    // The same decade-long range is fine on the aggregate, whose answer is the
+    // same size whatever it is asked.
+    const totals = await a.inject({
+      method: "GET", url: `/api/timesheet?from=2020-01-01&to=2030-01-01`, headers: authHeaders,
+    });
+    expect(totals.statusCode, totals.body).toBe(200);
+    await a.close();
+  });
+
+  /** A BACKWARDS RANGE IS NAMED AS SUCH, not reported as too long: the span of an
+   * inverted range is negative, so a gate that checked the length first would
+   * blame the wrong thing. */
+  it("400s a backwards or malformed range on the rows endpoint too", async () => {
+    const a = await app();
+    for (const query of [
+      "", "?from=2026-09-07", "?from=2026-09-13&to=2026-09-07", "?from=2026-09&to=2026-09-13",
+    ]) {
+      const response = await a.inject({
+        method: "GET", url: `/api/timesheet/days${query}`, headers: authHeaders,
+      });
+      expect(response.statusCode, query).toBe(400);
+    }
+    await a.close();
+  });
+
+  it("returns 401 for the rows without an identity header", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "GET", url: `/api/timesheet/days?from=${yesterday}&to=${today}`,
+    });
+    expect(response.statusCode).toBe(401);
     await a.close();
   });
 });

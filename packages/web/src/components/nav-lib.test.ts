@@ -20,9 +20,17 @@ describe("splitNav", () => {
     expect(primary.map((destination) => destination.label)).toEqual(["Mail", "Companies", "Contacts", "My Tasks"]);
   });
 
-  it("leaves Pipelines, Projects, Gantt and Settings behind More, in sidebar order", () => {
+  /**
+   * The Timesheet joined this list in v1.9.0 rather than the bar: a fifth tab
+   * would evict one of the four the phase spec fixes, and the timesheet is a
+   * page you go to to answer a question rather than one you flick between while
+   * working. The exact list is asserted so a later task cannot slip a
+   * destination into either half without saying so.
+   */
+  it("leaves Pipelines, Projects, Gantt, Timesheet and Settings behind More, in sidebar order", () => {
     const { overflow } = splitNav(NAV_DESTINATIONS);
-    expect(overflow.map((destination) => destination.id)).toEqual(["pipelines", "projects", "gantt", "settings"]);
+    expect(overflow.map((destination) => destination.id))
+      .toEqual(["pipelines", "projects", "gantt", "timesheet", "settings"]);
   });
 
   /**

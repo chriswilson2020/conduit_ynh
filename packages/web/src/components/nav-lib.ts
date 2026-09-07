@@ -8,7 +8,9 @@
  * are unit-tested, and bottom-nav.tsx is left with nothing but markup.
  */
 
-export type NavId = "mail" | "companies" | "contacts" | "my-tasks" | "pipelines" | "projects" | "gantt" | "settings";
+export type NavId =
+  | "mail" | "companies" | "contacts" | "my-tasks" | "pipelines" | "projects" | "gantt"
+  | "timesheet" | "settings";
 
 export interface NavDestination {
   readonly id: NavId;
@@ -50,6 +52,9 @@ export const NAV_DESTINATIONS = [
   { id: "projects", label: "Projects", to: "/projects", match: "/projects" },
   { id: "my-tasks", label: "My Tasks", to: "/my-tasks", match: "/my-tasks" },
   { id: "gantt", label: "Gantt", to: "/gantt", match: "/gantt" },
+  // v1.9.0's timesheet. NINTH, and it goes to the More sheet rather than the bar
+  // -- see PRIMARY_NAV_IDS, which this task does not touch and argues why.
+  { id: "timesheet", label: "Timesheet", to: "/timesheet", match: "/timesheet" },
   { id: "settings", label: "Settings", to: "/settings/mail", match: "/settings" },
 ] as const satisfies readonly NavDestination[];
 
@@ -61,6 +66,15 @@ export const NAV_DESTINATIONS = [
  * Working a pipeline or a schedule is desk work, and both stay one tap away
  * behind More. Mail leads because it carries the unread badge. Reordering
  * this is a decision to argue for, not a tweak -- the test names the four.
+ */
+/**
+ * ...AND v1.9.0's TIMESHEET DID NOT JOIN THEM, which is a decision rather than
+ * an omission. The bar holds four tabs plus More; a fifth would either evict one
+ * of these -- the phase spec fixes which four and why -- or make six targets
+ * across a 375px bar, 62px each. The timesheet is a page you go to once or twice
+ * a day to answer a question, not one you flick between while working, so it
+ * belongs with Pipelines, Projects and the Gantt behind More. The e2e journey
+ * reaches it exactly the way those three are reached.
  */
 export const PRIMARY_NAV_IDS: readonly string[] = ["mail", "companies", "contacts", "my-tasks"];
 

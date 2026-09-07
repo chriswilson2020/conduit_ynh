@@ -144,6 +144,9 @@ export function Shell({ children }: { children: ReactNode }) {
             <Link to="/gantt" className={navLinkClass} activeProps={{ className: activeNavLinkClass }}>
               Gantt
             </Link>
+            <Link to="/timesheet" className={navLinkClass} activeProps={{ className: activeNavLinkClass }}>
+              Timesheet
+            </Link>
             <Link to="/settings/mail" className={inSettings ? activeNavLinkClass : navLinkClass}>
               Settings
             </Link>

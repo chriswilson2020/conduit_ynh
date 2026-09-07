@@ -24,13 +24,26 @@ import { Input } from "./ui/input";
  * app has, and one of them going out of step with the other would be a bug in
  * either spelling.
  */
-export type EntityPickerKind = MailLinkKind;
+/**
+ * **A FIFTH KIND SINCE v1.9.0, AND IT IS NOT A MAIL LINK.** `MailLinkKind`'s four
+ * members were "the four record kinds this app has" and that stopped being true
+ * when `time_entries` shipped with FIVE record columns (Phase 10 Task 1): an hour
+ * can be booked to a task, and a mail thread cannot be filed against one. So the
+ * union is widened here rather than `MailLinkKind` being changed -- widening that
+ * would offer Task as a filing target in the mail link panel, which the API would
+ * refuse.
+ *
+ * Every existing caller passes one of the original four and is unaffected; the
+ * timesheet's Log time form is the only one that passes "task".
+ */
+export type EntityPickerKind = MailLinkKind | "task";
 
 export const KIND_LABEL: Record<EntityPickerKind, string> = {
   contact: "Contact",
   company: "Company",
   deal: "Deal",
   project: "Project",
+  task: "Task",
 };
 
 /**
@@ -76,6 +89,7 @@ export function EntityPicker({
       {kind === "contact" && <ContactResults query={query} onPick={onPick} />}
       {kind === "deal" && <DealResults query={query} onPick={onPick} />}
       {kind === "project" && <ProjectResults query={query} onPick={onPick} />}
+      {kind === "task" && <TaskResults query={query} onPick={onPick} />}
     </div>
   );
 }
@@ -148,6 +162,25 @@ function DealResults({ query, onPick }: { query: string; onPick: PickPayload }) 
  * useProjects mirrors listProjects), so the filtering is done here rather than
  * by a query parameter that does not exist.
  */
+/**
+ * Tasks go through global search for DealResults' reason and one more of their
+ * own: `GET /api/tasks` answers an unpaginated list of EVERY task, project-scoped
+ * or not, so listing them here would fetch the whole table on every keystroke's
+ * worth of filtering. Search indexes task titles across projects (and includes
+ * done ones deliberately -- finding finished work by name is the point), so it is
+ * both the cheaper and the better answer.
+ */
+function TaskResults({ query, onPick }: { query: string; onPick: PickPayload }) {
+  const { data } = useSearch(query);
+  if (query === "") return <p className="px-1 text-xs text-slate-400">Type to search tasks</p>;
+  return (
+    <PickerResults
+      results={(data?.tasks ?? []).slice(0, RESULT_LIMIT).map((task) => ({ id: task.id, label: task.title }))}
+      onPick={onPick}
+    />
+  );
+}
+
 function ProjectResults({ query, onPick }: { query: string; onPick: PickPayload }) {
   const { data = [] } = useProjects({ archived: false });
   const needle = query.toLowerCase();

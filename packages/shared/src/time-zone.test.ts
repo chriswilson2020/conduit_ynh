@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
-  DEFAULT_TIME_ZONE, MAX_TIME_ZONE_LENGTH, timeZoneLabel, timeZoneProblem, todayInZone,
-  usableTimeZone, zonedDayRange,
+  calendarDaySpan, calendarDaysBetween, DEFAULT_TIME_ZONE, MAX_TIME_ZONE_LENGTH, isCalendarDay,
+  isoWeekRange, timeZoneLabel, timeZoneProblem, todayInZone, usableTimeZone, zonedDayFormatter,
+  zonedDayRange,
 } from "./time-zone.js";
 
 /**
@@ -404,5 +405,222 @@ describe("zonedDayRange", () => {
     ]) {
       expect(() => zonedDayRange(bad, "2026-12-31", "UTC"), bad).toThrow(/calendar day/);
     }
+  });
+});
+
+/**
+ * **THE WEEK THE TIMESHEET OPENS ON (Phase 10 Task 4).**
+ *
+ * The page's Previous/Next buttons are this function and nothing else, so an
+ * off-by-one here moves an hour between weeks on the one surface the phase
+ * exists to produce. The cases below are the three a hand-written version gets
+ * wrong: Sunday (which `getUTCDay` numbers 0 and which belongs to the week that
+ * is ENDING), a month boundary, and a year boundary crossed by the offset
+ * rather than by the day.
+ */
+describe("isoWeekRange", () => {
+  /** NOW in every Phase 10 fixture is Wednesday 9 September 2026, and its week
+   * is the WEEK constant those tests use. Naming the same days here is what
+   * stops the page and the service tests describing two different weeks. */
+  it("answers Monday to Sunday for a day in the middle of the week", () => {
+    expect(isoWeekRange("2026-09-09")).toEqual({ from: "2026-09-07", to: "2026-09-13" });
+  });
+
+  /**
+   * EVERY DAY OF ONE WEEK ANSWERS THE SAME WEEK, which is the property rather
+   * than seven separate facts -- and it is the one a raw `getUTCDay()` breaks,
+   * because Sunday would start a week of its own.
+   */
+  it("puts all seven days of a week in the same week, Sunday included", () => {
+    for (const day of [
+      "2026-09-07", "2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11", "2026-09-12", "2026-09-13",
+    ]) {
+      expect(isoWeekRange(day), day).toEqual({ from: "2026-09-07", to: "2026-09-13" });
+    }
+    // ...and the days either side are NOT in it, which is what stops the
+    // assertion above passing for a function that answers one fixed week.
+    expect(isoWeekRange("2026-09-06").to).toBe("2026-09-06");
+    expect(isoWeekRange("2026-09-14").from).toBe("2026-09-14");
+  });
+
+  it("steps a whole week back and forward, and 0 is where it started", () => {
+    expect(isoWeekRange("2026-09-09", -1)).toEqual({ from: "2026-08-31", to: "2026-09-06" });
+    expect(isoWeekRange("2026-09-09", 1)).toEqual({ from: "2026-09-14", to: "2026-09-20" });
+    expect(isoWeekRange("2026-09-09", 0)).toEqual(isoWeekRange("2026-09-09"));
+  });
+
+  /**
+   * MONTHS AND YEARS ARE THE CALENDAR'S BUSINESS, NOT THIS FUNCTION'S, and
+   * `Date.UTC` rolls both for free -- but only because the arithmetic is done on
+   * the day-of-month rather than by adding milliseconds. The last case crosses a
+   * year by OFFSET, which is the arm a day-only test never reaches.
+   */
+  it("crosses a month and a year without arithmetic of its own", () => {
+    expect(isoWeekRange("2026-12-31")).toEqual({ from: "2026-12-28", to: "2027-01-03" });
+    expect(isoWeekRange("2026-03-01")).toEqual({ from: "2026-02-23", to: "2026-03-01" });
+    expect(isoWeekRange("2026-01-06", -2)).toEqual({ from: "2025-12-22", to: "2025-12-28" });
+    expect(isoWeekRange("2026-12-30", 3)).toEqual({ from: "2027-01-18", to: "2027-01-24" });
+  });
+
+  /**
+   * A RANGE IS ALWAYS SEVEN FORWARD DAYS FROM A MONDAY, checked over two years
+   * of days and four offsets rather than at the handful of dates a person thinks
+   * to name. The oracle is `Date.UTC` day-of-week arithmetic, which is
+   * independent of the implementation's own `(dow + 6) % 7`.
+   */
+  it("always answers a forward range of exactly seven days, whichever day it is given", () => {
+    const start = Date.UTC(2025, 0, 1);
+    for (let n = 0; n < 730; n += 1) {
+      const day = new Date(start + n * 86_400_000).toISOString().slice(0, 10);
+      for (const offset of [-3, -1, 0, 2]) {
+        const week = isoWeekRange(day, offset);
+        const where = `${day} ${String(offset)}`;
+        expect(week.from < week.to, where).toBe(true);
+        const span = (Date.parse(`${week.to}T00:00:00Z`) - Date.parse(`${week.from}T00:00:00Z`))
+          / 86_400_000;
+        expect(span, where).toBe(6);
+        expect(new Date(`${week.from}T00:00:00Z`).getUTCDay(), where).toBe(1);
+        expect(new Date(`${week.to}T00:00:00Z`).getUTCDay(), where).toBe(0);
+        // The day asked about is INSIDE the week the offset counts from.
+        if (offset === 0) expect(week.from <= day && day <= week.to, where).toBe(true);
+      }
+      // ...and one offset really is seven days, not merely "some other week".
+      expect(isoWeekRange(day, 1).from, day).toBe(isoWeekRange(
+        new Date(Date.parse(`${day}T00:00:00Z`) + 7 * 86_400_000).toISOString().slice(0, 10),
+      ).from);
+    }
+  });
+
+  /**
+   * THE SAME REFUSAL `zonedDayRange` GIVES, out of the same helper, and it names
+   * which function refused. A week computed from a rolled-over "2026-02-30"
+   * would be a range over days nobody asked for.
+   */
+  it("refuses anything that is not a calendar day, and a fractional offset", () => {
+    for (const bad of ["2026-09", "2026-13-01", "2026-02-30", "0026-09-07", ""]) {
+      expect(() => isoWeekRange(bad), bad).toThrow(/isoWeekRange.*calendar day/);
+    }
+    expect(() => isoWeekRange("2026-09-09", 0.5)).toThrow(/whole number of weeks/);
+  });
+});
+
+describe("calendarDaySpan and calendarDaysBetween", () => {
+  it("counts both ends, so one day is a span of one", () => {
+    expect(calendarDaySpan("2026-09-07", "2026-09-07")).toBe(1);
+    expect(calendarDaySpan("2026-09-07", "2026-09-13")).toBe(7);
+    expect(calendarDaysBetween("2026-09-07", "2026-09-07")).toEqual(["2026-09-07"]);
+  });
+
+  it("lists every day of a week in order, empty ones included", () => {
+    expect(calendarDaysBetween("2026-09-07", "2026-09-13")).toEqual([
+      "2026-09-07", "2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11", "2026-09-12", "2026-09-13",
+    ]);
+  });
+
+  /**
+   * A MONTH, A LEAP DAY AND A YEAR, because the arithmetic is the calendar's and
+   * a version that added 86,400,000ms to a Date would drift on neither -- but
+   * one that used a zone would skip a date on a 23-hour day. February 2028 has a
+   * 29th; a range across it that came back 28 days long would be a week's hours
+   * landing in the wrong month.
+   */
+  it("crosses months, a leap day and a year end", () => {
+    expect(calendarDaySpan("2026-01-31", "2026-02-01")).toBe(2);
+    expect(calendarDaySpan("2028-02-01", "2028-03-01")).toBe(30);
+    expect(calendarDaysBetween("2028-02-27", "2028-03-01"))
+      .toEqual(["2028-02-27", "2028-02-28", "2028-02-29", "2028-03-01"]);
+    expect(calendarDaysBetween("2026-12-30", "2027-01-02"))
+      .toEqual(["2026-12-30", "2026-12-31", "2027-01-01", "2027-01-02"]);
+  });
+
+  /** The list and the count are one answer, checked against each other over a
+   * year of ranges rather than at the dates a person thinks of. */
+  it("agrees with itself: the list is always exactly the span long", () => {
+    const start = Date.UTC(2026, 0, 1);
+    for (let n = 0; n < 365; n += 5) {
+      const from = new Date(start + n * 86_400_000).toISOString().slice(0, 10);
+      for (const length of [1, 2, 7, 31, 90]) {
+        const to = new Date(start + (n + length - 1) * 86_400_000).toISOString().slice(0, 10);
+        expect(calendarDaySpan(from, to), `${from}..${to}`).toBe(length);
+        const days = calendarDaysBetween(from, to);
+        expect(days.length, `${from}..${to}`).toBe(length);
+        expect(days[0]).toBe(from);
+        expect(days[days.length - 1]).toBe(to);
+      }
+    }
+  });
+
+  it("refuses a backwards range and a day that is not one", () => {
+    expect(() => calendarDaysBetween("2026-09-13", "2026-09-07")).toThrow(/runs backwards/);
+    expect(() => calendarDaySpan("2026-02-30", "2026-09-07")).toThrow(/calendarDaySpan.*calendar day/);
+    expect(() => calendarDaySpan("2026-09-07", "not-a-day")).toThrow(/calendarDaySpan.*calendar day/);
+  });
+});
+
+/**
+ * **THE PREDICATE THAT KEEPS A ZOD REFINE FROM THROWING.**
+ *
+ * routes/timesheet.ts's span check calls `calendarDaySpan`, which throws -- and
+ * Zod 4.4.3 runs a schema-level `.refine` even when the object's own fields
+ * failed, handing it the raw value. Without this guard
+ * `GET /api/timesheet/days?from=2026-09` answered 500 for a request the field
+ * validators had already refused; its own route test caught it.
+ */
+describe("isCalendarDay", () => {
+  it("accepts a real day and refuses everything that merely looks like one", () => {
+    expect(isCalendarDay("2026-09-07")).toBe(true);
+    expect(isCalendarDay("2028-02-29")).toBe(true);
+    for (const bad of [
+      "2026-09", "2026-13-01", "2026-02-30", "0026-09-07", "", "07/09/2026",
+      "2026-09-07T00:00:00Z", "2026-9-7",
+    ]) {
+      expect(isCalendarDay(bad), bad).toBe(false);
+    }
+  });
+
+  /** ONE RULE, TWO CALLERS: whatever this accepts is exactly what the throwing
+   * helpers accept, or the guard would let something through that then throws. */
+  it("accepts exactly what the throwing helpers accept", () => {
+    for (const day of [
+      "2026-09-07", "2028-02-29", "2026-09", "2026-13-01", "2026-02-30", "0026-09-07", "",
+    ]) {
+      let threw = false;
+      try {
+        calendarDaySpan(day, "2030-01-01");
+      } catch {
+        threw = true;
+      }
+      expect(threw, day).toBe(!isCalendarDay(day));
+    }
+  });
+});
+
+/**
+ * The formatter `todayInZone` is now a one-shot caller of, and which
+ * `timesheetDays` (api: services/timesheet.ts) builds once and calls per
+ * meeting.
+ */
+describe("zonedDayFormatter", () => {
+  it("answers the same day todayInZone does, for the same instant and zone", () => {
+    // 23:30 UTC on the 6th is Sunday in UTC and Monday in Amsterdam -- not a
+    // different day but a different WEEK, which is why this conversion exists
+    // at all rather than a `slice(0, 10)`.
+    const at = new Date("2026-09-06T23:30:00.000Z");
+    for (const zone of ["UTC", "Europe/Amsterdam", "Pacific/Auckland", "America/Los_Angeles"]) {
+      expect(zonedDayFormatter(zone)(at), zone).toBe(todayInZone(zone, at));
+    }
+    expect(zonedDayFormatter("UTC")(at)).toBe("2026-09-06");
+    expect(zonedDayFormatter("Europe/Amsterdam")(at)).toBe("2026-09-07");
+  });
+
+  it("is reusable -- one formatter answers many instants", () => {
+    const day = zonedDayFormatter("Europe/Amsterdam");
+    expect(day(new Date("2026-09-06T21:59:00.000Z"))).toBe("2026-09-06");
+    expect(day(new Date("2026-09-06T22:00:00.000Z"))).toBe("2026-09-07");
+    expect(day(new Date("2027-02-01T12:00:00.000Z"))).toBe("2027-02-01");
+  });
+
+  it("falls back to UTC for a zone that no longer resolves, exactly as usableTimeZone says", () => {
+    expect(zonedDayFormatter("Factory")(new Date("2026-09-06T23:30:00.000Z"))).toBe("2026-09-06");
   });
 });

@@ -5,11 +5,16 @@ import {
   DEFAULT_TIME_ZONE,
   MAX_TASK_ESTIMATE_MINUTES,
   MAX_TIME_ENTRY_MINUTES,
+  MAX_TIMESHEET_DAY_SPAN,
   formatMinutes,
   taskEffortSchema,
   taskEffortSummary,
+  timesheetBillableSummary,
+  timesheetFiltersSchema,
+  timesheetRowSchema,
   timesheetSummary,
   timesheetTotalsSchema,
+  timesheetWeekSchema,
   timeEntryAtLeastOneLink,
   timeEntryCreateInputSchema,
   timeEntryUpdateInputSchema,
@@ -2854,7 +2859,7 @@ describe("formatMinutes", () => {
 describe("timesheetTotalsSchema", () => {
   const totals = {
     from: "2026-09-07", to: "2026-09-13", timeZone: "Europe/Amsterdam",
-    entryMinutes: 300, entryCount: 4,
+    entryMinutes: 300, entryCount: 4, billableEntryMinutes: 180, billableEntryCount: 2,
     meetingMinutes: 150, meetingsCounted: 3, meetingsUnmeasured: 2, meetingsNotYetOccurred: 1,
     meetingsInRange: 6,
     countedMinutes: 450,
@@ -2898,7 +2903,7 @@ describe("timesheetTotalsSchema", () => {
   it("accepts an empty week, which is zero hours rather than no answer", () => {
     const empty = {
       from: "2026-09-07", to: "2026-09-13", timeZone: "UTC",
-      entryMinutes: 0, entryCount: 0,
+      entryMinutes: 0, entryCount: 0, billableEntryMinutes: 0, billableEntryCount: 0,
       meetingMinutes: 0, meetingsCounted: 0, meetingsUnmeasured: 0, meetingsNotYetOccurred: 0,
       meetingsInRange: 0, countedMinutes: 0,
     };
@@ -2909,7 +2914,7 @@ describe("timesheetTotalsSchema", () => {
 describe("timesheetSummary", () => {
   const base = {
     from: "2026-09-07", to: "2026-09-13", timeZone: "Europe/Amsterdam",
-    entryMinutes: 300, entryCount: 4,
+    entryMinutes: 300, entryCount: 4, billableEntryMinutes: 180, billableEntryCount: 2,
     meetingMinutes: 150, meetingsCounted: 3, meetingsUnmeasured: 0, meetingsNotYetOccurred: 0,
     meetingsInRange: 3,
     countedMinutes: 450,
@@ -2950,7 +2955,7 @@ describe("timesheetSummary", () => {
   it("reads as a real sentence when a week is empty", () => {
     expect(timesheetSummary({
       from: "2026-09-07", to: "2026-09-13", timeZone: "UTC",
-      entryMinutes: 0, entryCount: 0,
+      entryMinutes: 0, entryCount: 0, billableEntryMinutes: 0, billableEntryCount: 0,
       meetingMinutes: 0, meetingsCounted: 0, meetingsUnmeasured: 0, meetingsNotYetOccurred: 0,
       meetingsInRange: 0, countedMinutes: 0,
     })).toBe(
@@ -2973,6 +2978,274 @@ describe("timesheetSummary", () => {
     for (const fragment of ["1h 30m", "1h 5m", "1 entry", "25m", "1 meeting", "3 meetings", "4 meetings"]) {
       expect(sentence, fragment).toContain(fragment);
     }
+  });
+});
+
+/* ========================================================================== *
+ *  The billable split, the filters and the rows (Phase 10 Task 4)
+ * ========================================================================== */
+
+describe("timesheetTotalsSchema: the billable split", () => {
+  const totals = {
+    from: "2026-09-07", to: "2026-09-13", timeZone: "Europe/Amsterdam",
+    entryMinutes: 300, entryCount: 4, billableEntryMinutes: 180, billableEntryCount: 2,
+    meetingMinutes: 150, meetingsCounted: 3, meetingsUnmeasured: 0, meetingsNotYetOccurred: 0,
+    meetingsInRange: 3,
+    countedMinutes: 450,
+  };
+
+  /**
+   * **A SPLIT CANNOT EXCEED THE THING IT SPLITS**, on either axis. The mistake
+   * this catches is a FILTER over the wrong population -- the billable figure
+   * summed before the range or the record filter was applied -- and it is wrong
+   * in the direction nobody checks, because with invoicing out of the product
+   * nothing downstream ever contradicts a chargeable-hours figure.
+   */
+  it("refuses a billable half larger than the entries it is a half of", () => {
+    expect(timesheetTotalsSchema.safeParse({ ...totals, billableEntryMinutes: 301 }).success)
+      .toBe(false);
+    expect(timesheetTotalsSchema.safeParse({ ...totals, billableEntryCount: 5 }).success).toBe(false);
+    // The edges are legal: a week where everything, or nothing, was billable.
+    expect(timesheetTotalsSchema.safeParse({
+      ...totals, billableEntryMinutes: 300, billableEntryCount: 4,
+    }).success).toBe(true);
+    expect(timesheetTotalsSchema.safeParse({
+      ...totals, billableEntryMinutes: 0, billableEntryCount: 0,
+    }).success).toBe(true);
+  });
+
+  /** The billable minutes are NOT part of the headline's arithmetic: the total
+   * is entries plus meetings, and the split is a reading of one of those halves.
+   * A schema that added it in would refuse every honest week. */
+  it("leaves the headline's arithmetic alone", () => {
+    expect(timesheetTotalsSchema.parse(totals).countedMinutes).toBe(450);
+  });
+});
+
+describe("timesheetBillableSummary", () => {
+  const base = {
+    from: "2026-09-07", to: "2026-09-13", timeZone: "Europe/Amsterdam",
+    entryMinutes: 300, entryCount: 4, billableEntryMinutes: 180, billableEntryCount: 2,
+    meetingMinutes: 150, meetingsCounted: 3, meetingsUnmeasured: 0, meetingsNotYetOccurred: 0,
+    meetingsInRange: 3,
+    countedMinutes: 450,
+  };
+
+  /**
+   * **THE MEETINGS CLAUSE IS THE POINT.** "3h billable" printed beside a 7h 30m
+   * week invites `7h 30m - 3h = 4h 30m non-billable`, which is wrong by exactly
+   * the meetings -- they have no billable column and are in neither half. One
+   * string is what stops a page rendering the figure without the reason it does
+   * not subtract, which is `timesheetSummary`'s arrangement and its reason.
+   */
+  it("says what is billable and what is in neither figure", () => {
+    expect(timesheetBillableSummary(base)).toBe(
+      "3h of the 5h logged by hand is billable, across 2 entries. Meetings carry no billable "
+      + "flag, so the 2h 30m from meetings is in neither figure.",
+    );
+  });
+
+  it("drops the meetings clause on a week with no meetings in it", () => {
+    expect(timesheetBillableSummary({
+      ...base, meetingMinutes: 0, meetingsCounted: 0, meetingsInRange: 0, countedMinutes: 300,
+    })).toBe("3h of the 5h logged by hand is billable, across 2 entries.");
+  });
+
+  /** NOT "0m of 0m is billable", which reads as a finding about the week rather
+   * than as there being nothing to split. `formatMinutes`' own rule one level up:
+   * an empty week is a real answer and has to read like one. */
+  it("says there is nothing to split rather than splitting nothing", () => {
+    const quiet = {
+      ...base, entryMinutes: 0, entryCount: 0, billableEntryMinutes: 0, billableEntryCount: 0,
+      countedMinutes: 150,
+    };
+    expect(timesheetBillableSummary(quiet)).toBe(
+      "Nothing was logged by hand, so there is no billable split. Meetings carry no billable "
+      + "flag, so the 2h 30m from meetings is in neither figure.",
+    );
+  });
+
+  it("says 1 entry rather than 1 entries", () => {
+    expect(timesheetBillableSummary({ ...base, billableEntryMinutes: 60, billableEntryCount: 1 }))
+      .toContain("across 1 entry.");
+  });
+
+  /** DERIVED FROM THE VALUE, not from a second copy of it: every figure moves
+   * when the totals move, or the prose becomes the stale half of a pair. */
+  it("carries every figure it was given", () => {
+    const sentence = timesheetBillableSummary({
+      ...base, entryMinutes: 125, entryCount: 3, billableEntryMinutes: 65, billableEntryCount: 2,
+      meetingMinutes: 90, countedMinutes: 215,
+    });
+    for (const fragment of ["1h 5m", "2h 5m", "2 entries", "1h 30m"]) {
+      expect(sentence, fragment).toContain(fragment);
+    }
+  });
+});
+
+/**
+ * **THE FILTER CONTRACT, AND THE FIFTH LINK THAT IS DELIBERATELY NOT IN IT.**
+ *
+ * `time_entries` carries five record links and this carries four. That is a
+ * decision with a reason -- `meetings` has no `task_id`, so a task-filtered
+ * report would answer "0m across 0 meetings" for structural reasons a page could
+ * not explain, and `GET /api/tasks/:id/effort` already answers the question
+ * against the task's estimate. This test is the pin: adding `taskId` should cost
+ * a failing test and an argument, not pass unnoticed.
+ */
+describe("timesheetFiltersSchema", () => {
+  it("takes the four records both halves of the report have in common", () => {
+    const id = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+    expect(timesheetFiltersSchema.parse({ projectId: id })).toEqual({ projectId: id });
+    expect(Object.keys(timesheetFiltersSchema.shape).sort())
+      .toEqual(["companyId", "contactId", "dealId", "projectId"]);
+  });
+
+  it("accepts no filter at all -- an unfiltered week is the ordinary case", () => {
+    expect(timesheetFiltersSchema.parse({})).toEqual({});
+  });
+
+  it("refuses an id that is not one", () => {
+    expect(timesheetFiltersSchema.safeParse({ companyId: "acme" }).success).toBe(false);
+  });
+});
+
+describe("MAX_TIMESHEET_DAY_SPAN", () => {
+  /** Pinned because routes/timesheet.ts refuses a longer span with a 400 whose
+   * message quotes it, and because the bound exists on the ROWS endpoint alone
+   * -- the aggregate's answer is the same size for a decade as for a day. */
+  it("is a quarter, and bounds the rows endpoint rather than the aggregate", () => {
+    expect(MAX_TIMESHEET_DAY_SPAN).toBe(92);
+  });
+});
+
+describe("timesheetRowSchema", () => {
+  const entryRow = {
+    kind: "entry" as const, id: "3f2504e0-4f89-41d3-9a0c-0305e82c3301", day: "2026-09-08",
+    minutes: 90, label: "Wrote the thing", billable: true, counted: true,
+    uncountedReason: null, links: [],
+  };
+  const meetingRow = {
+    kind: "meeting" as const, id: "3f2504e0-4f89-41d3-9a0c-0305e82c3302", day: "2026-09-08",
+    minutes: null, label: "Corridor", billable: null, counted: false,
+    uncountedReason: "no-recorded-length" as const, links: [],
+  };
+
+  it("parses an entry and a meeting", () => {
+    expect(timesheetRowSchema.parse(entryRow)).toEqual(entryRow);
+    expect(timesheetRowSchema.parse(meetingRow)).toEqual(meetingRow);
+    expect(timesheetRowSchema.parse({ ...meetingRow, minutes: 45, counted: true, uncountedReason: null }))
+      .toMatchObject({ counted: true });
+  });
+
+  /**
+   * **A ROW EITHER COUNTED OR SAYS WHY NOT.** A row that did neither would be
+   * rendered as counted while the headline excluded it -- a list disagreeing with
+   * the total above it, which is the one outcome this surface may not produce.
+   */
+  it("refuses a row that is uncounted for no stated reason, or counted with one", () => {
+    expect(timesheetRowSchema.safeParse({ ...meetingRow, uncountedReason: null }).success)
+      .toBe(false);
+    expect(timesheetRowSchema.safeParse({ ...entryRow, uncountedReason: "not-yet-happened" }).success)
+      .toBe(false);
+  });
+
+  /** An entry always has minutes and a flag: `minutes` is NOT NULL and forbidden
+   * to be zero, and `billable` has no default. A meeting never has the flag --
+   * `false` there would be a claim nobody made. */
+  it("keeps the two kinds' fields apart", () => {
+    expect(timesheetRowSchema.safeParse({ ...entryRow, minutes: null }).success).toBe(false);
+    expect(timesheetRowSchema.safeParse({ ...entryRow, billable: null }).success).toBe(false);
+    expect(timesheetRowSchema.safeParse({ ...meetingRow, billable: false }).success).toBe(false);
+    expect(timesheetRowSchema.safeParse({ ...entryRow, minutes: 0 }).success).toBe(false);
+  });
+
+  /** THE BUCKET MUST MATCH THE VALUE IT DESCRIBES. A meeting with a duration
+   * claiming "no recorded length" is a bucket that has drifted from the column;
+   * a future meeting WITH a duration is ordinary and stays legal. */
+  it("only lets a meeting with no minutes be uncounted for having none", () => {
+    expect(timesheetRowSchema.safeParse({
+      ...meetingRow, minutes: 45, uncountedReason: "no-recorded-length",
+    }).success).toBe(false);
+    expect(timesheetRowSchema.safeParse({
+      ...meetingRow, minutes: 45, uncountedReason: "not-yet-happened",
+    }).success).toBe(true);
+    expect(timesheetRowSchema.safeParse({
+      ...meetingRow, minutes: null, uncountedReason: "not-yet-happened",
+    }).success).toBe(true);
+  });
+
+  it("carries the records a row names, already readable", () => {
+    const links = [
+      { kind: "project" as const, id: "3f2504e0-4f89-41d3-9a0c-0305e82c3303", label: "Rollout" },
+    ];
+    expect(timesheetRowSchema.parse({ ...entryRow, links }).links).toEqual(links);
+  });
+});
+
+describe("timesheetWeekSchema", () => {
+  const row = {
+    kind: "entry" as const, id: "3f2504e0-4f89-41d3-9a0c-0305e82c3301", day: "2026-09-08",
+    minutes: 90, label: null, billable: true, counted: true, uncountedReason: null, links: [],
+  };
+  const week = {
+    from: "2026-09-07", to: "2026-09-13", timeZone: "Europe/Amsterdam",
+    days: [
+      { day: "2026-09-07", countedMinutes: 0, rows: [] },
+      { day: "2026-09-08", countedMinutes: 90, rows: [row] },
+    ],
+  };
+
+  it("parses a week whose days add up", () => {
+    expect(timesheetWeekSchema.parse(week)).toEqual(week);
+  });
+
+  /**
+   * **A DAY'S FIGURE IS ITS OWN ROWS, AND THE SCHEMA IS WHERE THAT IS HELD.**
+   * The service sums it; this refuses the payload if it stopped agreeing. An
+   * uncounted row contributes nothing, which is the whole reason a day figure and
+   * a row count are different questions.
+   */
+  it("refuses a day whose figure is not the rows it holds", () => {
+    expect(timesheetWeekSchema.safeParse({
+      ...week, days: [week.days[0], { day: "2026-09-08", countedMinutes: 120, rows: [row] }],
+    }).success).toBe(false);
+    // An unmeasured meeting adds nothing, so a day of one is 0 minutes and not
+    // an inconsistency.
+    expect(timesheetWeekSchema.safeParse({
+      ...week,
+      days: [{
+        day: "2026-09-08", countedMinutes: 0,
+        rows: [{
+          kind: "meeting", id: "3f2504e0-4f89-41d3-9a0c-0305e82c3302", day: "2026-09-08",
+          minutes: null, label: "Corridor", billable: null, counted: false,
+          uncountedReason: "no-recorded-length", links: [],
+        }],
+      }],
+    }).success).toBe(true);
+  });
+
+  /** A ROW ON A DAY THE WEEK DOES NOT CONTAIN is the shape a time-zone slip
+   * produces: a meeting counted by the aggregate and rendered under a heading
+   * nobody asked for. */
+  it("refuses a day outside its own range, days out of order, and a misfiled row", () => {
+    expect(timesheetWeekSchema.safeParse({
+      ...week, days: [...week.days, { day: "2026-09-20", countedMinutes: 0, rows: [] }],
+    }).success).toBe(false);
+    expect(timesheetWeekSchema.safeParse({
+      ...week, days: [week.days[1], week.days[0]],
+    }).success).toBe(false);
+    expect(timesheetWeekSchema.safeParse({
+      ...week,
+      days: [
+        week.days[0],
+        { day: "2026-09-08", countedMinutes: 90, rows: [{ ...row, day: "2026-09-09" }] },
+      ],
+    }).success).toBe(false);
+  });
+
+  it("refuses a range that runs backwards", () => {
+    expect(timesheetWeekSchema.safeParse({ ...week, from: "2026-09-20" }).success).toBe(false);
   });
 });
 
