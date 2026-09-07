@@ -3529,6 +3529,30 @@ describe("timerSummary", () => {
     expect(sentence).not.toContain("0m");
   });
 
+  /**
+   * **THE ONE CLAUSE ALL THREE BRANCHES HAVE TO CARRY, AND THE E2E IS WHAT
+   * CAUGHT IT MISSING.**
+   *
+   * "Nothing is counted until you stop it" is true regardless of how long the
+   * clock has run, and the strip sits on /timesheet as well as on every other
+   * route -- so a branch without it leaves a screen reading "0m counted" beside a
+   * running stopwatch with nothing saying why, which is Task 2's "excluded in
+   * silence" at a new cause.
+   *
+   * **THE UNDER-A-MINUTE BRANCH SHIPPED WITHOUT IT.** The three tests above each
+   * assert their own branch's own words and not one of them asserted the thing
+   * all three must say, so the whole file was green; `e2e/timer.spec.ts` reads
+   * the strip a second after starting a timer, which is the only place that
+   * branch is on a screen, and it failed there. This is the invariant, tested as
+   * an invariant.
+   */
+  it("says nothing is counted, in every branch, however long the clock has run", () => {
+    for (const minutes of [0, 1, 126, MAX_TIME_ENTRY_MINUTES, MAX_TIME_ENTRY_MINUTES + 1, 62 * 60]) {
+      expect(timerSummary(timer, after(minutes)), `after ${String(minutes)} minutes`)
+        .toMatch(/othing is counted/);
+    }
+  });
+
   // THE EXACT EDGES, because "longer than a day" is the whole recovery branch
   // and an off-by-one here either refuses a legal 24h entry or offers an illegal
   // one.

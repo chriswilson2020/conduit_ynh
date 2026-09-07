@@ -5850,12 +5850,22 @@ export type TimerState = z.infer<typeof timerStateSchema>;
  *   never stopped for the operator, never guesses a duration, and never becomes
  *   an entry on its own. What changes if they ignore it is only this sentence
  *   and what the stop form will accept.
+ *
+ * **AND "NOTHING IS COUNTED" IS IN ALL THREE, WHICH IS NOT A STYLE RULE.** It is
+ * the one clause that is true regardless of how long the clock has run, and the
+ * strip sits on /timesheet as well as everywhere else -- so a branch missing it
+ * leaves a screen reading "0m counted" beside a running stopwatch with nothing
+ * saying why. **The under-a-minute branch shipped without it and the e2e caught
+ * it**, which is worth recording: the three tests below each asserted their own
+ * branch's own words, and not one of them asserted the thing all three have to
+ * say. `timerSummary`'s test now checks the invariant across the branches as
+ * well as the branches themselves.
  */
 export function timerSummary(timer: RunningTimer, now: Date): string {
   const elapsed = timerElapsedMinutes(new Date(timer.startedAt), now);
   if (elapsed < 1) {
-    return "Running for less than a minute. There is nothing to log yet: an entry is "
-      + "at least one minute.";
+    return "Running for less than a minute. Nothing is counted until you stop it, and "
+      + "there is nothing to log yet either: an entry is at least one minute.";
   }
   const ran = formatMinutes(elapsed);
   if (timerProposedMinutes(elapsed) === null) {
