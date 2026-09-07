@@ -1261,8 +1261,13 @@ followed it. `EXPORT_FORMAT_VERSION` stays at 1.
 
 ### The phone, and what was rejected
 
-The strip is a `flex-wrap` row between the header and `<main>`, present only while
-something is running. Its sentence takes a whole line below the breakpoint so the
+The strip is a `flex-wrap` row between the header and `<main>`, rendering null
+while nothing is running — so no route gains a DOM node until a clock is going,
+and the tick is torn down with it. **What every route does pay is one
+`GET /api/timer` per app load**: one query mounted once in the shell, served by
+the same partial unique index that enforces one running timer per person, and
+refetched only on the `["timer"]` hint. That is the price of the strip being
+everywhere, and it is the point. Its sentence takes a whole line below the breakpoint so the
 controls beside it stay at the 44px floor; the e2e reads
 `scrollWidth - clientWidth` at 390px with the strip up.
 

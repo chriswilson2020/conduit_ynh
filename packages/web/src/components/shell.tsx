@@ -173,8 +173,17 @@ export function Shell({ children }: { children: ReactNode }) {
           It is here rather than on /timesheet because the spec's second risk is
           "you left this running for 62 hours", and a timer visible only on the
           page an operator opens once a week is a timer that is always left
-          running. It renders NOTHING when nothing is running, so eighteen of
-          the nineteen routes are byte-for-byte what they were.
+          running.
+
+          IT RENDERS NULL WHEN NOTHING IS RUNNING, so no route gains a pixel or
+          a DOM node until a clock is going -- and its ticking interval is torn
+          down with it, so the eighteen routes without a timer pay no timer for
+          it either. WHAT THEY DO PAY, said rather than glossed: one
+          `GET /api/timer` per app load. It is one query mounted once here
+          (not per route, like useUnreadMailCount above), served by the same
+          partial unique index that enforces one running timer per person, and
+          refetched only on the `["timer"]` SSE hint. That is the price of the
+          strip being on every page, and it is the point.
 
           IT COSTS NO NAVIGATION SLOT, which is the reason it is a row rather
           than a tab: Task 4 declined a fifth bottom-bar tab and a sixth record
