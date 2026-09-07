@@ -3485,13 +3485,15 @@ describe("timerProposedMinutes", () => {
 
 describe("timerSummary", () => {
   const startedAt = "2026-09-04T07:00:00.000Z";
+  const projectId = randomUUID();
   const timer = {
     id: randomUUID(),
     startedAt,
     description: "Rewrite the ingest",
     companyId: null, contactId: null, dealId: null,
-    projectId: randomUUID(), taskId: null,
+    projectId, taskId: null,
     workDate: "2026-09-04",
+    links: [{ kind: "project" as const, id: projectId, label: "Rollout" }],
     createdAt: startedAt, updatedAt: startedAt,
   };
   const after = (minutes: number) =>
@@ -3611,9 +3613,11 @@ describe("timerStopInputSchema", () => {
 });
 
 describe("timerStateSchema", () => {
+  const linkedProject = randomUUID();
   const base = {
     id: randomUUID(), startedAt: "2026-09-04T07:00:00.000Z", description: null,
-    companyId: null, contactId: null, dealId: null, projectId: randomUUID(), taskId: null,
+    companyId: null, contactId: null, dealId: null, projectId: linkedProject, taskId: null,
+    links: [{ kind: "project" as const, id: linkedProject, label: "Rollout" }],
     createdAt: "2026-09-04T07:00:00.000Z", updatedAt: "2026-09-04T07:00:00.000Z",
   };
 
@@ -3635,7 +3639,47 @@ describe("timerStateSchema", () => {
 
   it("refuses a running timer attached to nothing", () => {
     expect(timerStateSchema.safeParse({
-      timer: { ...base, projectId: null, workDate: "2026-09-04" }, timeZone: "UTC",
+      timer: { ...base, projectId: null, links: [], workDate: "2026-09-04" }, timeZone: "UTC",
     }).success).toBe(false);
+  });
+
+  /**
+   * **THE RESOLVED LINKS AND THE ID COLUMNS ARE ONE SET COUNTED TWICE**, so a
+   * payload where they disagree is a service that joined the wrong rows -- and
+   * the strip would then say the hours are going somewhere they are not.
+   */
+  it("refuses a timer whose resolved links are not the records it names", () => {
+    expect(timerStateSchema.safeParse({
+      timer: { ...base, links: [], workDate: "2026-09-04" }, timeZone: "UTC",
+    }).success).toBe(false);
+    expect(timerStateSchema.safeParse({
+      timer: {
+        ...base, workDate: "2026-09-04",
+        links: [...base.links, { kind: "deal" as const, id: randomUUID(), label: "Ghost" }],
+      },
+      timeZone: "UTC",
+    }).success).toBe(false);
+  });
+
+  /**
+   * **AND A MALFORMED `links` IS A REFUSAL RATHER THAN A THROW**, which is Task
+   * 4's finding used rather than repeated: measured on zod 4.4.3, a `.refine`
+   * runs even when the object's own fields have already failed and is handed the
+   * RAW value. The consistency refine above therefore checks `Array.isArray`
+   * before touching it -- without that guard this case is an exception escaping
+   * `safeParse`, which at a route is a 500 where a 400 belongs.
+   */
+  it("refuses a links field that is not an array without throwing out of safeParse", () => {
+    for (const links of ["project", 3, null, { kind: "project" }]) {
+      expect(
+        () => timerStateSchema.safeParse({
+          timer: { ...base, workDate: "2026-09-04", links }, timeZone: "UTC",
+        }),
+        JSON.stringify(links),
+      ).not.toThrow();
+      expect(timerStateSchema.safeParse({
+        timer: { ...base, workDate: "2026-09-04", links }, timeZone: "UTC",
+      }).success).toBe(false);
+    }
   });
 });

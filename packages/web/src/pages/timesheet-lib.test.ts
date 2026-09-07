@@ -3,8 +3,9 @@ import { MAX_TIME_ENTRY_MINUTES } from "@conduit/shared";
 import type { TimesheetRow } from "@conduit/shared";
 import { ApiError } from "../api";
 import {
-  addLink, buildTimeEntryInput, buildTimeEntryPatch, dayHeading, draftFromRow,
-  emptyTimeEntryDraft, isToday, removeLink, rowLabel, timeEntryErrorMessage, uncountedLabel,
+  addLink, buildTimeEntryInput, buildTimeEntryPatch, buildTimerStartInput, dayHeading,
+  draftFromRow, emptyTimeEntryDraft, emptyTimerStartDraft, isToday, removeLink, rowLabel,
+  timeEntryErrorMessage, uncountedLabel,
   weekAt, weekLabel, FILTER_KINDS, LINK_KINDS, LINK_LABEL,
   type TimeEntryDraft, type TimeEntryLink,
 } from "./timesheet-lib";
@@ -385,5 +386,80 @@ describe("timeEntryErrorMessage", () => {
       .toBe("minutes: too big");
     expect(timeEntryErrorMessage(new Error("the network went away"))).toBe("the network went away");
     expect(timeEntryErrorMessage("just a string")).toBe("just a string");
+  });
+});
+
+describe("buildTimerStartInput", () => {
+  const project: TimeEntryLink = {
+    kind: "project", id: "3f2504e0-4f89-41d3-9a0c-0305e82c3301", label: "Rollout",
+  };
+  const deal: TimeEntryLink = {
+    kind: "deal", id: "0f8fad5b-d9cb-469f-a165-70867728950e", label: "Big one",
+  };
+
+  it("sends every link the operator picked, and the words if they wrote any", () => {
+    const built = buildTimerStartInput({ description: "Ingest rewrite", links: [project, deal] });
+    expect(built).toEqual({
+      ok: true,
+      input: {
+        description: "Ingest rewrite",
+        companyId: null, contactId: null, dealId: deal.id, projectId: project.id, taskId: null,
+      },
+    });
+  });
+
+  /**
+   * **A LIST OF LINKS, NOT ONE, AND THE SPEC'S CENTRAL EXAMPLE IS WHY.** The
+   * at-least-one rule is not exactly-one precisely because an hour can belong to
+   * a project AND the deal it came from -- so the clock has to be startable
+   * against both, or the timer path would quietly be a narrower capture path
+   * than the hand one.
+   */
+  it("starts against a project and the deal it came from at once", () => {
+    const built = buildTimerStartInput({ description: "", links: [project, deal] });
+    expect(built.ok && built.input.projectId).toBe(project.id);
+    expect(built.ok && built.input.dealId).toBe(deal.id);
+  });
+
+  /**
+   * **REFUSED HERE BECAUSE OF WHEN IT WOULD OTHERWISE BE REFUSED.** A timer with
+   * no link could never become an entry, and meeting that refusal at STOP would
+   * mean meeting it while holding hours with nowhere to put them -- the exact
+   * situation the recovery interaction already exists to make survivable.
+   */
+  it("refuses a timer attached to nothing, in the words the entry form uses", () => {
+    const built = buildTimerStartInput({ description: "Something", links: [] });
+    expect(built.ok).toBe(false);
+    if (!built.ok) {
+      for (const word of ["company", "contact", "deal", "project", "task"]) {
+        expect(built.error, word).toContain(word);
+      }
+      expect(built.error).toMatch(/appears in no report/);
+    }
+  });
+
+  it("sends a blank description as null rather than as an empty string", () => {
+    expect(buildTimerStartInput({ description: "   ", links: [project] }).ok).toBe(true);
+    const built = buildTimerStartInput({ description: "   ", links: [project] });
+    expect(built.ok && built.input.description).toBeNull();
+  });
+
+  /**
+   * NO DAY, NO MINUTES AND NO BILLABLE FLAG ON THE WIRE. Each is somebody else's
+   * answer -- the day is the server's (off `started_at`), the duration is what
+   * the clock is for, and the flag is asked at stop, when the operator knows.
+   */
+  it("states no day, no duration and no billable flag", () => {
+    const built = buildTimerStartInput({ description: "", links: [project] });
+    expect(built.ok).toBe(true);
+    if (built.ok) {
+      expect(built.input).not.toHaveProperty("workDate");
+      expect(built.input).not.toHaveProperty("minutes");
+      expect(built.input).not.toHaveProperty("billable");
+    }
+  });
+
+  it("starts empty, with no links and no words", () => {
+    expect(emptyTimerStartDraft()).toEqual({ description: "", links: [] });
   });
 });

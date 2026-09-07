@@ -5772,8 +5772,41 @@ export const runningTimerSchema = z.object({
   /** The calendar day, in the organisation's clock, that stopping this timer
    * will book its minutes to. A bare date, like `time_entries.work_date`. */
   workDate: z.iso.date(),
+  /**
+   * The same five links, resolved to names -- `timesheetLinkSchema`'s shape, and
+   * its argument transfers word for word: the strip and the stop form cannot
+   * look these up from list endpoints, because a timer may legitimately name an
+   * ARCHIVED record and those lists do not return one. The service LEFT JOINs
+   * them, exactly as the timesheet's rows do.
+   *
+   * **THE STOP FORM IS WHY THIS IS NOT OPTIONAL FURNITURE.** An operator
+   * committing hours has to see where they are going, and "on Rollout" is the
+   * only thing on that screen that says so -- the description is nullable and
+   * the ids are not readable.
+   */
+  links: z.array(timesheetLinkSchema),
   ...timestamps,
-}).refine(timeEntryAtLeastOneLink, { message: TIME_ENTRY_NO_LINK_MESSAGE });
+})
+  .refine(timeEntryAtLeastOneLink, { message: TIME_ENTRY_NO_LINK_MESSAGE })
+  /**
+   * The resolved links and the id columns are the same set counted twice, so a
+   * payload where they disagree is a service that joined the wrong rows.
+   *
+   * **`Array.isArray` FIRST, AND THAT GUARD IS TASK 4'S FINDING USED RATHER
+   * THAN REPEATED.** Measured there on zod 4.4.3: a `.refine` runs even when the
+   * object's own fields have already failed, and is handed the RAW value. So
+   * `v.links` here can be anything at all -- a string, a number, absent -- and
+   * `.length` on the wrong type would silently pass while a method call on it
+   * would THROW, turning a 400 the field validator had already decided into a
+   * 500. When it is not an array, the array validator has said so and this has
+   * nothing to add.
+   */
+  .refine((v) => {
+    if (!Array.isArray(v.links)) return true;
+    const named = [v.companyId, v.contactId, v.dealId, v.projectId, v.taskId]
+      .filter((id) => id != null).length;
+    return v.links.length === named;
+  }, { message: "a running timer's resolved links must be exactly the records it names" });
 export type RunningTimer = z.infer<typeof runningTimerSchema>;
 
 /**

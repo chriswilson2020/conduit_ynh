@@ -1,7 +1,9 @@
 import {
   MAX_TIME_ENTRY_MINUTES, isoWeekRange, timeEntryAtLeastOneLink, todayInZone,
 } from "@conduit/shared";
-import type { TimeEntryCreateInput, TimeEntryUpdateInput, TimesheetRow } from "@conduit/shared";
+import type {
+  TimeEntryCreateInput, TimeEntryUpdateInput, TimerStartInput, TimesheetRow,
+} from "@conduit/shared";
 import { ApiError } from "../api";
 
 /**
@@ -265,7 +267,7 @@ export type BuildResult<T> = { ok: true; input: T } | { ok: false; error: string
  * in a report the operator has just taken it out of. Written once so the create
  * and the patch cannot disagree about it.
  */
-function linkFields(links: readonly TimeEntryLink[]): {
+export function linkFields(links: readonly TimeEntryLink[]): {
   companyId: string | null; contactId: string | null; dealId: string | null;
   projectId: string | null; taskId: string | null;
 } {
@@ -349,6 +351,65 @@ export function buildTimeEntryInput(draft: TimeEntryDraft): BuildResult<TimeEntr
 export function buildTimeEntryPatch(draft: TimeEntryDraft): BuildResult<TimeEntryUpdateInput> {
   const built = buildTimeEntryInput(draft);
   return built.ok ? { ok: true, input: built.input } : built;
+}
+
+/* -------------------------------------------------------------------------- *
+ *  Starting the clock (Phase 10 Task 5)
+ * -------------------------------------------------------------------------- */
+
+/**
+ * The start form's own state: where the hours will go, and optionally what the
+ * work is.
+ *
+ * **NO DAY, NO MINUTES AND NO BILLABLE FLAG**, and every one of those absences
+ * is somebody else's answer rather than a simplification. The duration is what
+ * the clock is for; the day comes off `started_at` on the server, in the
+ * organisation's calendar; and the flag is asked when the work is DONE, because
+ * that is when an operator knows whether it was chargeable -- a timer that
+ * decided it at the start would be guessing on the row where the guess is
+ * hardest to notice, which is what `time_entries.billable` has no DEFAULT to
+ * prevent.
+ *
+ * The links are a LIST for `TimeEntryDraft.links`' reason exactly: at-least-one
+ * is not exactly-one because an hour can belong to a project AND the deal it
+ * came from, and the clock has to be able to start against both.
+ */
+export interface TimerStartDraft {
+  description: string;
+  links: TimeEntryLink[];
+}
+
+export function emptyTimerStartDraft(): TimerStartDraft {
+  return { description: "", links: [] };
+}
+
+/**
+ * **THE AT-LEAST-ONE RULE, REFUSED HERE BECAUSE OF WHEN IT WOULD OTHERWISE BE
+ * REFUSED.** A timer with no link could not become an entry, and the server says
+ * so too (`timers_has_link`, and `startTimer`'s own re-assertion) -- but a
+ * refusal that arrives at STOP lands on somebody recovering from a forgotten
+ * weekend, holding hours with nothing to attach them to. Here it costs one tap,
+ * with the picker still on the screen.
+ *
+ * The message is `buildTimeEntryInput`'s, one form over, because it is the same
+ * rule and an operator meeting it twice should not have to work out that it is.
+ */
+export function buildTimerStartInput(draft: TimerStartDraft): BuildResult<TimerStartInput> {
+  const links = linkFields(draft.links);
+  if (!timeEntryAtLeastOneLink(links)) {
+    return {
+      ok: false,
+      error: "Start this timer against a company, contact, deal, project or task -- "
+        + "time attached to nothing appears in no report.",
+    };
+  }
+  return {
+    ok: true,
+    input: {
+      description: draft.description.trim() === "" ? null : draft.description.trim(),
+      ...links,
+    },
+  };
 }
 
 /**

@@ -2,13 +2,18 @@ import { and, eq, isNull, sql } from "drizzle-orm";
 import {
   timeEntryAtLeastOneLink, usableTimeZone, zonedDayFormatter, TIME_ENTRY_NO_LINK_MESSAGE,
 } from "@conduit/shared";
-import type { RunningTimer, TimeEntry, TimerStartInput, TimerState, TimerStopInput } from "@conduit/shared";
+import type {
+  RunningTimer, TimeEntry, TimerStartInput, TimerState, TimerStopInput, TimesheetLink,
+} from "@conduit/shared";
 import type { Database } from "../db/client.js";
-import { timers, type TimerRow } from "../db/schema.js";
+import {
+  companies, contacts, deals, projects, tasks, timers, type TimerRow,
+} from "../db/schema.js";
 import { NotFoundError, ConflictError } from "./errors.js";
 import {
   assertLinkedRecordsExist, insertTimeEntry, normaliseDescription, publishTimeEntryHint,
 } from "./time-entries.js";
+import { contactName, linksOf } from "./timesheet.js";
 import { getOrgProfile } from "./org-profile.js";
 import { publish } from "./sse.js";
 
@@ -143,7 +148,7 @@ function publishTimerHint(): void {
  * the server's `now()` -- the timer path simply never reaches the asymmetry Task
  * 4 recorded between a future entry (counts) and a future meeting (does not).
  */
-function toRunningTimer(row: TimerRow, timeZone: string): RunningTimer {
+function toRunningTimer(row: TimerRow, timeZone: string, links: TimesheetLink[]): RunningTimer {
   return {
     id: row.id,
     startedAt: row.startedAt.toISOString(),
@@ -151,13 +156,57 @@ function toRunningTimer(row: TimerRow, timeZone: string): RunningTimer {
     companyId: row.companyId, contactId: row.contactId, dealId: row.dealId,
     projectId: row.projectId, taskId: row.taskId,
     workDate: zonedDayFormatter(timeZone)(row.startedAt),
+    links,
     createdAt: row.createdAt.toISOString(), updatedAt: row.updatedAt.toISOString(),
   };
 }
 
+/**
+ * The five records this timer names, resolved to labels.
+ *
+ * **A SECOND QUERY RATHER THAN FIVE JOINS ON THE READ ABOVE, and it costs one
+ * round trip on a row that is at most one.** The join version would put five
+ * LEFT JOINs on the query that every page of the app issues, to decorate a row
+ * that is usually absent -- so the joins would be paid on every "is anything
+ * running" and used on the few where something is. Split, the common answer is
+ * one indexed lookup that touches one table.
+ *
+ * LEFT JOINED rather than looked up through the list endpoints, for
+ * `timesheetLinkSchema`'s reason: a timer may name an ARCHIVED record (a project
+ * that finished on Friday is an ordinary thing to book time to), and no list
+ * returns one.
+ */
+async function linksFor(db: Database, row: TimerRow): Promise<TimesheetLink[]> {
+  const [found] = await db
+    .select({
+      companyName: companies.name,
+      contactFirstName: contacts.firstName, contactLastName: contacts.lastName,
+      dealTitle: deals.title, projectName: projects.name, taskTitle: tasks.title,
+    })
+    .from(timers)
+    .leftJoin(companies, eq(timers.companyId, companies.id))
+    .leftJoin(contacts, eq(timers.contactId, contacts.id))
+    .leftJoin(deals, eq(timers.dealId, deals.id))
+    .leftJoin(projects, eq(timers.projectId, projects.id))
+    .leftJoin(tasks, eq(timers.taskId, tasks.id))
+    .where(eq(timers.id, row.id));
+  return linksOf([
+    { kind: "company", id: row.companyId, label: found?.companyName ?? null },
+    {
+      kind: "contact",
+      id: row.contactId,
+      label: contactName(found?.contactFirstName ?? null, found?.contactLastName ?? null),
+    },
+    { kind: "deal", id: row.dealId, label: found?.dealTitle ?? null },
+    { kind: "project", id: row.projectId, label: found?.projectName ?? null },
+    { kind: "task", id: row.taskId, label: found?.taskTitle ?? null },
+  ]);
+}
+
 async function stateOf(db: Database, row: TimerRow | undefined): Promise<TimerState> {
   const timeZone = usableTimeZone((await getOrgProfile(db)).timeZone);
-  return { timer: row === undefined ? null : toRunningTimer(row, timeZone), timeZone };
+  if (row === undefined) return { timer: null, timeZone };
+  return { timer: toRunningTimer(row, timeZone, await linksFor(db, row)), timeZone };
 }
 
 /**

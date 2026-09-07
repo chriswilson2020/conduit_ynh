@@ -50,6 +50,7 @@ import {
   taskEffortSchema,
   taskSchema,
   timeEntrySchema,
+  timerStateSchema,
   timesheetTotalsSchema,
   timesheetWeekSchema,
   usersResponseSchema,
@@ -116,6 +117,8 @@ import {
   type TaskStatus,
   type TimeEntry,
   type TimeEntryCreateInput,
+  type TimerStartInput,
+  type TimerStopInput,
   type TimeEntryUpdateInput,
   type TimesheetFilters,
   type UpdateCompanyInput,
@@ -2838,5 +2841,94 @@ export function useArchiveTimeEntry() {
     mutationFn: async (id: string) =>
       parseWith(timeEntrySchema, await postJson<unknown>(`/time-entries/${id}/archive`), "time entry"),
     onSuccess: (entry: TimeEntry) => invalidate(entry),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// The timer (Phase 10 Task 5)
+// ---------------------------------------------------------------------------
+
+/**
+ * **`["timer"]` IS A KEY OF ITS OWN, AND IT HAS TO BE.**
+ *
+ * A running timer is neither a time entry nor a meeting -- it is not in
+ * `time_entries` at all, and cannot be, because `minutes` is NOT NULL and `> 0`
+ * -- so nesting it under either table's key would leave the strip stale after
+ * exactly the writes that change it. api: services/timers.ts publishes
+ * `["timer"]` on every start, stop and discard.
+ *
+ * **THAT KEY IS WHAT MAKES THE SECOND DEVICE LIVE RATHER THAN MERELY CORRECT ON
+ * REFRESH.** The spec asks for running state that survives a closed tab and a
+ * second device, and the row in Postgres is what makes that TRUE; this hint is
+ * what makes it VISIBLE. A timer started on a phone fills the strip on the
+ * laptop through the same SSE invalidation every other key here uses -- and,
+ * more usefully, one STOPPED on the phone empties it, so the laptop's Stop
+ * button stops offering to stop a timer that has already finished.
+ *
+ * A stop publishes this AND every key an entry write publishes, because it
+ * changes both halves of the screen: the strip empties and the week grows.
+ */
+export function useRunningTimer() {
+  return useQuery({
+    queryKey: ["timer"],
+    queryFn: async () => parseWith(
+      timerStateSchema, await getJson<unknown>("/timer"), "timer",
+    ),
+  });
+}
+
+function useInvalidateTimer() {
+  const queryClient = useQueryClient();
+  return () => {
+    void queryClient.invalidateQueries({ queryKey: ["timer"] });
+  };
+}
+
+export function useStartTimer() {
+  const invalidate = useInvalidateTimer();
+  return useMutation({
+    mutationFn: async (input: TimerStartInput) =>
+      parseWith(timerStateSchema, await postJson<unknown>("/timer", input), "timer"),
+    onSuccess: invalidate,
+  });
+}
+
+/**
+ * Stopping the clock returns the ENTRY it created, so this invalidates the
+ * timer's key and every key a hand-typed entry invalidates -- including
+ * `["task", id]` when the hours were booked to a task, which is the drawer's
+ * booked-versus-estimated sentence.
+ *
+ * There is no `previousTaskId` here, unlike `useUpdateTimeEntry`: a stop CREATES
+ * an entry, so there is no task it moved away from.
+ */
+export function useStopTimer() {
+  const invalidateTimer = useInvalidateTimer();
+  const invalidateEntry = useInvalidateTimeEntry();
+  return useMutation({
+    mutationFn: async ({ id, input }: { id: string; input: TimerStopInput }) =>
+      parseWith(
+        timeEntrySchema, await postJson<unknown>(`/timer/${id}/stop`, input), "time entry",
+      ),
+    onSuccess: (entry: TimeEntry) => {
+      invalidateTimer();
+      invalidateEntry(entry);
+    },
+  });
+}
+
+/**
+ * Discarding writes no entry, so nothing but the timer's own key moves -- and
+ * that asymmetry with the stop above is the point rather than an omission. The
+ * row is kept (Conduit never expunges, and it is the only record that the clock
+ * ever ran), but no total anywhere changes, because a running timer was in none
+ * of them.
+ */
+export function useDiscardTimer() {
+  const invalidate = useInvalidateTimer();
+  return useMutation({
+    mutationFn: async (id: string) =>
+      parseWith(timerStateSchema, await postJson<unknown>(`/timer/${id}/discard`), "timer"),
+    onSuccess: invalidate,
   });
 }

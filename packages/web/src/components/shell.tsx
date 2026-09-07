@@ -6,6 +6,7 @@ import { useIsMobile } from "../use-is-mobile";
 import { BottomNav, MobileSearch } from "./bottom-nav";
 import { GlobalSearch } from "./search";
 import { TaskDrawerFocusProvider } from "./task-drawer-focus";
+import { TimerStrip } from "./timer-strip";
 import { useSseInvalidation } from "./sse";
 
 // activeProps.className replaces (rather than merges with) the base className
@@ -166,6 +167,26 @@ export function Shell({ children }: { children: ReactNode }) {
             </div>
           )}
         </header>
+        {/*
+          THE RUNNING TIMER, BETWEEN THE HEADER AND THE CONTENT, ON EVERY ROUTE.
+
+          It is here rather than on /timesheet because the spec's second risk is
+          "you left this running for 62 hours", and a timer visible only on the
+          page an operator opens once a week is a timer that is always left
+          running. It renders NOTHING when nothing is running, so eighteen of
+          the nineteen routes are byte-for-byte what they were.
+
+          IT COSTS NO NAVIGATION SLOT, which is the reason it is a row rather
+          than a tab: Task 4 declined a fifth bottom-bar tab and a sixth record
+          rail tab against measurements, and this needed neither. It is inside
+          the column that already holds the header, so it sits above <main>'s
+          scroll region on a desk and above the document's on a phone.
+
+          OUTSIDE <main> DELIBERATELY. A strip inside it would scroll away with
+          the content -- on the one surface whose whole job is to be seen while
+          the operator is looking at something else.
+        */}
+        <TimerStrip />
         {/*
           The bottom bar is `fixed`, so it overlays the end of a scrolled page;
           the extra bottom padding below the breakpoint is what keeps the last

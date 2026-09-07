@@ -85,6 +85,31 @@ describe("the timer's running state", () => {
   });
 
   /**
+   * **THE STRIP AND THE STOP FORM NEED NAMES, NOT IDS**, and the names come off
+   * a LEFT JOIN rather than a list endpoint -- `timesheetLinkSchema`'s argument,
+   * which transfers word for word: a timer may legitimately name an ARCHIVED
+   * record, and no list returns one. An operator committing hours has to see
+   * where they are going.
+   */
+  it("resolves every record it names to a label, archived ones included", async () => {
+    const company = await createCompany(handle.db, actorId, { name: "Acme" });
+    await archiveCompany(handle.db, actorId, company.id);
+    const projectId = await seedProject();
+    const task = await createTask(handle.db, actorId, { title: "Migrate", projectId });
+    await startTimer(handle.db, actorId, { companyId: company.id, projectId, taskId: task.id });
+
+    const state = await getRunningTimer(handle.db, actorId);
+    expect(state.timer?.links).toEqual([
+      { kind: "company", id: company.id, label: "Acme" },
+      { kind: "project", id: projectId, label: "Rollout" },
+      { kind: "task", id: task.id, label: "Migrate" },
+    ]);
+    // The wire schema refuses a payload where the resolved links and the id
+    // columns are not the same set, so this parse is the agreement biting.
+    expect(() => timerStateSchema.parse(state)).not.toThrow();
+  });
+
+  /**
    * **A TIMER IS ONE PERSON'S.** The strip is on every page, so a second
    * operator's clock appearing on this one's screen would be a running timer
    * they cannot account for and cannot stop.

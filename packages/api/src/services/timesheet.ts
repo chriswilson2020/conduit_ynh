@@ -367,13 +367,17 @@ export async function timesheetTotals(
 /** A contact's two name columns as one label, `time_entries.csv`'s spelling.
  * A contact with no surname is legal (contacts.lastName is nullable), so the
  * empty part is dropped rather than joined to a trailing space. */
-function contactName(firstName: string | null, lastName: string | null): string {
+// EXPORTED SINCE TASK 5: services/timers.ts resolves the SAME five links for the
+// running timer's strip, and for the reason timesheetLinkSchema argues -- a
+// timer may name an archived record, which no list endpoint returns, so the
+// label has to come off the same LEFT JOIN. Two callers, one spelling.
+export function contactName(firstName: string | null, lastName: string | null): string {
   return [firstName, lastName].filter((part) => part !== null && part !== "").join(" ");
 }
 
 /** The links a row carries, in one fixed order so two rows on the same record
  * read the same way. Nulls drop out; at-least-one means most rows have one. */
-function linksOf(
+export function linksOf(
   found: { kind: TimesheetLink["kind"]; id: string | null; label: string | null }[],
 ): TimesheetLink[] {
   return found

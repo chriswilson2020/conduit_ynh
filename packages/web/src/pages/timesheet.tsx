@@ -4,19 +4,21 @@ import {
 } from "@conduit/shared";
 import type { TimesheetDay, TimesheetFilters, TimesheetRow } from "@conduit/shared";
 import {
-  useArchiveTimeEntry, useCreateTimeEntry, useOrgProfile, useTimesheet, useTimesheetDays,
-  useUpdateTimeEntry,
+  useArchiveTimeEntry, useCreateTimeEntry, useOrgProfile, useRunningTimer, useStartTimer,
+  useTimesheet, useTimesheetDays, useUpdateTimeEntry,
 } from "../queries";
+import { timerErrorMessage } from "../components/timer-lib";
 import { Button } from "../components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "../components/ui/dialog";
 import { EntityPicker } from "../components/entity-picker";
 import { Input } from "../components/ui/input";
 import { CHIP_REMOVE_TOUCH } from "../components/ui/touch";
 import {
-  addLink, buildTimeEntryInput, buildTimeEntryPatch, dayHeading, draftFromRow,
-  emptyTimeEntryDraft, isToday, removeLink, rowLabel, timeEntryErrorMessage, uncountedLabel,
-  weekAt, weekLabel, FILTER_KINDS, LINK_KINDS, LINK_LABEL,
-  type FilterKind, type TimeEntryDraft, type TimeEntryLinkKind, type TimesheetFilterLink,
+  addLink, buildTimeEntryInput, buildTimeEntryPatch, buildTimerStartInput, dayHeading, draftFromRow,
+  emptyTimeEntryDraft, emptyTimerStartDraft, isToday, removeLink, rowLabel, timeEntryErrorMessage,
+  uncountedLabel, weekAt, weekLabel, FILTER_KINDS, LINK_KINDS, LINK_LABEL,
+  type FilterKind, type TimeEntryDraft, type TimeEntryLink, type TimeEntryLinkKind,
+  type TimerStartDraft, type TimesheetFilterLink,
 } from "./timesheet-lib";
 
 /**
@@ -97,6 +99,13 @@ export function TimesheetPage() {
   const [offset, setOffset] = useState(0);
   const [filter, setFilter] = useState<TimesheetFilterLink | null>(null);
   const [editing, setEditing] = useState<TimesheetRow | "new" | null>(null);
+  const [starting, setStarting] = useState(false);
+  // WHETHER A CLOCK IS ALREADY RUNNING, so Start can say so rather than produce a
+  // 409 the operator has to read. The running timer itself is rendered by the
+  // shell's strip on every route (components/timer-strip.tsx), including this
+  // one -- this page only decides whether its own button can do anything.
+  const { data: timerState } = useRunningTimer();
+  const timerRunning = timerState?.timer != null;
 
   const week = timeZone === "" ? { from: "", to: "" } : weekAt(timeZone, offset);
   const filters: TimesheetFilters = filter === null ? {} : { [`${filter.kind}Id`]: filter.id };
@@ -108,9 +117,37 @@ export function TimesheetPage() {
     <div data-testid="timesheet" className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h1 className="text-xl font-semibold text-slate-900">Timesheet</h1>
-        <Button data-testid="log-time" className="min-h-11" onClick={() => setEditing("new")}>
-          Log time
-        </Button>
+        {/*
+          TWO CAPTURE PATHS, SIDE BY SIDE, which is the spec's second decision on
+          one row: the clock and the hand entry are equals here rather than one
+          being the primary control and the other a menu item.
+
+          STARTING IS ON THIS PAGE AND STOPPING IS EVERYWHERE (the shell's
+          strip), and the asymmetry is deliberate: a start needs a record picker,
+          which needs width, and it is an act an operator performs while thinking
+          about their work. Stopping is the half they forget, so it has to be
+          reachable from whatever page they are on when they remember.
+
+          DISABLED WHILE ONE IS RUNNING rather than allowed to 409: at most one
+          timer runs per person (`timers_one_running_per_owner`), and a button
+          that produced an error message every time would be teaching the
+          operator to ignore error messages. The 409 handler stays for the race
+          this cannot see -- a timer started on another device a moment ago.
+        */}
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            variant="outline"
+            data-testid="start-timer"
+            className="min-h-11"
+            disabled={timerRunning}
+            onClick={() => setStarting(true)}
+          >
+            {timerRunning ? "Timer running" : "Start timer"}
+          </Button>
+          <Button data-testid="log-time" className="min-h-11" onClick={() => setEditing("new")}>
+            Log time
+          </Button>
+        </div>
       </div>
 
       <WeekControls from={week.from} to={week.to} offset={offset} onOffset={setOffset} />
@@ -162,6 +199,166 @@ export function TimesheetPage() {
           row={editing === "new" ? null : editing}
           defaultDay={week.from}
           onClose={() => setEditing(null)}
+        />
+      )}
+
+      {starting && <TimerStartDialog onClose={() => setStarting(false)} />}
+    </div>
+  );
+}
+
+/**
+ * **STARTING THE CLOCK: WHERE THE HOURS WILL GO, AND NOTHING ELSE.**
+ *
+ * Three fields the hand-entry form has are absent here, and each absence is
+ * somebody else's answer rather than a shorter form:
+ *
+ *   NO DAY. It comes off `started_at`, read in the organisation's calendar, and
+ *   the stop dialog states it before anything is committed.
+ *
+ *   NO MINUTES. That is what the clock is for.
+ *
+ *   NO BILLABLE FLAG, and this one is the interesting one: it is asked at STOP,
+ *   because that is when an operator knows whether the work was chargeable.
+ *   Asking it here would be asking them to guess, and a guess made at the start
+ *   of two hours is the kind nobody revisits.
+ *
+ * **THE LINKS ARE REQUIRED AND THE REFUSAL IS THE POINT OF ASKING NOW.** A timer
+ * attached to nothing could never become an entry (`time_entries_has_link`), and
+ * meeting that refusal at stop would mean meeting it while holding hours with
+ * nowhere to put them -- which is exactly the situation the recovery interaction
+ * already exists to make survivable. Refused here it costs one tap.
+ */
+function TimerStartDialog({ onClose }: { onClose: () => void }) {
+  const [draft, setDraft] = useState<TimerStartDraft>(emptyTimerStartDraft);
+  const [error, setError] = useState<string | null>(null);
+  const [picking, setPicking] = useState<TimeEntryLinkKind | null>(null);
+  const start = useStartTimer();
+
+  function submit() {
+    setError(null);
+    const built = buildTimerStartInput(draft);
+    if (!built.ok) return setError(built.error);
+    start.mutate(built.input, {
+      onSuccess: () => onClose(),
+      onError: (err) => setError(timerErrorMessage(err, "start")),
+    });
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
+      <DialogContent data-testid="timer-start-dialog">
+        <DialogTitle className="text-lg font-semibold text-slate-900">Start a timer</DialogTitle>
+        <div className="mt-3 flex flex-col gap-3">
+          <label className="flex flex-col gap-1 text-xs font-medium text-slate-500">
+            What are you working on?
+            <Input
+              autoFocus
+              data-testid="timer-start-description"
+              placeholder="Optional, and what the strip will say while it runs"
+              value={draft.description}
+              onChange={(event) => setDraft({ ...draft, description: event.target.value })}
+            />
+          </label>
+
+          <TimeEntryLinkPicker
+            links={draft.links}
+            picking={picking}
+            onPicking={setPicking}
+            onLinks={(links) => setDraft({ ...draft, links })}
+            testIdPrefix="timer-start-link"
+          />
+
+          {error !== null && (
+            <p role="alert" data-testid="timer-start-error" className="text-sm text-red-700">
+              {error}
+            </p>
+          )}
+
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <Button variant="ghost" data-testid="timer-start-cancel" className="min-h-11" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button
+              data-testid="timer-start-save"
+              className="min-h-11"
+              disabled={start.isPending}
+              onClick={submit}
+            >
+              Start
+            </Button>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/**
+ * The five record links as chips and five pickers, shared by the two forms on
+ * this page.
+ *
+ * **EXTRACTED WHEN THE SECOND CALLER ARRIVED, WHICH IS THE RULE THIS CODEBASE
+ * APPLIES TO SERVICE HELPERS AND IS APPLIED HERE FOR A SHARPER REASON.** The two
+ * forms must agree about what "booked to" means, because a timer's links become
+ * an entry's links unchanged at stop -- a picker that let a timer hold a state an
+ * entry could not would produce a stop that fails at the moment the operator can
+ * least afford it. `addLink`'s at-most-one-per-kind rule is what keeps the form
+ * from holding a state the ROW cannot, and there is now one copy of it in use.
+ */
+function TimeEntryLinkPicker({
+  links, picking, onPicking, onLinks, testIdPrefix,
+}: {
+  links: TimeEntryLink[];
+  picking: TimeEntryLinkKind | null;
+  onPicking: (kind: TimeEntryLinkKind | null) => void;
+  onLinks: (links: TimeEntryLink[]) => void;
+  testIdPrefix: string;
+}) {
+  return (
+    <div className="flex flex-col gap-2">
+      <span className="text-xs font-medium text-slate-500">Booked to</span>
+      <div className="flex flex-wrap items-center gap-1">
+        {links.length === 0 && <span className="text-xs text-slate-400">Nothing yet</span>}
+        {links.map((link) => (
+          <span
+            key={`${link.kind}-${link.id}`}
+            data-testid={`${testIdPrefix}-chip`}
+            className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-700"
+          >
+            {LINK_LABEL[link.kind]}: {link.label}
+            <button
+              type="button"
+              aria-label={`Remove ${LINK_LABEL[link.kind]} ${link.label}`}
+              className={`text-slate-400 hover:text-slate-900 ${CHIP_REMOVE_TOUCH}`}
+              onClick={() => onLinks(removeLink(links, link.kind))}
+            >
+              {"×"}
+            </button>
+          </span>
+        ))}
+      </div>
+      <div className="flex flex-wrap gap-2">
+        {LINK_KINDS.map((kind) => (
+          <Button
+            key={kind}
+            variant="ghost"
+            data-testid={`${testIdPrefix}-${kind}`}
+            className="min-h-11 px-3 text-xs"
+            onClick={() => onPicking(picking === kind ? null : kind)}
+          >
+            {LINK_LABEL[kind]}
+          </Button>
+        ))}
+      </div>
+      {picking !== null && (
+        <EntityPicker
+          kind={picking}
+          onPick={(id, label) => {
+            onLinks(addLink(links, { kind: picking, id, label }));
+            onPicking(null);
+          }}
+          onCancel={() => onPicking(null)}
         />
       )}
     </div>
@@ -502,54 +699,19 @@ function TimeEntryDialog({
             </div>
           </fieldset>
 
-          <div className="flex flex-col gap-2">
-            <span className="text-xs font-medium text-slate-500">Booked to</span>
-            <div className="flex flex-wrap items-center gap-1">
-              {draft.links.length === 0 && (
-                <span className="text-xs text-slate-400">Nothing yet</span>
-              )}
-              {draft.links.map((link) => (
-                <span
-                  key={`${link.kind}-${link.id}`}
-                  data-testid="entry-link-chip"
-                  className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-700"
-                >
-                  {LINK_LABEL[link.kind]}: {link.label}
-                  <button
-                    type="button"
-                    aria-label={`Remove ${LINK_LABEL[link.kind]} ${link.label}`}
-                    className={`text-slate-400 hover:text-slate-900 ${CHIP_REMOVE_TOUCH}`}
-                    onClick={() => setDraft({ ...draft, links: removeLink(draft.links, link.kind) })}
-                  >
-                    {"×"}
-                  </button>
-                </span>
-              ))}
-            </div>
-            <div className="flex flex-wrap gap-2">
-              {LINK_KINDS.map((kind) => (
-                <Button
-                  key={kind}
-                  variant="ghost"
-                  data-testid={`entry-link-${kind}`}
-                  className="min-h-11 px-3 text-xs"
-                  onClick={() => setPicking(picking === kind ? null : kind)}
-                >
-                  {LINK_LABEL[kind]}
-                </Button>
-              ))}
-            </div>
-            {picking !== null && (
-              <EntityPicker
-                kind={picking}
-                onPick={(id, label) => {
-                  setDraft({ ...draft, links: addLink(draft.links, { kind: picking, id, label }) });
-                  setPicking(null);
-                }}
-                onCancel={() => setPicking(null)}
-              />
-            )}
-          </div>
+          {/* THE SAME PICKER THE TIMER'S START FORM USES, and it must be: a
+              timer's links become an entry's links unchanged at stop, so a
+              picker that let one hold a state the other could not would produce
+              a stop that fails at the moment the operator can least afford it.
+              The testid prefix keeps every e2e selector on this form exactly
+              what it was. */}
+          <TimeEntryLinkPicker
+            links={draft.links}
+            picking={picking}
+            onPicking={setPicking}
+            onLinks={(links) => setDraft({ ...draft, links })}
+            testIdPrefix="entry-link"
+          />
 
           {error !== null && (
             <p role="alert" data-testid="entry-error" className="text-sm text-red-700">{error}</p>
