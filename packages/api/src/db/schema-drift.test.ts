@@ -86,10 +86,22 @@ import * as schema from "./schema.js";
  * wrote from `schema.ts`; it cannot see anything `schema.ts` cannot express, and
  * this database's shape is full of that. **`schema.ts` DECLARES ZERO INDEXES AND
  * THE DATABASE HAS 27**, plus five triggers, three functions and a generated
- * column. A migration dropping `documents_company_idx` passes that test
- * cleanly. It earns its place for the one thing it does see -- a `schema.ts`
- * edit made without regenerating, which leaves a stale snapshot and makes the
- * NEXT generated migration emit DDL nobody asked for -- and for nothing else.
+ * column. A migration dropping `documents_company_idx` passes that test cleanly,
+ * which was measured here and not assumed: with that `CREATE INDEX` deleted from
+ * 0019, this file fails on the index inventory and the generate test stays
+ * green.
+ *
+ * **AND IT IS WEAKER THAN THAT, WHICH WAS ALSO MEASURED.** It does not notice a
+ * CHECK EXPRESSION changing in `schema.ts` either: with `tasks_estimate_range`
+ * edited to `<= 525601` in `schema.ts` and nowhere else, drizzle-kit generate
+ * emits no migration at all, and the only test in this file that fails is the
+ * constraint-definition comparison above. So the class of drift this test can
+ * see is narrower than "everything drizzle models" -- it is closer to "tables,
+ * columns and constraint names".
+ *
+ * It earns its place for the one thing it does see -- a `schema.ts` edit made
+ * without regenerating, which leaves a stale snapshot and makes the NEXT
+ * generated migration emit DDL nobody asked for -- and for nothing else.
  */
 
 const handle = openTestDatabase();
