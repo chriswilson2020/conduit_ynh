@@ -759,7 +759,13 @@ describe("follow-up tasks from a meeting", () => {
       unsubscribe();
     }
 
-    expect(hints).toContainEqual({ keys: [["meetings"], ["meeting", meeting.id], ["events"]] });
+    // `["timesheet"]` joined the meeting hint in v1.9.0: a meeting's
+    // `duration_minutes` is half the week's figure, and the timesheet listens to
+    // neither `["meetings"]` nor `["time-entries"]` because it reads both tables
+    // and a query has one key. See publishMeetingHint.
+    expect(hints).toContainEqual({
+      keys: [["meetings"], ["meeting", meeting.id], ["events"], ["timesheet"]],
+    });
     // Both publishes happen: the meeting hint is an addition to createTask's
     // own, not a replacement for it.
     expect(hints.some((hint) => hint.keys.some((key) => key[0] === "task" && key[1] === task.id)))

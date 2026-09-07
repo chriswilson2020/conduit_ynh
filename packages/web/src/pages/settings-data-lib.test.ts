@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { readFile } from "node:fs/promises";
+import { EXPORT_MEMBERS } from "@conduit/shared";
 import type { BackupPreflight, PlanEffectView, PlanView } from "@conduit/shared";
 import { ApiError, ResponseShapeError } from "../api";
 import {
-  EMPTY_BACKUP_FORM, EMPTY_RESTORE_FORM, applyKeptThePreview, backupFormProblem,
-  canPreviewRestore, canSubmitBackup, downloadProblem, formatBytes, formatDuration,
-  planCountLabel, preflightSeverity, preflightWarning, restoreConfirmBlocked,
+  EMPTY_BACKUP_FORM, EMPTY_RESTORE_FORM, EXPORT_ARCHIVE_SUMMARY, applyKeptThePreview,
+  backupFormProblem, canPreviewRestore, canSubmitBackup, downloadProblem, formatBytes,
+  formatDuration, planCountLabel, preflightSeverity, preflightWarning, restoreConfirmBlocked,
   restoreFormProblem, restorePreviewBlocked, restoreProblem,
 } from "./settings-data-lib";
 
@@ -747,5 +749,51 @@ describe("twoSentences, through the messages that append to the server's", () =>
     );
     expect(answer).toContain("passphrase. Nothing has been changed");
     expect(answer).not.toContain("passphrase.. ");
+  });
+});
+
+/**
+ * **THE ONE OPERATOR-FACING LIST OF SHEETS, WHICH HAD NO TEST AT ALL.**
+ *
+ * Phase 10 Task 1 measured this: reverting the Settings sentence to its
+ * nine-sheet version was a mutation that survived the ENTIRE suite. It is the
+ * only description of the archive a user ever reads, so the failure it produces
+ * is an operator who does not know their timesheet is in the file -- and there
+ * was nothing anywhere to say so.
+ */
+describe("what the operator is told the export contains", () => {
+  it("names every member of the archive, in the order the archive holds them", () => {
+    for (const member of EXPORT_MEMBERS) {
+      expect(EXPORT_ARCHIVE_SUMMARY, `${member.member} is not named to the operator`)
+        .toContain(member.noun);
+    }
+    const at = EXPORT_MEMBERS.map((member) => EXPORT_ARCHIVE_SUMMARY.indexOf(member.noun));
+    expect([...at].sort((a, b) => a - b)).toEqual(at);
+  });
+
+  it("is a sentence the page RENDERS, not one typed into the page beside it", async () => {
+    // READ OFF DISK, because that is the only way to hold this from a `node`
+    // environment with no DOM -- and the mutation being guarded against is a
+    // SOURCE edit: somebody writing the list of record types out again, in the
+    // page, exactly as it was written out before v1.9.0. A rendering test could
+    // not see that; this can, and it was watched failing against the page's own
+    // pre-v1.9.0 paragraph rather than trusted.
+    const source = await readFile(new URL("./settings-data.tsx", import.meta.url), "utf8");
+    const from = source.indexOf("function ExportCard(");
+    const to = source.indexOf("function BackupCard(");
+    // The premise: the slice below is really the export card and really ends.
+    expect(from).toBeGreaterThan(0);
+    expect(to).toBeGreaterThan(from);
+    const card = source.slice(from, to);
+
+    expect(card).toContain("{EXPORT_ARCHIVE_SUMMARY}");
+    for (const member of EXPORT_MEMBERS) {
+      expect(
+        card,
+        `"${member.noun}" is typed into the export card. The sentence describing the archive `
+        + "is derived from EXPORT_MEMBERS (see EXPORT_ARCHIVE_SUMMARY) precisely so that a "
+        + "sheet added to the export cannot go unmentioned to the operator.",
+      ).not.toContain(member.noun);
+    }
   });
 });

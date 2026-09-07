@@ -1,4 +1,6 @@
-import { installNameMatches, passphraseProblem, planIsApplicable } from "@conduit/shared";
+import {
+  exportMemberNouns, installNameMatches, passphraseProblem, planIsApplicable,
+} from "@conduit/shared";
 import type { BackupPreflight, PlanUnit, PlanView } from "@conduit/shared";
 import { ApiError, ResponseShapeError } from "../api";
 
@@ -20,7 +22,42 @@ import { ApiError, ResponseShapeError } from "../api";
  * a file that did not arrive, the other a database that may or may not still
  * exist. Merging them would put "check the connection and try again" in front
  * of somebody whose restore stopped half way.
+ *
+ * SINCE v1.9.0 ONE PIECE OF COPY LIVES HERE TOO, and it is here for the same
+ * reason the decisions are: it was the only description of the export that an
+ * operator ever reads, it was typed out by hand in the page, and NOTHING TESTED
+ * IT. Phase 10 Task 1 added a tenth sheet and found that reverting this one
+ * sentence to its nine-sheet version survived the entire suite -- an operator
+ * would have gone on being told their timesheet was not in a file that
+ * contained it. See EXPORT_ARCHIVE_SUMMARY.
  */
+
+/**
+ * **WHAT THE EXPORT CONTAINS, IN THE OPERATOR'S WORDS -- DERIVED, NOT TYPED.**
+ *
+ * The nouns and their order come from @conduit/shared's EXPORT_MEMBERS, which
+ * is the same list services/export.ts writes the archive from. A sheet added
+ * there appears in this sentence with nobody remembering to come here, which is
+ * the whole point: this was one of ten hand-written lists of the same ten
+ * member names, and the only one of the ten with no test behind it.
+ *
+ * THE SENTENCE, NOT ONLY THE LIST, and that is deliberate. If the page kept the
+ * prose and interpolated a list of nouns, the prose would still be a place
+ * somebody could describe the archive -- "one CSV per record type" and then a
+ * list of nine -- and it would still be untestable from here. As one exported
+ * string it is a value settings-data-lib.test.ts can hold against the member
+ * list, and the page's only job is to render it.
+ *
+ * THE FILES ARE MENTIONED TWICE ON PURPOSE. `files.csv` is a sheet like any
+ * other -- it is what says which company each stored file belongs to -- and the
+ * blobs themselves are a separate half of the archive that is measured in
+ * hundreds of megabytes. An operator wondering "are my PDFs in here" is asking
+ * about the second one.
+ */
+export const EXPORT_ARCHIVE_SUMMARY =
+  `A ZIP holding one CSV per record type -- ${exportMemberNouns()} -- plus the files `
+  + "themselves and every quote PDF you have issued. The CSVs open in Excel, Numbers or "
+  + "LibreOffice, accented names intact.";
 
 /**
  * WHY THERE IS A SECOND PASSPHRASE FIELD.

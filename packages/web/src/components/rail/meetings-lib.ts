@@ -1,7 +1,7 @@
 import type {
   MeetingAttendee, MeetingAttendeeInput, MeetingCreateInput, MeetingTaskCreateInput,
 } from "@conduit/shared";
-import { meetingAtLeastOneLink } from "@conduit/shared";
+import { formatMinutes, meetingAtLeastOneLink } from "@conduit/shared";
 import { ApiError } from "../../api";
 import type { PendingArrivals } from "../../lib";
 import { newArrivalsLabel } from "../../lib";
@@ -77,13 +77,18 @@ export function localInputToIso(value: string): string | null {
 /** "45m", "1h", "1h 30m" -- or null for the honest "nobody recorded how long
  * it ran", which the row renders as nothing at all rather than as "0m"
  * (durationMinutes is `.int().positive().nullable()`, so 0 is not a value it
- * can hold). */
+ * can hold).
+ *
+ * THE NULL BRANCH IS THIS FUNCTION'S, THE SPELLING IS `formatMinutes`'.
+ * v1.9.0's timesheet writes quantities of work too, and the two must not drift
+ * into disagreeing about how 90 minutes reads -- but they genuinely differ at
+ * zero, and that difference is the reason this wrapper survives rather than
+ * being deleted: a meeting has no zero-length form, while an empty WEEK is a
+ * real answer that has to print as "0m" or a page cannot tell "no hours" from
+ * "no data". One spelling, two contracts at the bottom of the range. */
 export function durationLabel(minutes: number | null): string | null {
   if (minutes === null || minutes <= 0) return null;
-  const hours = Math.floor(minutes / 60);
-  const rest = minutes % 60;
-  if (hours === 0) return `${rest}m`;
-  return rest === 0 ? `${hours}h` : `${hours}h ${rest}m`;
+  return formatMinutes(minutes);
 }
 
 /**

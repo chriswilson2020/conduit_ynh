@@ -47,7 +47,12 @@ import {
   stageSchema,
   statusReportSchema,
   taskDependencySchema,
+  taskEffortSchema,
   taskSchema,
+  timeEntrySchema,
+  timerStateSchema,
+  timesheetTotalsSchema,
+  timesheetWeekSchema,
   usersResponseSchema,
   type BulkThreadActionInput,
   type BulkMessageActionInput,
@@ -110,6 +115,12 @@ import {
   type StatusReportRecord,
   type Task,
   type TaskStatus,
+  type TimeEntry,
+  type TimeEntryCreateInput,
+  type TimerStartInput,
+  type TimerStopInput,
+  type TimeEntryUpdateInput,
+  type TimesheetFilters,
   type UpdateCompanyInput,
   type UpdateContactInput,
   type UpdateDealInput,
@@ -926,6 +937,30 @@ export function useTaskDependencies(id: string) {
     queryKey: ["task", id, "dependencies"],
     queryFn: async () =>
       parseWith(taskDependencyListSchema, await getJson<unknown>(`/tasks/${id}/dependencies`), "task dependencies"),
+    enabled: id !== "",
+  });
+}
+
+/**
+ * Booked versus estimated for one task -- GET /api/tasks/:id/effort
+ * (api: services/timesheet.ts's taskEffort).
+ *
+ * SCOPED UNDER ["task", id] FOR useTaskDependencies' REASON, and here it earns
+ * that placement twice over: the estimate changes through a task PATCH (which
+ * publishes ["task", id]) and the booked minutes change through a time-entry
+ * write, which since v1.9.0 publishes the same key when the entry names a task
+ * (api: services/time-entries.ts's publishTimeEntryHint). Two independent
+ * sources of change, one key, and neither of them has to know about this hook.
+ *
+ * A SEPARATE REQUEST RATHER THAN A FIELD ON THE TASK, which is a deliberate
+ * round trip: putting the booked figure on `taskSchema` would make the board and
+ * the Gantt run an aggregate per rendered card. See taskEffort's doc comment.
+ */
+export function useTaskEffort(id: string) {
+  return useQuery({
+    queryKey: ["task", id, "effort"],
+    queryFn: async () =>
+      parseWith(taskEffortSchema, await getJson<unknown>(`/tasks/${id}/effort`), "task effort"),
     enabled: id !== "",
   });
 }
@@ -2687,4 +2722,213 @@ export async function applyImport(input: { planId: string; kind: "export" | "csv
  */
 export async function cancelImport(planId: string): Promise<void> {
   await deleteRequest(`/import/${planId}`);
+}
+
+// ---------------------------------------------------------------------------
+// Time entries and the timesheet (Phase 10)
+// ---------------------------------------------------------------------------
+
+/**
+ * **`["timesheet"]` IS A KEY OF ITS OWN, AND IT HAS TO BE.**
+ *
+ * The report reads `time_entries` AND `meetings`, and a TanStack query has ONE
+ * key -- so nesting these under `["time-entries"]` would leave the week stale
+ * after every meeting write, and under `["meetings"]` after every entry. The API
+ * publishes `["timesheet"]` from BOTH mutators for exactly that reason (api:
+ * services/time-entries.ts's publishTimeEntryHint and services/meetings.ts's
+ * publishMeetingHint), so components/sse.tsx invalidates both hooks below with no
+ * timesheet-specific case, and a meeting logged in another tab moves the figure
+ * in this one.
+ *
+ * The totals and the days are two queries against two routes rather than one
+ * payload, because only the rows grow with the range: the aggregate answers the
+ * same handful of numbers for a decade as for a day and carries no span bound,
+ * while the rows endpoint refuses more than MAX_TIMESHEET_DAY_SPAN. They cannot
+ * disagree -- the same module computes both from the same predicates, and a
+ * service test holds the day figures against the aggregate's own sum.
+ */
+export interface TimesheetParams extends TimesheetFilters {
+  from: string;
+  to: string;
+}
+
+function timesheetQueryString(params: TimesheetParams): string {
+  return toQueryString({
+    from: params.from, to: params.to,
+    company_id: params.companyId, contact_id: params.contactId,
+    deal_id: params.dealId, project_id: params.projectId,
+  });
+}
+
+export function useTimesheet(params: TimesheetParams) {
+  return useQuery({
+    queryKey: ["timesheet", "totals", params],
+    queryFn: async () => parseWith(
+      timesheetTotalsSchema,
+      await getJson<unknown>(`/timesheet${timesheetQueryString(params)}`),
+      "timesheet totals",
+    ),
+    enabled: params.from !== "" && params.to !== "",
+  });
+}
+
+export function useTimesheetDays(params: TimesheetParams) {
+  return useQuery({
+    queryKey: ["timesheet", "days", params],
+    queryFn: async () => parseWith(
+      timesheetWeekSchema,
+      await getJson<unknown>(`/timesheet/days${timesheetQueryString(params)}`),
+      "timesheet days",
+    ),
+    enabled: params.from !== "" && params.to !== "",
+  });
+}
+
+/**
+ * Mirrors publishTimeEntryHint (api: services/time-entries.ts): every entry
+ * mutation publishes `["time-entries"]`, `["time-entry", id]`, `["timesheet"]`
+ * and -- when the entry names a task -- `["task", <id>]`, which is the key the
+ * drawer's booked-versus-estimated line already listens to.
+ *
+ * BOTH TASKS ON AN UPDATE, pre-patch and post-patch, for the server's own
+ * reason: re-linking an hour moves it out of one booked total and into another,
+ * and a drawer open on the task it LEFT is exactly as stale as one open on the
+ * task it arrived at.
+ */
+function useInvalidateTimeEntry() {
+  const queryClient = useQueryClient();
+  return (entry: TimeEntry, extraTaskIds: (string | null)[] = []) => {
+    void queryClient.invalidateQueries({ queryKey: ["time-entries"] });
+    void queryClient.invalidateQueries({ queryKey: ["time-entry", entry.id] });
+    void queryClient.invalidateQueries({ queryKey: ["timesheet"] });
+    const tasks = new Set<string>();
+    if (entry.taskId !== null) tasks.add(entry.taskId);
+    for (const id of extraTaskIds) if (id !== null) tasks.add(id);
+    for (const id of tasks) void queryClient.invalidateQueries({ queryKey: ["task", id] });
+  };
+}
+
+export function useCreateTimeEntry() {
+  const invalidate = useInvalidateTimeEntry();
+  return useMutation({
+    mutationFn: async (input: TimeEntryCreateInput) =>
+      parseWith(timeEntrySchema, await postJson<unknown>("/time-entries", input), "time entry"),
+    onSuccess: (entry: TimeEntry) => invalidate(entry),
+  });
+}
+
+export function useUpdateTimeEntry() {
+  const invalidate = useInvalidateTimeEntry();
+  return useMutation({
+    // previousTaskId is passed by a caller holding the pre-patch entry -- the
+    // timesheet's edit form does -- so re-linking an hour refreshes the booked
+    // total of the task it left as well as the one it joined.
+    mutationFn: async (
+      { id, patch }: { id: string; patch: TimeEntryUpdateInput; previousTaskId?: string | null },
+    ) => parseWith(timeEntrySchema, await patchJson<unknown>(`/time-entries/${id}`, patch), "time entry"),
+    onSuccess: (entry: TimeEntry, { previousTaskId }) => invalidate(entry, [previousTaskId ?? null]),
+  });
+}
+
+/**
+ * ARCHIVE IS HOW AN HOUR COMES OUT OF A TOTAL, and it is the only way: Conduit
+ * never deletes, and an entry cannot be corrected to nothing either because
+ * `minutes > 0`. There is deliberately no delete mutation here to match.
+ */
+export function useArchiveTimeEntry() {
+  const invalidate = useInvalidateTimeEntry();
+  return useMutation({
+    mutationFn: async (id: string) =>
+      parseWith(timeEntrySchema, await postJson<unknown>(`/time-entries/${id}/archive`), "time entry"),
+    onSuccess: (entry: TimeEntry) => invalidate(entry),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// The timer (Phase 10 Task 5)
+// ---------------------------------------------------------------------------
+
+/**
+ * **`["timer"]` IS A KEY OF ITS OWN, AND IT HAS TO BE.**
+ *
+ * A running timer is neither a time entry nor a meeting -- it is not in
+ * `time_entries` at all, and cannot be, because `minutes` is NOT NULL and `> 0`
+ * -- so nesting it under either table's key would leave the strip stale after
+ * exactly the writes that change it. api: services/timers.ts publishes
+ * `["timer"]` on every start, stop and discard.
+ *
+ * **THAT KEY IS WHAT MAKES THE SECOND DEVICE LIVE RATHER THAN MERELY CORRECT ON
+ * REFRESH.** The spec asks for running state that survives a closed tab and a
+ * second device, and the row in Postgres is what makes that TRUE; this hint is
+ * what makes it VISIBLE. A timer started on a phone fills the strip on the
+ * laptop through the same SSE invalidation every other key here uses -- and,
+ * more usefully, one STOPPED on the phone empties it, so the laptop's Stop
+ * button stops offering to stop a timer that has already finished.
+ *
+ * A stop publishes this AND every key an entry write publishes, because it
+ * changes both halves of the screen: the strip empties and the week grows.
+ */
+export function useRunningTimer() {
+  return useQuery({
+    queryKey: ["timer"],
+    queryFn: async () => parseWith(
+      timerStateSchema, await getJson<unknown>("/timer"), "timer",
+    ),
+  });
+}
+
+function useInvalidateTimer() {
+  const queryClient = useQueryClient();
+  return () => {
+    void queryClient.invalidateQueries({ queryKey: ["timer"] });
+  };
+}
+
+export function useStartTimer() {
+  const invalidate = useInvalidateTimer();
+  return useMutation({
+    mutationFn: async (input: TimerStartInput) =>
+      parseWith(timerStateSchema, await postJson<unknown>("/timer", input), "timer"),
+    onSuccess: invalidate,
+  });
+}
+
+/**
+ * Stopping the clock returns the ENTRY it created, so this invalidates the
+ * timer's key and every key a hand-typed entry invalidates -- including
+ * `["task", id]` when the hours were booked to a task, which is the drawer's
+ * booked-versus-estimated sentence.
+ *
+ * There is no `previousTaskId` here, unlike `useUpdateTimeEntry`: a stop CREATES
+ * an entry, so there is no task it moved away from.
+ */
+export function useStopTimer() {
+  const invalidateTimer = useInvalidateTimer();
+  const invalidateEntry = useInvalidateTimeEntry();
+  return useMutation({
+    mutationFn: async ({ id, input }: { id: string; input: TimerStopInput }) =>
+      parseWith(
+        timeEntrySchema, await postJson<unknown>(`/timer/${id}/stop`, input), "time entry",
+      ),
+    onSuccess: (entry: TimeEntry) => {
+      invalidateTimer();
+      invalidateEntry(entry);
+    },
+  });
+}
+
+/**
+ * Discarding writes no entry, so nothing but the timer's own key moves -- and
+ * that asymmetry with the stop above is the point rather than an omission. The
+ * row is kept (Conduit never expunges, and it is the only record that the clock
+ * ever ran), but no total anywhere changes, because a running timer was in none
+ * of them.
+ */
+export function useDiscardTimer() {
+  const invalidate = useInvalidateTimer();
+  return useMutation({
+    mutationFn: async (id: string) =>
+      parseWith(timerStateSchema, await postJson<unknown>(`/timer/${id}/discard`), "timer"),
+    onSuccess: invalidate,
+  });
 }

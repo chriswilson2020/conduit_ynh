@@ -27,10 +27,18 @@ import { MONEY_LOCALE } from "./money-format.js";
 // is sent, saveOrgProfile refuses one that arrives anyway, and the renderer has
 // to make the same judgement about a stored one. Three readings of "is this a
 // zone" that agree today would not stay agreed.
+// zonedDayRange joins them in v1.9.0: the timesheet sums a `date` column and a
+// `timestamptz` one, so it has to decide which calendar day a meeting's instant
+// fell on, and that is this same field's question at a second surface.
+// isoWeekRange and zonedDayFormatter join them in Task 4: the timesheet page has
+// to name a week before it can ask for one, and its rows have to be put on the
+// organisation's calendar days one meeting at a time.
 export {
-  DEFAULT_TIME_ZONE, MAX_TIME_ZONE_LENGTH, timeZoneLabel, timeZoneProblem, todayInZone,
-  usableTimeZone,
+  calendarDaySpan, calendarDaysBetween, DEFAULT_TIME_ZONE, MAX_TIME_ZONE_LENGTH, isCalendarDay,
+  isoWeekRange, timeZoneLabel, timeZoneProblem, todayInZone, usableTimeZone, zonedDayFormatter,
+  zonedDayRange,
 } from "./time-zone.js";
+export type { ZonedDayRange } from "./time-zone.js";
 // ...and imported as well as re-exported, for the reason MONEY_LOCALE is:
 // `formatDocumentInstant` below needs the names in scope, and a re-export does
 // not put them there.
@@ -67,6 +75,20 @@ export type {
 // ticket, and routes/restore.ts refuses one that arrives anyway. One function,
 // two callers -- not two comparisons that agree today.
 export { installNameMatches } from "./install-name.js";
+// v1.9.0's ONE LIST OF WHAT THE EXPORT CONTAINS, reaching api and web the same
+// way the rules above do -- and for a sharper version of their reason. Those
+// are two judgements that must agree; this is FIVE hand-written lists that
+// agreed only by somebody remembering, and Phase 9 proved three times running
+// that somebody does not. The export writes these members, the importer explains
+// the ones it cannot read, and Settings tells the operator what is in the file:
+// three surfaces, one declaration. See the module for the full table of readers.
+export {
+  EXPORT_MEMBERS, EXPORT_MEMBER_NAMES, MEMBER_BY_TABLE, NOT_IMPORTED_MEMBERS,
+  exportMemberNouns, importedMembers,
+} from "./export-members.js";
+export type {
+  ExportMember, ExportMemberImport, ExportMemberName, ImportedMemberName,
+} from "./export-members.js";
 // IN SCOPE, not merely re-exported: the zod schema at the foot of this file is
 // held against this type by the compiler, and a `export type ... from` does not
 // bring the name into this module.
@@ -538,6 +560,46 @@ export const TASK_STATUS_LABEL: Record<TaskStatus, string> = {
   todo: "To do", in_progress: "In progress", blocked: "Blocked", done: "Done",
 };
 
+/**
+ * **THE LONGEST A TASK MAY BE ESTIMATED AT: ONE YEAR, IN MINUTES.**
+ *
+ * Phase 10 Task 3. `tasks` carried no quantity of work at all until v1.9.0 --
+ * only dates and a percentage -- so "booked versus estimated", which is the
+ * usual point of booking time against a task, had nothing to compare against.
+ *
+ * MINUTES, BECAUSE THE OTHER HALF OF THE COMPARISON IS MINUTES:
+ * `time_entries.minutes` and `meetings.duration_minutes` are both integer
+ * minutes, and an estimate in hours would put a conversion and a rounding
+ * between a number and the number it exists to be read against. See db/schema.ts
+ * on `tasks.estimate_minutes` for the rest of the unit argument.
+ *
+ * **SPELLED HERE AND AS THE `tasks_estimate_range` DB CHECK**, with schema.test.ts
+ * probing the exact edges so the literal in the migration and this constant
+ * cannot come to mean different things -- MAX_TIME_ENTRY_MINUTES' arrangement.
+ *
+ * **NOT 1440, AND NOT UNBOUNDED, AND BOTH HALVES OF THAT ARE THE POINT.**
+ *
+ *   MAX_TIME_ENTRY_MINUTES is one day because `work_date` is one day: an entry
+ *   is work attributed to a calendar date and no date holds more than 24 hours.
+ *   A TASK HAS NO SUCH DAY. Its dates are a span (`tasks_dates_paired`) and the
+ *   Gantt draws a bar across it, so the same bound here would refuse true rows
+ *   in bulk. What a year draws instead is the line between two entities this
+ *   product already has: a work item estimated at more than a person-year is a
+ *   project, and `tasks.project_id` is the column that says so. Wall clock, not
+ *   an eight-hour working day, because Conduit does not know the operator's
+ *   working day -- the one place the schema would have had to guess at it
+ *   (`time_entries.billable`) it refused to.
+ *
+ *   AND UNBOUNDED IS `meetings.duration_minutes`' POSITION, WHOSE COST TASK 2
+ *   MEASURED. `meetingSchema.durationMinutes` is `z.number().int().positive()`
+ *   with no ceiling, so one meeting can carry 999,999,999 minutes and dominate a
+ *   week's total; it cannot be tightened NOW, because a `.max()` would make the
+ *   client refuse to parse rows that already exist -- turning a silly figure
+ *   into a broken page. A bound is free exactly once, on the day the column is
+ *   created empty, and for this column that day is today.
+ */
+export const MAX_TASK_ESTIMATE_MINUTES = 365 * 24 * 60;
+
 export const taskSchema = z.object({
   id: z.uuid(), title: z.string().min(1), description: nullableString,
   type: taskTypeSchema, status: taskStatusSchema,
@@ -545,6 +607,9 @@ export const taskSchema = z.object({
   startDate: z.iso.date().nullable(), dueDate: z.iso.date().nullable(),
   completedAt: z.iso.datetime().nullable(),
   progressPct: z.number().int().min(0).max(100).nullable(),
+  /** Minutes, or null for "nobody has estimated this" -- the ONE spelling of
+   * that, which is why the floor is 1 and not 0 (db/schema.ts's CHECK). */
+  estimateMinutes: z.number().int().min(1).max(MAX_TASK_ESTIMATE_MINUTES).nullable(),
   parentTaskId: z.uuid().nullable(), position: z.string().min(1),
   companyId: z.uuid().nullable(), contactId: z.uuid().nullable(), dealId: z.uuid().nullable(),
   projectId: z.uuid().nullable(),
@@ -584,6 +649,11 @@ const taskInputShape = z.object({
   startDate: z.iso.date().nullable().optional(),
   dueDate: z.iso.date().nullable().optional(),
   progressPct: z.number().int().min(0).max(100).nullable().optional(),
+  // An explicit null CLEARS the estimate, which is how a mis-typed one is
+  // withdrawn: the column has no zero to fall back to, deliberately (see
+  // MAX_TASK_ESTIMATE_MINUTES and the CHECK). Absent means "leave it alone", the
+  // three-state patch semantics every other field here has.
+  estimateMinutes: z.number().int().min(1).max(MAX_TASK_ESTIMATE_MINUTES).nullable().optional(),
   parentTaskId: z.uuid().nullable().optional(),
   companyId: z.uuid().nullable().optional(), contactId: z.uuid().nullable().optional(),
   dealId: z.uuid().nullable().optional(), projectId: z.uuid().nullable().optional(),
@@ -4826,3 +4896,1063 @@ export const importOutcomeSchema = z.object({
   message: z.string(),
 });
 export type ImportOutcome = z.infer<typeof importOutcomeSchema>;
+
+/* ========================================================================== *
+ *  TIME TRACKING (Phase 10)
+ * ========================================================================== */
+
+/**
+ * The longest one entry may be, in minutes: one day.
+ *
+ * SPELLED HERE AND AS A DB CHECK, and schema.test.ts probes the exact edges so
+ * the two cannot drift -- the belt-and-braces arrangement projects.color and
+ * tasks.progress_pct use, NOT meetings.duration_minutes' zod-only one.
+ *
+ * **THE DIFFERENCE IS NOT "NOTHING SUMS A MEETING'S DURATION" ANY MORE.** That
+ * was the reason when this was written and v1.9.0's timesheet made it false:
+ * both numbers are now summed into one week (api: services/timesheet.ts). What
+ * still differs is that this bound is DEFINITIONAL and that column has none
+ * available to it -- see below, and db/schema.ts on both columns.
+ *
+ * ONE DAY, because `work_date` is one day. An entry is a quantity of work
+ * attributed to a calendar date, and no date holds more than 24 hours -- so
+ * this is the bound the column's own meaning already implies, rather than a
+ * policy about how long anybody should work. What it catches in practice is a
+ * missing decimal point: 90 minutes typed as 900 still lands, 6000 does not.
+ *
+ * IT IS NOT THE BOUND A TASK'S ESTIMATE GETS, for exactly that reason: a task
+ * has no single day to be definitional about. See MAX_TASK_ESTIMATE_MINUTES,
+ * which is a year and argues the difference.
+ *
+ * IT IS ALSO THE BOUND TASK 5 WILL MEET. The spec's "you left this running for
+ * 62 hours" cannot be stored, so the timer's recovery interaction has to
+ * produce a real answer rather than saving the elapsed time and moving on --
+ * the spec's own "the recovery interaction is most of the feature", made
+ * unavoidable rather than merely recommended.
+ */
+export const MAX_TIME_ENTRY_MINUTES = 24 * 60;
+
+/**
+ * This predicate and the `time_entries_has_link` DB CHECK
+ * (num_nonnulls(company_id, contact_id, deal_id, project_id, task_id) >= 1,
+ * api: db/schema.ts) are ONE RULE IN TWO PLACES, exactly as
+ * meetingAtLeastOneLink and meetings_has_link are.
+ *
+ * AT LEAST ONE OF FIVE, and both halves of that are decisions the spec argues
+ * rather than defaults:
+ *
+ *   NOT EXACTLY ONE (notes'/files'/documents' rule): an hour can legitimately
+ *   belong to a project AND the deal it came from, and a schema that made the
+ *   operator pick one would be making one of those two reports wrong on
+ *   purpose.
+ *
+ *   NOT ANY-INCLUDING-NONE (tasks'/mail_threads' rule): unattached time appears
+ *   in no report and can be found only by SQL, so the week's total comes out
+ *   short and nothing anywhere says so.
+ *
+ * Exported for meetingAtLeastOneLink's reason exactly: updateTimeEntry must
+ * re-assert it against the MERGED row, because a patch sees one snapshot and
+ * only the service can tell "clearing companyId while dealId stays" from
+ * "clearing the last link". The parameter type accepts a merge result
+ * unchanged.
+ */
+export function timeEntryAtLeastOneLink(
+  v: {
+    companyId?: string | null; contactId?: string | null; dealId?: string | null;
+    projectId?: string | null; taskId?: string | null;
+  },
+): boolean {
+  return [v.companyId, v.contactId, v.dealId, v.projectId, v.taskId].some((x) => x != null);
+}
+
+/**
+ * The sentence both the wire refine and the service's merged-row check use, so
+ * a client reading the prose reads the same words whichever gate spoke.
+ */
+export const TIME_ENTRY_NO_LINK_MESSAGE =
+  "at least one of companyId, contactId, dealId, projectId or taskId is required";
+
+export const timeEntrySchema = z.object({
+  id: z.uuid(),
+  /**
+   * THE DAY THE WORK HAPPENED -- a bare date, not a timestamp.
+   *
+   * A timesheet's question is which DAY an hour belongs to, and a timestamptz
+   * cannot answer it without also answering "in whose time zone", which for a
+   * row typed by hand has no true answer at all: the operator did not record an
+   * instant, they recorded a day. org_profile.time_zone (0018) exists and would
+   * have to be consulted on every read, so the same stored row would move
+   * between weeks when that setting changed.
+   *
+   * FUTURE AND PAST ARE BOTH ADMITTED and nothing bounds the year. The database
+   * cannot hold such a rule -- a CHECK must be immutable and `now()` is not --
+   * so a bound here would be a rule exactly one write path enforced, which is
+   * the arrangement this schema keeps refusing. A mistyped year is visible in
+   * the timesheet's own date column and in the export's.
+   */
+  workDate: z.iso.date(),
+  minutes: z.number().int().positive().max(MAX_TIME_ENTRY_MINUTES),
+  /**
+   * What the hour was, in the operator's own words. "" is not a value: an entry
+   * with nothing written on it is NULL.
+   *
+   * NOT IN THE SPEC'S COLUMN LIST, which names "a duration, a date, an owner, a
+   * billable flag, and the link set", and here anyway because the phase's
+   * definition of done is a timesheet that answers "where did the week go".
+   * Five hours against a project, with no words, is a number rather than an
+   * answer. Adding it later is a migration over live rows, every one of which
+   * would lack it.
+   */
+  description: nullableString,
+  /**
+   * A FLAG, AND THERE IS NO RATE. Invoicing is out of Conduit (spec), so this
+   * feeds reporting and the export and nothing else. A rate column without a
+   * rate card is a number somebody re-types on every entry for ever, and rates
+   * belong to the products/rate-card item already on the backlog.
+   */
+  billable: z.boolean(),
+  ownerUserId: z.uuid(),
+  companyId: z.uuid().nullable(), contactId: z.uuid().nullable(),
+  dealId: z.uuid().nullable(), projectId: z.uuid().nullable(),
+  /**
+   * THE FIFTH LINK, AND IT IS NOT `documents`' FIFTH. documents' five are
+   * company/contact/deal/project/MEETING; these are
+   * company/contact/deal/project/TASK. Same arity, different set -- so this is a
+   * new shape rather than a copy of 0016's, which is the point db/schema.ts
+   * makes at greater length about the CHECK.
+   *
+   * A task is in the set because the spec's first decision is "log time against
+   * anything, properly", and because a task is the natural unit for the
+   * booked-versus-estimated comparison Task 3 adds.
+   */
+  taskId: z.uuid().nullable(),
+  archivedAt: z.iso.datetime().nullable(), ...timestamps,
+});
+export type TimeEntry = z.infer<typeof timeEntrySchema>;
+
+// ownerUserId is absent on purpose: the owner is the actor, stamped
+// server-side -- the rule notes' authorUserId, files' uploaderUserId and
+// meetings' ownerUserId all follow.
+const timeEntryInputShape = z.object({
+  workDate: z.iso.date(),
+  minutes: z.number().int().positive().max(MAX_TIME_ENTRY_MINUTES),
+  description: nullableString.optional(),
+  /**
+   * REQUIRED ON CREATE, and that is the decision rather than an oversight.
+   *
+   * The column carries no DEFAULT either (db/schema.ts), which is
+   * documents.frozen's arrangement and documents.frozen's reason: a boolean
+   * whose two values are both perfectly ordinary has no default that is not a
+   * guess, and a guess is made silently on the row where it is hardest to
+   * notice. An entry defaulting to non-billable would under-report chargeable
+   * time -- the direction nobody checks, because with invoicing out of the
+   * product nothing downstream ever contradicts it.
+   *
+   * So the form decides every time, and a caller that says nothing gets a 400
+   * naming this field rather than a row carrying an answer nobody gave.
+   */
+  billable: z.boolean(),
+  companyId: z.uuid().nullable().optional(), contactId: z.uuid().nullable().optional(),
+  dealId: z.uuid().nullable().optional(), projectId: z.uuid().nullable().optional(),
+  taskId: z.uuid().nullable().optional(),
+});
+
+export const timeEntryCreateInputSchema = timeEntryInputShape.superRefine((v, ctx) => {
+  if (!timeEntryAtLeastOneLink(v)) {
+    ctx.addIssue({ code: "custom", message: TIME_ENTRY_NO_LINK_MESSAGE });
+  }
+});
+export type TimeEntryCreateInput = z.infer<typeof timeEntryCreateInputSchema>;
+
+// The at-least-one-link refine deliberately does NOT ride the patch shape, for
+// meetingUpdateInputSchema's reason word for word: a partial update sees one
+// snapshot and never its persisted counterpart, so clearing companyId on an
+// entry that also carries a dealId is legitimate while clearing the LAST link
+// is not, and only the service can tell them apart. api:
+// services/time-entries.ts's updateTimeEntry re-asserts it against the merged
+// row -- through the exported timeEntryAtLeastOneLink above, never a second
+// copy -- and answers 409 rather than letting the CHECK raise a 500.
+export const timeEntryUpdateInputSchema = timeEntryInputShape.partial();
+export type TimeEntryUpdateInput = z.infer<typeof timeEntryUpdateInputSchema>;
+
+/**
+ * Query-side filter contract for GET /api/time-entries.
+ *
+ * `from`/`to` are INCLUSIVE bounds on work_date, and they are in Task 1 because
+ * they are the whole reason the date column is a date: Task 4's timesheet is
+ * "this week", which is a closed range over exactly this column.
+ *
+ * WHAT IS DELIBERATELY NOT HERE, so the omissions read as decisions rather than
+ * gaps: no `ownerUserId` filter and no `billable` filter. Each is one WHERE
+ * clause on the day something reads it, and a filter with no reader costs what
+ * an unbuilt index costs (0017/0019/0020's rule, applied to the other half of
+ * the query). The billable split is a report Task 4 owns; the owner filter
+ * needs a second person before it can select anything.
+ */
+export const timeEntryListFiltersSchema = z.object({
+  companyId: z.uuid().optional(), contactId: z.uuid().optional(),
+  dealId: z.uuid().optional(), projectId: z.uuid().optional(), taskId: z.uuid().optional(),
+  from: z.iso.date().optional(), to: z.iso.date().optional(),
+  // true = ONLY archived entries, absent/false = only live ones -- the house
+  // semantics every archived list uses (api: services/companies.ts).
+  archived: z.boolean().optional(),
+  cursor: z.string().min(1).optional(),
+  limit: z.number().int().positive().max(100).optional(),
+});
+export type TimeEntryListFilters = z.infer<typeof timeEntryListFiltersSchema>;
+
+/* -------------------------------------------------------------------------- *
+ *  The timesheet's totals (Phase 10 Task 2)
+ * -------------------------------------------------------------------------- */
+
+/**
+ * **NARROWING THE WEEK TO ONE RECORD (Phase 10 Task 4).**
+ *
+ * "Where did the week go" has an obvious second half -- "and how much of it went
+ * to this project" -- and these are the filters that answer it. They apply to
+ * BOTH halves of the report, entries and meetings alike, which is why they live
+ * here beside the totals rather than in `timeEntryListFiltersSchema`: a filter
+ * that narrowed the entries and left the meetings whole would produce a total
+ * belonging to no record at all.
+ *
+ * **FOUR, NOT FIVE, AND THE MISSING ONE IS `taskId`.** The plan assigns "the
+ * record filters" to this task without saying how many, and `time_entries` has
+ * five links. A task filter is refused for two reasons that point the same way:
+ *
+ *   `meetings` HAS NO `task_id` COLUMN. Its link set is company/contact/deal/
+ *   project -- four, not the entries' five -- so a task-filtered timesheet would
+ *   answer "0m across 0 meetings" for every task that ever existed, with the
+ *   reason (no meeting CAN name a task) visible nowhere on the page. That is an
+ *   uncounted-hours silence of exactly the kind this phase keeps closing, and
+ *   the only honest fix would be a third derived clause explaining an absence
+ *   that is structural rather than about the week.
+ *
+ *   AND TASK 3 ALREADY ANSWERS IT, BETTER. `GET /api/tasks/:id/effort`
+ *   (`taskEffort`) gives one task's booked minutes AGAINST ITS ESTIMATE, which
+ *   is the question somebody filtering a timesheet to a task is really asking.
+ *   A second, weaker answer on another surface is how two numbers about the same
+ *   thing start disagreeing.
+ *
+ * The record filters are separate optional fields rather than a discriminated
+ * "one record" union because that is `timeEntryListFiltersSchema`'s shape and
+ * `listMeetings`', and combining two is a legitimate (if unused) narrowing. The
+ * PAGE sends one at a time; nothing here requires that.
+ */
+/**
+ * The longest span `GET /api/timesheet/days` will list, in calendar days.
+ *
+ * **A BOUND ON THE ROWS ENDPOINT AND NOT ON THE AGGREGATE**, because only one of
+ * them grows with the range: `GET /api/timesheet` answers the same handful of
+ * numbers for a decade as for a day, while this one answers a row per entry and
+ * per meeting. Refused at the gate with a 400 rather than answered with a
+ * truncated list, which would put a short list under a full total and leave the
+ * operator to notice -- `timesheetWeekSchema`'s whole reason for existing.
+ *
+ * A QUARTER, which is the longest stretch a single operator's timesheet is
+ * plausibly read row by row; at two entries a working day that is around 130
+ * rows plus meetings. The page itself only ever asks for seven.
+ */
+export const MAX_TIMESHEET_DAY_SPAN = 92;
+
+export const timesheetFiltersSchema = z.object({
+  companyId: z.uuid().optional(),
+  contactId: z.uuid().optional(),
+  dealId: z.uuid().optional(),
+  projectId: z.uuid().optional(),
+});
+export type TimesheetFilters = z.infer<typeof timesheetFiltersSchema>;
+
+/**
+ * A quantity of work, written the way this product already writes one: "45m",
+ * "1h", "1h 30m".
+ *
+ * **THE RAIL'S `durationLabel` NOW DELEGATES TO THIS AND KEEPS ITS OWN NULL
+ * BRANCH**, because the two have genuinely different contracts at the bottom of
+ * the range. A meeting nobody timed renders as nothing at all -- there is no such
+ * thing as a zero-length meeting, so `durationLabel` answers null. An empty week
+ * is a real answer and must print as "0m", or a page cannot distinguish "no
+ * hours" from "no data", which is this phase's failure mode in miniature. What
+ * they must NOT differ about is how 90 minutes is spelled, hence one function
+ * for that and two callers for the edge each of them owns.
+ */
+export function formatMinutes(minutes: number): string {
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  if (hours === 0) return `${String(rest)}m`;
+  return rest === 0 ? `${String(hours)}h` : `${String(hours)}h ${String(rest)}m`;
+}
+
+/** "1 entry" / "4 entries", so the sentence below never says "1 meetings". */
+function countOf(n: number, singular: string, plural: string): string {
+  return `${String(n)} ${n === 1 ? singular : plural}`;
+}
+
+/**
+ * **WHERE THE WEEK WENT: THE ANSWER, AND WHAT IT COULD NOT ANSWER FOR.**
+ *
+ * Phase 10's spec decides that the timesheet reads meetings and time entries
+ * TOGETHER -- `meetings.duration_minutes` has held tracked time since Phase 5 and
+ * has never been aggregated -- and that a manual entry cannot name a meeting, so
+ * one hour has exactly one source. api: services/timesheet.ts produces this;
+ * Task 4's page renders it.
+ *
+ * **THREE BUCKETS FOR MEETINGS, NOT ONE, AND THE TWO EXTRA ONES ARE THE POINT.**
+ * The spec: "a meeting with no duration contributes nothing, which is correct and
+ * must be visible: a report that silently treats unknown length as zero is the
+ * same failure in a smaller costume." So an uncounted meeting is a number in the
+ * answer rather than an absence from it:
+ *
+ *   `meetingsUnmeasured` -- in the range, has happened, and nobody recorded how
+ *   long it ran. `meetings.duration_minutes` is nullable precisely because that
+ *   is honest (Phase 5), and treating the null as a zero would turn an unknown
+ *   into a claim.
+ *
+ *   `meetingsNotYetOccurred` -- in the range and still in the future. **THIS ONE
+ *   IS NOT IN THE SPEC AND IS A CONSEQUENCE OF PHASE 5 THE SPEC DID NOT NOTICE.**
+ *   `occurred_at` is deliberately free in both directions, because "logging a
+ *   meeting you have just had and one you have just arranged are the same act",
+ *   and NO COLUMN DISTINGUISHES THE TWO. So the current week contains Friday's
+ *   arranged meetings on Wednesday morning, and counting them would answer "where
+ *   did the week go" with work nobody has done yet. The spec's own premise is
+ *   that "a logged meeting with a duration IS a recorded hour"; an arranged one
+ *   is a plan, so it is reported and not counted.
+ *
+ * `meetingsInRange` is the three of them added up, and the refine below is what
+ * makes that a guarantee rather than a hope: a meeting in two buckets is a double
+ * count inside a single query, and one in none is an hour that vanished.
+ *
+ * **`countedMinutes`, NEVER `totalMinutes`.** The name is doing work: a page that
+ * prints this figure and calls it the total, with the uncounted meetings left
+ * off, is the exact failure the spec describes -- and with this name it reads as
+ * a lie in its own source. {@link timesheetSummary} is the sentence that cannot
+ * leave them off at all.
+ */
+export const timesheetTotalsSchema = z.object({
+  /** Inclusive first day of the range, in `timeZone`'s calendar. */
+  from: z.iso.date(),
+  /** Inclusive last day. */
+  to: z.iso.date(),
+  /**
+   * THE CLOCK THE MEETING DAYS WERE DECIDED IN, named because it was used --
+   * `formatDocumentInstant`'s rule. This is `org_profile.time_zone` after
+   * `usableTimeZone`, so it can differ from the stored string when that has
+   * stopped resolving; a report that quietly fell back to UTC and did not say so
+   * is the failure that rule exists for.
+   */
+  timeZone: z.string().min(1),
+  entryMinutes: z.number().int().nonnegative(),
+  entryCount: z.number().int().nonnegative(),
+  /**
+   * **THE BILLABLE SPLIT (Task 4), AND IT IS OVER THE HAND-ENTERED HALF ALONE.**
+   *
+   * `time_entries.billable` has existed since Task 1 and until this task nothing
+   * in the product could read it: the spec says plainly that "billable time here
+   * feeds reporting and export, not billing", and with no report the column was
+   * write-only -- a flag the operator is forced to answer on every entry
+   * (`billable` has no default, deliberately) and never sees again outside a CSV.
+   *
+   * **MEETINGS HAVE NO SUCH FLAG AND ONE IS NOT INVENTED HERE.** `meetings`
+   * carries no `billable` column, so `meetingMinutes` is in NEITHER of these two
+   * figures -- not in the billable half and not in a non-billable half. Counting
+   * meetings as non-billable would be a claim nobody made about them, which is
+   * the same failure as counting an unmeasured meeting as zero. It is
+   * {@link timesheetBillableSummary}'s job to say so in the same string as the
+   * figure, for {@link timesheetSummary}'s reason.
+   *
+   * Summed from the same population as `entryMinutes` -- one query, a FILTER
+   * clause -- so the refine below can hold them against each other rather than
+   * hoping two queries agreed.
+   */
+  billableEntryMinutes: z.number().int().nonnegative(),
+  billableEntryCount: z.number().int().nonnegative(),
+  meetingMinutes: z.number().int().nonnegative(),
+  meetingsCounted: z.number().int().nonnegative(),
+  meetingsUnmeasured: z.number().int().nonnegative(),
+  meetingsNotYetOccurred: z.number().int().nonnegative(),
+  meetingsInRange: z.number().int().nonnegative(),
+  countedMinutes: z.number().int().nonnegative(),
+}).superRefine((v, ctx) => {
+  if (v.from > v.to) {
+    ctx.addIssue({ code: "custom", message: `from ${v.from} is after to ${v.to}` });
+  }
+  // THE HEADLINE FIGURE IS REFUSED IF IT DISAGREES WITH ITS OWN HALVES. This is
+  // the one number the phase exists to produce, so a wrong one arriving quietly
+  // is worse than no answer at all.
+  if (v.countedMinutes !== v.entryMinutes + v.meetingMinutes) {
+    ctx.addIssue({
+      code: "custom",
+      message: `countedMinutes ${String(v.countedMinutes)} is not entryMinutes `
+        + `${String(v.entryMinutes)} plus meetingMinutes ${String(v.meetingMinutes)}`,
+    });
+  }
+  // THE BILLABLE HALF IS A SUBSET OF THE ENTRIES, ON BOTH AXES. A split that
+  // exceeded the thing it splits is a FILTER over the wrong population -- the
+  // one mistake that makes a chargeable-hours figure wrong in the direction
+  // nobody checks, since with invoicing out of the product nothing downstream
+  // ever contradicts it.
+  if (v.billableEntryMinutes > v.entryMinutes) {
+    ctx.addIssue({
+      code: "custom",
+      message: `billableEntryMinutes ${String(v.billableEntryMinutes)} exceeds entryMinutes `
+        + String(v.entryMinutes),
+    });
+  }
+  if (v.billableEntryCount > v.entryCount) {
+    ctx.addIssue({
+      code: "custom",
+      message: `billableEntryCount ${String(v.billableEntryCount)} exceeds entryCount `
+        + String(v.entryCount),
+    });
+  }
+  const bucketed = v.meetingsCounted + v.meetingsUnmeasured + v.meetingsNotYetOccurred;
+  if (bucketed !== v.meetingsInRange) {
+    ctx.addIssue({
+      code: "custom",
+      message: `${String(bucketed)} meetings are accounted for but ${String(v.meetingsInRange)} `
+        + "are in the range: every meeting must be counted, unmeasured or not yet happened",
+    });
+  }
+});
+export type TimesheetTotals = z.infer<typeof timesheetTotalsSchema>;
+
+/**
+ * The operator's sentence: the week's figure and, in the same string, every
+ * meeting that is not in it.
+ *
+ * **ONE SENTENCE BECAUSE A PAGE CANNOT DROP A CLAUSE IT NEVER HAD.** The spec
+ * requires the uncounted meetings to be visible, and a `count` sitting beside a
+ * `total` in a payload is visible only to a UI that chooses to render it -- which
+ * is the same silence in a different place. This is `EXPORT_ARCHIVE_SUMMARY`'s
+ * arrangement (web: settings-data-lib.ts) and its reason: the whole paragraph is
+ * derived, so the page renders it or renders nothing.
+ *
+ * NO CLAUSE WHEN THERE IS NOTHING TO SAY, deliberately: "every meeting has a
+ * recorded length" on a quiet week is noise, and the absence of the caveat is
+ * only readable as an assurance if the caveat is guaranteed to appear when it is
+ * warranted -- which is what deriving it from the value guarantees.
+ */
+export function timesheetSummary(totals: TimesheetTotals): string {
+  const head = `${formatMinutes(totals.countedMinutes)} counted from ${totals.from} to `
+    + `${totals.to}: ${formatMinutes(totals.entryMinutes)} across `
+    + `${countOf(totals.entryCount, "entry", "entries")}, and `
+    + `${formatMinutes(totals.meetingMinutes)} across `
+    + `${countOf(totals.meetingsCounted, "meeting", "meetings")}.`;
+  const uncounted: string[] = [];
+  if (totals.meetingsUnmeasured > 0) {
+    uncounted.push(
+      `${countOf(totals.meetingsUnmeasured, "meeting", "meetings")} with no recorded length`,
+    );
+  }
+  if (totals.meetingsNotYetOccurred > 0) {
+    uncounted.push(
+      `${countOf(totals.meetingsNotYetOccurred, "meeting", "meetings")} that `
+      + `${totals.meetingsNotYetOccurred === 1 ? "has" : "have"} not happened yet`,
+    );
+  }
+  return uncounted.length === 0 ? head : `${head} Not counted: ${uncounted.join(", and ")}.`;
+}
+
+/**
+ * **HOW MUCH OF THE WEEK WAS CHARGEABLE, AND WHAT IS IN NEITHER FIGURE.**
+ *
+ * `time_entries.billable` is a flag the operator is made to answer on every
+ * entry -- the column has no default, deliberately -- and until Task 4 nothing
+ * in the product read it back. This is the reading, and it is a SENTENCE for
+ * {@link timesheetSummary}'s reason: "3h billable" printed beside a week's total
+ * invites the arithmetic `total - billable = non-billable`, which is WRONG here
+ * by exactly the meetings, and wrong in the direction nobody checks.
+ *
+ * **THE MEETINGS CLAUSE IS THE POINT, NOT A CAVEAT.** `meetings` has no billable
+ * column. A meeting's minutes are therefore in neither half of this split, and a
+ * page that could render the billable figure without saying so is a page that
+ * will. Derived from `meetingMinutes`, so the clause appears exactly when there
+ * is something for it to be about -- {@link timesheetSummary}'s "no clause when
+ * there is nothing to say" rule.
+ *
+ * **NO PERCENTAGE.** A ratio of two figures that do not cover the week would
+ * read as a share OF the week, and `countedMinutes` is the number beside it.
+ */
+export function timesheetBillableSummary(totals: TimesheetTotals): string {
+  const head = totals.entryMinutes === 0
+    // NOT "0m of 0m is billable", which reads as a finding about the week rather
+    // than as the absence of anything to split.
+    ? "Nothing was logged by hand, so there is no billable split."
+    : `${formatMinutes(totals.billableEntryMinutes)} of the `
+      + `${formatMinutes(totals.entryMinutes)} logged by hand is billable, across `
+      + `${countOf(totals.billableEntryCount, "entry", "entries")}.`;
+  return totals.meetingMinutes === 0 ? head : `${head} Meetings carry no billable flag, so the `
+    + `${formatMinutes(totals.meetingMinutes)} from meetings is in neither figure.`;
+}
+
+/* -------------------------------------------------------------------------- *
+ *  The timesheet's rows (Phase 10 Task 4)
+ * -------------------------------------------------------------------------- */
+
+/**
+ * A record a timesheet row is attached to, already resolved to something
+ * readable.
+ *
+ * **THE NAME COMES WITH THE ROW BECAUSE THE ALTERNATIVE IS FOUR LIST QUERIES ON
+ * A PHONE.** The page could hold the companies, contacts, deals and projects
+ * lists and look each id up, and it would be wrong as well as slow: an entry may
+ * legitimately name an ARCHIVED record (services/time-entries.ts's
+ * "existence, not activeness" rule), which those lists do not return. So the
+ * service LEFT JOINs the five, exactly as `time_entries.csv` does, and the label
+ * that reaches the page is the one the database has.
+ */
+export const timesheetLinkSchema = z.object({
+  kind: z.enum(["company", "contact", "deal", "project", "task"]),
+  id: z.uuid(),
+  label: z.string(),
+});
+export type TimesheetLink = z.infer<typeof timesheetLinkSchema>;
+
+/**
+ * **WHY A ROW IS NOT IN THE WEEK'S FIGURE, WHEN IT IS NOT.**
+ *
+ * The same two reasons {@link timesheetSummary} names in prose, as an enum a row
+ * can carry: the operator reading "Not counted: 2 meetings with no recorded
+ * length" must be able to see WHICH two, or the sentence is an assertion they
+ * cannot act on. `null` means the row counted.
+ */
+export const timesheetUncountedReasonSchema = z.enum(["no-recorded-length", "not-yet-happened"]);
+export type TimesheetUncountedReason = z.infer<typeof timesheetUncountedReasonSchema>;
+
+/**
+ * One line of the timesheet: a time entry, or a meeting.
+ *
+ * **BOTH KINDS IN ONE LIST, BECAUSE THE HEADLINE COUNTS BOTH.** A page listing
+ * only the entries under a sentence that says "and 2h 30m across 3 meetings"
+ * would be a list that does not add up to its own total -- the reader's only way
+ * to check the figure, quietly missing a third of it. So `timesheetDays` (api:
+ * services/timesheet.ts) reads the same two tables the aggregate does, over the
+ * same range, with the same predicates.
+ *
+ * `minutes` IS NULLABLE AND ONLY EVER FOR A MEETING NOBODY TIMED:
+ * `time_entries_minutes_range` forbids a zero and the column is NOT NULL, so an
+ * entry always has a figure. A null here is `meetings.duration_minutes` being
+ * honest, and it renders as words rather than as "0m" (see `durationLabel`).
+ *
+ * `billable` IS NULLABLE FOR THE SAME KIND OF REASON, one column over: meetings
+ * have no such flag, and `false` would be a claim. See
+ * {@link timesheetBillableSummary}.
+ */
+export const timesheetRowSchema = z.object({
+  kind: z.enum(["entry", "meeting"]),
+  id: z.uuid(),
+  /**
+   * The calendar day this row belongs to, in the ORGANISATION's clock -- which
+   * for an entry is `work_date` unchanged and for a meeting is the day
+   * `occurred_at` fell on there. That conversion is the whole reason the two
+   * tables cannot simply be UNIONed in SQL; see `zonedDayFormatter`.
+   */
+  day: z.iso.date(),
+  minutes: z.number().int().positive().nullable(),
+  /** What the operator wrote, or the meeting's title. Never "" -- a described
+   * entry and a blank one are told apart by `null`, `normaliseDescription`'s
+   * rule, and the page decides what to print for the blank one. */
+  label: nullableString,
+  billable: z.boolean().nullable(),
+  counted: z.boolean(),
+  uncountedReason: timesheetUncountedReasonSchema.nullable(),
+  links: z.array(timesheetLinkSchema),
+}).superRefine((v, ctx) => {
+  // A ROW EITHER COUNTED OR SAYS WHY NOT, and it cannot do both. Without this a
+  // service that forgot to set the reason would produce rows the page renders as
+  // counted while the headline excludes them -- a list and a total disagreeing,
+  // which is the one failure this whole surface exists to prevent.
+  if (v.counted !== (v.uncountedReason === null)) {
+    ctx.addIssue({
+      code: "custom",
+      message: v.counted
+        ? `a counted row carries the uncounted reason ${v.uncountedReason ?? ""}`
+        : "an uncounted row does not say why it was not counted",
+    });
+  }
+  if (v.kind === "entry" && (v.minutes === null || v.billable === null)) {
+    ctx.addIssue({ code: "custom", message: "an entry always has minutes and a billable flag" });
+  }
+  if (v.kind === "meeting" && v.billable !== null) {
+    ctx.addIssue({ code: "custom", message: "a meeting has no billable flag" });
+  }
+  // AN UNMEASURED MEETING IS EXACTLY A MEETING WITH NO MINUTES, in both
+  // directions: a row with minutes claiming that reason, or one without minutes
+  // claiming any other, is a bucket that has drifted from the value it describes.
+  if ((v.minutes === null) !== (v.uncountedReason === "no-recorded-length")
+    && v.uncountedReason !== "not-yet-happened") {
+    ctx.addIssue({
+      code: "custom",
+      message: "only a meeting with no recorded length may be uncounted for having none",
+    });
+  }
+});
+export type TimesheetRow = z.infer<typeof timesheetRowSchema>;
+
+/**
+ * One calendar day of the week, with its own figure.
+ *
+ * **EVERY DAY OF THE RANGE IS PRESENT, INCLUDING THE EMPTY ONES.** A week that
+ * silently omitted Wednesday would read as a week with no Wednesday in it, and
+ * "where did the week go" is a question a blank day answers.
+ *
+ * `countedMinutes` IS SUMMED OVER `rows` BY THE SERVICE AND NOT BY THE PAGE,
+ * and the difference is the plan's own rule: `listTimeEntries` caps at 100, so
+ * any figure a page adds up over what it was handed is right until it is
+ * silently short. `timesheetDays` is not capped -- the ROUTE bounds the span
+ * instead -- and a test holds these day figures against `timesheetTotals`'
+ * `countedMinutes`, which is the SQL sum, over the same range.
+ */
+export const timesheetDaySchema = z.object({
+  day: z.iso.date(),
+  countedMinutes: z.number().int().nonnegative(),
+  rows: z.array(timesheetRowSchema),
+});
+export type TimesheetDay = z.infer<typeof timesheetDaySchema>;
+
+/**
+ * The timesheet's list half: `GET /api/timesheet/days`.
+ *
+ * A SIBLING OF `GET /api/timesheet` RATHER THAN A FIELD ON IT, so Task 2's
+ * aggregate keeps a caller that pays for no rows -- and so this endpoint can
+ * carry the span bound it needs without imposing one on an answer that is O(1)
+ * whatever the range.
+ */
+export const timesheetWeekSchema = z.object({
+  from: z.iso.date(),
+  to: z.iso.date(),
+  timeZone: z.string().min(1),
+  days: z.array(timesheetDaySchema),
+}).superRefine((v, ctx) => {
+  if (v.from > v.to) {
+    ctx.addIssue({ code: "custom", message: `from ${v.from} is after to ${v.to}` });
+  }
+  // THE DAYS ARE THE RANGE, IN ORDER, WITH NO GAPS AND NO STRAYS. A row that
+  // landed on a day outside the week -- the shape a time-zone slip produces --
+  // would otherwise arrive as a day nobody asked for and be rendered without
+  // comment.
+  const days = v.days.map((d) => d.day);
+  if (days.some((day, i) => i > 0 && day <= (days[i - 1] ?? ""))) {
+    ctx.addIssue({ code: "custom", message: "the days are not in ascending order" });
+  }
+  const outside = days.filter((day) => day < v.from || day > v.to);
+  if (outside.length > 0) {
+    ctx.addIssue({
+      code: "custom",
+      message: `${outside.join(", ")} ${outside.length === 1 ? "is" : "are"} outside `
+        + `${v.from}..${v.to}`,
+    });
+  }
+  for (const day of v.days) {
+    const summed = day.rows.reduce((total, row) => total + (row.counted ? row.minutes ?? 0 : 0), 0);
+    if (summed !== day.countedMinutes) {
+      ctx.addIssue({
+        code: "custom",
+        message: `${day.day} reports ${String(day.countedMinutes)} counted minutes but its rows `
+          + `hold ${String(summed)}`,
+      });
+    }
+    if (day.rows.some((row) => row.day !== day.day)) {
+      ctx.addIssue({ code: "custom", message: `${day.day} holds a row from another day` });
+    }
+  }
+});
+export type TimesheetWeek = z.infer<typeof timesheetWeekSchema>;
+
+/* -------------------------------------------------------------------------- *
+ *  Booked versus estimated, for one task (Phase 10 Task 3)
+ * -------------------------------------------------------------------------- */
+
+/**
+ * **WHAT ONE TASK WAS ESTIMATED AT, AND WHAT HAS ACTUALLY BEEN BOOKED TO IT.**
+ *
+ * The spec's second fact about the schema was that `tasks` carries no quantity
+ * of work, and that "booked versus estimated is usually the point of tracking
+ * time against tasks, and it cannot exist until that column does".
+ * `tasks.estimate_minutes` (0022) is that column; this is the reading over it.
+ * api: services/timesheet.ts's `taskEffort`.
+ *
+ * **THE BOOKED HALF IS `time_entries` ALONE, AND THAT IS A FACT ABOUT THE
+ * SCHEMA RATHER THAN A CHOICE.** `meetings` has four record links and `task_id`
+ * is not one of them, so a meeting cannot be booked to a task and no meeting
+ * minute can reach this number. The tempting mistake is to reach for the
+ * `events.meeting_id` link that a meeting's follow-up TASK carries: Task 2
+ * settled that one -- an hour booked against a follow-up task is different work,
+ * not a second copy of the meeting's hour.
+ *
+ * **AN ARCHIVED ENTRY IS NOT BOOKED.** Archiving is the only way an hour leaves
+ * a total anywhere in this phase (an entry cannot be corrected to nothing --
+ * `time_entries_minutes_range` forbids zero), so an archived entry still
+ * counting here would make the correction for a mis-booked afternoon impossible
+ * on this reading while it worked on every other one.
+ *
+ * **AND NOTHING HERE REACHES `countedMinutes`.** An estimate is not time that
+ * happened; the week's total (above) does not read `tasks` at all and must not
+ * start. Booked-versus-estimated is a COMPARISON of two independent numbers, and
+ * adding an estimate into the sum would answer "where did the week go" with work
+ * nobody has done -- which is exactly what `meetingsNotYetOccurred` exists to
+ * refuse for arranged meetings.
+ */
+export const taskEffortSchema = z.object({
+  taskId: z.uuid(),
+  /** null means nobody has estimated this task. NOT a zero: see
+   * MAX_TASK_ESTIMATE_MINUTES, and `tasks_estimate_range`. */
+  estimateMinutes: z.number().int().min(1).max(MAX_TASK_ESTIMATE_MINUTES).nullable(),
+  /** Live (unarchived) `time_entries` minutes booked to this task. 0 is a real
+   * answer -- "nothing booked yet" -- and never an absent one. */
+  bookedMinutes: z.number().int().nonnegative(),
+  /** How many entries those minutes came from, so the sentence can say it and a
+   * reader can tell one long afternoon from nine scattered hours. */
+  entryCount: z.number().int().nonnegative(),
+}).superRefine((v, ctx) => {
+  // Minutes without entries, or entries without minutes, means the sum and its
+  // count came from different populations -- the failure Task 2 wrote ONE
+  // predicate to make unspellable in the timesheet's aggregate. Here they come
+  // out of one aggregate for the same reason, and this is what proves it stayed
+  // that way.
+  if ((v.bookedMinutes === 0) !== (v.entryCount === 0)) {
+    ctx.addIssue({
+      code: "custom",
+      message: `${String(v.bookedMinutes)} minutes booked across `
+        + `${String(v.entryCount)} entries: every live entry has minutes > 0, so these `
+        + "must be zero together or neither",
+    });
+  }
+});
+export type TaskEffort = z.infer<typeof taskEffortSchema>;
+
+/**
+ * The operator's sentence: what was booked, what was estimated, and the gap --
+ * in ONE string, so a surface cannot print half of a comparison.
+ *
+ * **THIS IS `timesheetSummary`'S ARRANGEMENT AND ITS REASON.** A `bookedMinutes`
+ * sitting beside an `estimateMinutes` in a payload is a comparison only if the
+ * page chooses to render both, and "5h booked" alone -- on a task estimated at
+ * two -- is a number that is wrong without looking wrong. Deriving the whole
+ * sentence is what makes the estimate impossible to drop; web:
+ * components/task-drawer.tsx renders this and composes nothing.
+ *
+ * **AN ESTIMATE ON A TASK NOBODY HAS STARTED IS REPORTED IN FULL, and that is a
+ * decision.** Nothing here asks about `status`, `progress_pct`, `start_date` or
+ * `completed_at`, and the "no time booked yet" phrasing exists precisely so the
+ * zero reads as a fact rather than as an empty answer. Task 2 excluded meetings
+ * that have not happened because the timesheet sums time that HAPPENED and an
+ * arranged meeting is a plan -- but an estimate never claims anything happened,
+ * so "has it started" is not a question it has to answer. Dropping unstarted
+ * tasks would also make the estimated side SHRINK as work went undone, which is
+ * backwards, and a task estimated at eight hours with nothing booked is the most
+ * informative row this comparison produces: either the work has not begun or the
+ * hours went somewhere else.
+ */
+export function taskEffortSummary(effort: TaskEffort): string {
+  const booked = effort.bookedMinutes === 0
+    ? "No time booked yet"
+    : `${formatMinutes(effort.bookedMinutes)} booked across `
+      + `${countOf(effort.entryCount, "entry", "entries")}`;
+  if (effort.estimateMinutes === null) return `${booked}, and no estimate.`;
+  const estimate = `${booked}, against an estimate of ${formatMinutes(effort.estimateMinutes)}`;
+  const gap = effort.bookedMinutes - effort.estimateMinutes;
+  if (gap === 0) return `${estimate}: exactly on the estimate.`;
+  return gap < 0
+    ? `${estimate}: ${formatMinutes(-gap)} left.`
+    : `${estimate}: ${formatMinutes(gap)} over.`;
+}
+
+/* -------------------------------------------------------------------------- *
+ *  The timer (Phase 10 Task 5)
+ * -------------------------------------------------------------------------- */
+
+/**
+ * **THE SECOND CAPTURE PATH, AND THE ONE THE SPEC CALLS THE PHASE'S REAL RISK.**
+ *
+ * "A start/stop timer sounds like a column. What it actually brings: running
+ * state that must survive a restart, a closed tab and a second device; the
+ * weekend problem, where the recovery interaction is most of the feature; and
+ * two paths that can produce the same hour."
+ *
+ * **NOTHING HERE IS A DURATION IN FLIGHT.** A running timer is `started_at` and
+ * a link set (api: db/schema.ts's `timers`), and every figure an operator reads
+ * is computed from that instant against a clock passed in. The wire payload
+ * deliberately carries NO elapsed figure: an elapsed time in a JSON body is
+ * stale by the time it is parsed, and having the server send one would mean two
+ * definitions of "how long has this run" -- one ticking in the strip and one
+ * fixed in the payload -- which is exactly how two numbers about one thing start
+ * disagreeing. {@link timerElapsedMinutes} is the single definition; the server
+ * calls it with its own clock and the browser with the device's.
+ *
+ * **A RUNNING TIMER IS NOT AN HOUR AND CANNOT BE COUNTED AS ONE.** It is not a
+ * `time_entries` row -- it cannot be, since `minutes` is NOT NULL and
+ * `minutes > 0`, so the schema has no way to hold a duration that is still
+ * accruing -- and `timesheetTotals` reads `time_entries` and `meetings` and
+ * nothing else. That is why every sentence below ends by saying nothing is
+ * counted until the timer stops: the figure on the strip is real and is
+ * deliberately in no total, and an operator has to be told which.
+ */
+
+/**
+ * How long a running timer has run, in whole minutes.
+ *
+ * **FLOORED, AND CLAMPED AT NOUGHT.** Flooring is {@link formatMinutes}' own
+ * rule at the other end of the same pipeline: a stopwatch reading 1m59s has not
+ * produced two minutes of work, and the proposal an operator accepts without
+ * reading must never exceed what the clock actually ran. The clamp is for the
+ * DEVICE clock rather than for a paradox -- `started_at` is stamped by Postgres
+ * and the strip ticks against the browser, so a phone a few seconds behind the
+ * server would otherwise render `formatMinutes(-1)`, which reads "-1h 59m".
+ */
+export function timerElapsedMinutes(startedAt: Date, now: Date): number {
+  const elapsedMs = now.getTime() - startedAt.getTime();
+  return elapsedMs <= 0 ? 0 : Math.floor(elapsedMs / 60_000);
+}
+
+/**
+ * The figure the stop form offers, or `null` when the clock's answer is not a
+ * storable number of minutes.
+ *
+ * **ONE RULE COVERING BOTH ENDS OF THE FEATURE'S RISK.** The proposal is
+ * withheld exactly when the elapsed figure could not be an entry:
+ *
+ *   UNDER ONE MINUTE, because `time_entries_minutes_range` forbids zero. A timer
+ *   started and stopped by mistake has produced nothing, and rounding nine
+ *   seconds up to a minute would be this schema inventing a quantity of work --
+ *   the same guess `billable` has no default in order to refuse.
+ *
+ *   OVER {@link MAX_TIME_ENTRY_MINUTES}, which is one day because `work_date` is
+ *   one day. This is the spec's "you left this running for 62 hours", and the
+ *   bound is what makes the recovery interaction unavoidable rather than merely
+ *   recommended: there is no "save the elapsed time and move on" branch for a
+ *   weekend, because the database will not hold it.
+ *
+ * **AND IT IS ONE FUNCTION RATHER THAN A THRESHOLD EACH**, because the two are
+ * the same refusal seen from opposite sides: the clock's answer is not a number
+ * of minutes an entry can carry, so it is not offered. What differs is what the
+ * operator is told, and that is {@link timerSummary}'s job.
+ *
+ * **REJECTED: SPLITTING A LONG TIMER ACROSS THE DAYS IT SPANNED.** A Friday
+ * 15:00 to Monday 08:00 timer would become 9h on Friday, 24h on Saturday, 24h on
+ * Sunday and 8h on Monday -- four entries the database WOULD accept, two of them
+ * claiming a person worked around the clock. It converts an obvious refusal into
+ * plausible-looking rubbish spread over a week's report, which is the one
+ * failure mode this phase keeps refusing.
+ */
+export function timerProposedMinutes(elapsedMinutes: number): number | null {
+  if (elapsedMinutes < 1) return null;
+  return elapsedMinutes > MAX_TIME_ENTRY_MINUTES ? null : elapsedMinutes;
+}
+
+/**
+ * A timer that is running now: the instant it started, what it is attached to,
+ * and the day its hours will land on.
+ *
+ * **`workDate` IS THE SERVER'S ANSWER AND NOT THE CLIENT'S**, derived from
+ * `started_at` in `org_profile.time_zone` -- Task 2's rule for which calendar day
+ * an instant belongs to, applied to the one instant this table stores. A phone
+ * in another zone deriving it locally would put one running timer on two
+ * different days, and on the last hour of a week that is two different WEEKS.
+ *
+ * **THE START DAY, NEVER THE STOP DAY.** A timer that runs from 23:00 to 01:00
+ * has to land somewhere and both readings are defensible, so the argument is not
+ * about which is more accurate: the START day is the only one that is knowable
+ * WHILE THE TIMER RUNS, which is what lets the strip and the stop dialog tell the
+ * operator where the hours are going before they commit them. A stop-day rule
+ * would make that sentence unwriteable until the moment it stopped being useful.
+ * It also cannot produce a future-dated entry -- `started_at` is `now()` on the
+ * server -- which is the asymmetry Task 4 recorded between entries (a future day
+ * counts) and meetings (a future one does not): the timer path simply never
+ * reaches it.
+ */
+export const runningTimerSchema = z.object({
+  id: z.uuid(),
+  /** The instant Postgres stamped when the operator pressed Start. THE ONE
+   * PIECE OF STATE, and the reason a restart, a closed tab and a second device
+   * all see the same timer: nothing about a running timer lives in a process. */
+  startedAt: z.iso.datetime(),
+  description: nullableString,
+  companyId: z.uuid().nullable(), contactId: z.uuid().nullable(),
+  dealId: z.uuid().nullable(), projectId: z.uuid().nullable(), taskId: z.uuid().nullable(),
+  /** The calendar day, in the organisation's clock, that stopping this timer
+   * will book its minutes to. A bare date, like `time_entries.work_date`. */
+  workDate: z.iso.date(),
+  /**
+   * The same five links, resolved to names -- `timesheetLinkSchema`'s shape, and
+   * its argument transfers word for word: the strip and the stop form cannot
+   * look these up from list endpoints, because a timer may legitimately name an
+   * ARCHIVED record and those lists do not return one. The service LEFT JOINs
+   * them, exactly as the timesheet's rows do.
+   *
+   * **THE STOP FORM IS WHY THIS IS NOT OPTIONAL FURNITURE.** An operator
+   * committing hours has to see where they are going, and "on Rollout" is the
+   * only thing on that screen that says so -- the description is nullable and
+   * the ids are not readable.
+   */
+  links: z.array(timesheetLinkSchema),
+  ...timestamps,
+})
+  .refine(timeEntryAtLeastOneLink, { message: TIME_ENTRY_NO_LINK_MESSAGE })
+  /**
+   * The resolved links and the id columns are the same set counted twice, so a
+   * payload where they disagree is a service that joined the wrong rows.
+   *
+   * **`Array.isArray` FIRST -- AND THE MEASUREMENT SAYS THIS CANNOT CURRENTLY
+   * FIRE, WHICH IS WHY IT SAYS SO RATHER THAN IMPLYING A REACHABLE CASE.**
+   *
+   * Task 4 recorded that "a zod `.refine` runs even when the object's own fields
+   * failed, and it is handed the RAW value", and generalised it: "any `.refine`
+   * in this codebase that does more than compare already-parsed primitives can
+   * be handed rubbish, and one that throws converts a 4xx into a 5xx". That
+   * generalisation is TOO BROAD, and Task 5 probed the exact rule on the same
+   * zod (4.4.3) rather than inheriting it. A refine on a `z.object` runs after a
+   * field failure in exactly ONE case:
+   *
+   *   - a FORMAT failure on a value of the right type -- `z.iso.date()` given
+   *     `"2026-09"` -- **runs the refine**, with that raw string in hand. This
+   *     is the case Task 4 met, and its finding is sound for it.
+   *   - a wrong TYPE, a MISSING key, a non-array where an array belongs, or an
+   *     array whose ELEMENT fails: **the refine does not run at all.**
+   *
+   * So `v.links` here is always a real array by the time this executes, and the
+   * guard is unreachable. It is kept for the reason `timesheetDays`' "a row fell
+   * outside the range" throw is kept: it costs one comparison, it is what makes
+   * the function total rather than accidentally safe, and zod's abort behaviour
+   * is a library's choice that an upgrade may revise. A mutation deleting it is
+   * GREEN, deliberately, and this comment is the record of why -- not a claim
+   * that a test is missing.
+   *
+   * What Task 4's finding still means here: a refine may see a FORMAT-failed
+   * string. Nothing below touches one -- the id fields are compared with
+   * `!= null`, which is total over every value.
+   */
+  .refine((v) => {
+    if (!Array.isArray(v.links)) return true;
+    const named = [v.companyId, v.contactId, v.dealId, v.projectId, v.taskId]
+      .filter((id) => id != null).length;
+    return v.links.length === named;
+  }, { message: "a running timer's resolved links must be exactly the records it names" });
+export type RunningTimer = z.infer<typeof runningTimerSchema>;
+
+/**
+ * `GET /api/timer`: what is running for the calling operator, and nothing else.
+ *
+ * **A NULLABLE FIELD RATHER THAN A 404**, because "no timer is running" is the
+ * ordinary state of this endpoint and not a missing resource -- and a strip that
+ * had to distinguish a 404 from a network failure would show a stopwatch when
+ * the server was down.
+ *
+ * `timeZone` is the clock `workDate` was decided in, carried for the same reason
+ * the timesheet carries it: a day computed in a zone the reader cannot see is a
+ * claim rather than an answer (`formatDocumentInstant`'s rule).
+ */
+export const timerStateSchema = z.object({
+  timer: runningTimerSchema.nullable(),
+  timeZone: z.string(),
+});
+export type TimerState = z.infer<typeof timerStateSchema>;
+
+/**
+ * **WHAT THE OPERATOR IS TOLD ABOUT A RUNNING TIMER, IN ONE STRING.**
+ *
+ * `timesheetSummary`'s and `taskEffortSummary`'s arrangement, and their reason:
+ * the figure and its caveat travel together, so a surface cannot render the
+ * stopwatch without the sentence that says what it can and cannot become. The
+ * three branches ARE the recovery interaction:
+ *
+ *   **A STORABLE FIGURE.** The clock proposes and says so -- "unless you change
+ *   it" is not politeness, it is the statement that the operator is the
+ *   authority on how long they worked and the timer merely watched.
+ *
+ *   **UNDER A MINUTE.** There is nothing to log, and the sentence says so rather
+ *   than reading "0m", which is `durationLabel`'s and `uncountedLabel`'s rule:
+ *   an unknown or absent quantity rendered as a zero is a claim.
+ *
+ *   **PAST THE BOUND -- the weekend.** The elapsed figure is stated (the
+ *   operator needs to know it ran for 62 hours; that IS the news) and is
+ *   simultaneously withdrawn as a proposal, with both ways out named. There is
+ *   deliberately no third option here and no default: a timer left running is
+ *   never stopped for the operator, never guesses a duration, and never becomes
+ *   an entry on its own. What changes if they ignore it is only this sentence
+ *   and what the stop form will accept.
+ *
+ * **AND "NOTHING IS COUNTED" IS IN ALL THREE, WHICH IS NOT A STYLE RULE.** It is
+ * the one clause that is true regardless of how long the clock has run, and the
+ * strip sits on /timesheet as well as everywhere else -- so a branch missing it
+ * leaves a screen reading "0m counted" beside a running stopwatch with nothing
+ * saying why. **The under-a-minute branch shipped without it and the e2e caught
+ * it**, which is worth recording: the three tests below each asserted their own
+ * branch's own words, and not one of them asserted the thing all three have to
+ * say. `timerSummary`'s test now checks the invariant across the branches as
+ * well as the branches themselves.
+ */
+export function timerSummary(timer: RunningTimer, now: Date): string {
+  const elapsed = timerElapsedMinutes(new Date(timer.startedAt), now);
+  if (elapsed < 1) {
+    return "Running for less than a minute. Nothing is counted until you stop it, and "
+      + "there is nothing to log yet either: an entry is at least one minute.";
+  }
+  const ran = formatMinutes(elapsed);
+  if (timerProposedMinutes(elapsed) === null) {
+    return `Running for ${ran}, which is longer than the `
+      + `${formatMinutes(MAX_TIME_ENTRY_MINUTES)} one entry can hold. Say how long you `
+      + "actually worked, or discard the timer; nothing is counted until you do.";
+  }
+  return `Running for ${ran}. Stopping it logs ${ran} unless you change the figure, and `
+    + "nothing is counted until you do.";
+}
+
+/**
+ * `POST /api/timer`: the links the hours will belong to, and optionally what the
+ * work is.
+ *
+ * **THE AT-LEAST-ONE RULE BITES HERE, AT THE START.** A timer with no link could
+ * not become an entry -- `time_entries_has_link` would refuse it -- so refusing
+ * it at STOP would hand that refusal to an operator already recovering from a
+ * forgotten weekend, holding hours they cannot save. Refused at start it costs
+ * one tap, while the picker is still on the screen. `timers_has_link` (api:
+ * db/schema.ts) is the same rule in the database, so the two-place arrangement
+ * `time_entries_has_link` has is repeated rather than trusted.
+ *
+ * **NO `minutes`, NO `billable`, NO `workDate`**, and each absence is somebody
+ * else's answer: the duration is what the clock is for, the flag is asked at stop
+ * (the column has no default and this phase never guesses it), and the day is
+ * derived by the server from `started_at`.
+ */
+export const timerStartInputSchema = z.object({
+  description: nullableString.optional(),
+  companyId: z.uuid().nullable().optional(), contactId: z.uuid().nullable().optional(),
+  dealId: z.uuid().nullable().optional(), projectId: z.uuid().nullable().optional(),
+  taskId: z.uuid().nullable().optional(),
+}).superRefine((v, ctx) => {
+  if (!timeEntryAtLeastOneLink(v)) {
+    ctx.addIssue({ code: "custom", message: TIME_ENTRY_NO_LINK_MESSAGE });
+  }
+});
+export type TimerStartInput = z.infer<typeof timerStartInputSchema>;
+
+/**
+ * `POST /api/timer/:id/stop`: the answers the clock cannot give.
+ *
+ * **`minutes` IS REQUIRED AND IS NOT DEFAULTED TO THE ELAPSED TIME**, which is
+ * the recovery interaction expressed as a schema. A default would have to be
+ * computed somewhere, and for the 62-hour timer the only figure available to
+ * compute is one `time_entries_minutes_range` refuses -- so the endpoint would
+ * have a case with no legal default, which is precisely the case the spec says
+ * the whole feature is about. The client proposes (see
+ * {@link timerProposedMinutes}); the operator states; the server writes what it
+ * is told. Bounded exactly as an entry is, because that is what it becomes.
+ *
+ * **`billable` IS REQUIRED FOR THE COLUMN'S OWN REASON**, inherited unchanged
+ * from Task 1: `time_entries.billable` has no DEFAULT, both its values are
+ * ordinary, and a timer that decided it silently would put the guess back one
+ * layer out where the database's refusal cannot reach it.
+ *
+ * **AND THERE ARE NO LINKS**, which is the difference from
+ * `timeEntryCreateInputSchema` rather than an omission. The records were chosen
+ * when the operator started the clock and are the timer's own; changing them at
+ * stop would make the strip's "on Rollout" a claim that could be false by the
+ * time the hours landed. An entry booked to the wrong record is corrected where
+ * every other entry is corrected -- on the timesheet, which already edits them.
+ */
+export const timerStopInputSchema = z.object({
+  minutes: z.number().int().positive().max(MAX_TIME_ENTRY_MINUTES),
+  billable: z.boolean(),
+  description: nullableString.optional(),
+});
+export type TimerStopInput = z.infer<typeof timerStopInputSchema>;

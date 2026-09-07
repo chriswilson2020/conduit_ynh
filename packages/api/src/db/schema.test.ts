@@ -10,6 +10,7 @@ import {
   mailAuthMethodSchema, mailOAuthProviderOf, documentTypeSchema, documentTypeFreezes,
   documentTypeNumbered,
   CONTACT_FIELD_CAPS, DEFAULT_TIME_ZONE, MAX_LOGO_DATA_URI_CHARS, MAX_TEMPLATE_BYTES,
+  MAX_TASK_ESTIMATE_MINUTES, MAX_TIME_ENTRY_MINUTES,
   type DocumentType,
 } from "@conduit/shared";
 import { openTestDatabase, truncateAll } from "../test/db.js";
@@ -40,7 +41,7 @@ import {
   mailAccounts, mailAccountFolders, mailFolderState, mailThreads, mailMessages, mailAttachments,
   mailThreadHides, meetings, meetingAttendees,
   orgProfile, documents, documentAgreements, documentLetters, documentQuotes, documentLineItems,
-  documentNumberSequences, documentTemplates,
+  documentNumberSequences, documentTemplates, tasks, timeEntries, timers,
 } from "./schema.js";
 
 const handle = openTestDatabase();
@@ -4188,5 +4189,789 @@ describe("the project status report (0020)", () => {
       for (const type of ["quote", "nda", "mutual_nda"]) expect(row.def).toContain(type);
     }
     expect(defs).toHaveLength(3);
+  });
+});
+
+describe("time entries (0021)", () => {
+  /** A row that satisfies every constraint except the link one, overridable per
+   * test. No record link by default, so a test that means to insert a VALID row
+   * has to say which record it belongs to -- which is the rule under test. */
+  function entryValues(
+    overrides: Partial<typeof timeEntries.$inferInsert> = {},
+  ): typeof timeEntries.$inferInsert {
+    return {
+      workDate: "2026-09-01", minutes: 60, billable: false, ownerUserId: userId, ...overrides,
+    };
+  }
+
+  async function seedProject(): Promise<string> {
+    return (await createProject(handle.db, userId, { name: "Rollout" })).id;
+  }
+
+  /**
+   * **THE UPGRADE DRILL, AND ITS QUESTION IS THE CHEAPEST ONE IN THE FILE.**
+   *
+   * 0021 creates one table and touches nothing that exists, so unlike 0016 there
+   * is no fixture of pre-migration rows to replay and unlike 0018 there is no
+   * backfill whose DEFAULT could lie about rows that predate it. What is left to
+   * prove is exactly two things, and both of them have failed before in this
+   * project: that the migration ARRIVES AT ALL on a database that is already
+   * migrated (the journal trap, five for five in Phase 9), and that a populated
+   * install still has its rows afterwards.
+   *
+   * THE PREMISE IS PINNED FIRST. Without the catalogue check below, every
+   * assertion here would pass just as happily against a database that had been
+   * fully migrated all along -- which is the exact failure mode a drill exists
+   * for, and the exact shape a skipped migration would have produced.
+   */
+  it("applies migration 0021 to a real pre-0021 database -- the table, both CHECKs and the index arrive, and existing rows are untouched", async () => {
+    await withPreMigrationDatabase("0021", async (scratch) => {
+      // RAW SQL, NOT `insert(companies)`: schema.ts describes TODAY's shape, and
+      // this file's standing hazard is a drizzle insert naming a column the
+      // pre-migration database does not have. (Harmless for `companies` today,
+      // written this way because the 0011 and 0017 drills both went red on it.)
+      await scratch.db.execute(sql`
+        INSERT INTO users (id, username) VALUES (${userId}::uuid, 'chris')
+      `);
+      await scratch.db.execute(sql`
+        INSERT INTO companies (id, name) VALUES (gen_random_uuid(), 'Acme')
+      `);
+
+      const before = await scratch.db.execute<{ tablename: string }>(sql`
+        SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = 'time_entries'
+      `);
+      expect(before).toEqual([]);
+
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      // THE TABLE IS HERE, WHICH IS THE HALF THE JOURNAL TRAP WOULD HAVE TAKEN:
+      // a skipped 0021 raises no error anywhere, it just leaves this empty.
+      const after = await scratch.db.execute<{ tablename: string }>(sql`
+        SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = 'time_entries'
+      `);
+      expect(after).toHaveLength(1);
+
+      // Both CHECKs arrived VALIDATED rather than merely declared -- proved by
+      // exercising them, which is the only way to tell.
+      const [company] = await scratch.db.execute<{ id: string }>(sql`SELECT id FROM companies`);
+      await expect(scratch.db.execute(sql`
+        INSERT INTO time_entries (work_date, minutes, billable, owner_user_id)
+        VALUES ('2026-09-01', 60, false, ${userId}::uuid)
+      `)).rejects.toMatchObject({ cause: { constraint_name: "time_entries_has_link" } });
+      await expect(scratch.db.execute(sql`
+        INSERT INTO time_entries (work_date, minutes, billable, owner_user_id, company_id)
+        VALUES ('2026-09-01', 0, false, ${userId}::uuid, ${company?.id ?? ""}::uuid)
+      `)).rejects.toMatchObject({ cause: { constraint_name: "time_entries_minutes_range" } });
+
+      // The hand-written index is in the migration and not in schema.ts, so
+      // nothing else in this suite would notice its absence.
+      const indexes = await scratch.db.execute<{ indexname: string }>(sql`
+        SELECT indexname FROM pg_indexes
+        WHERE tablename = 'time_entries' AND indexname = 'time_entries_work_date_idx'
+      `);
+      expect(indexes).toHaveLength(1);
+
+      // ...and the install that was already here still is.
+      const companies = await scratch.db.execute<{ name: string }>(sql`SELECT name FROM companies`);
+      expect(companies.map((row) => row.name)).toEqual(["Acme"]);
+    });
+  }, 30000);
+
+  /**
+   * **THE CONSTRAINT THIS TASK EXISTS FOR.** Three arms, and each one is a
+   * decision the spec argues rather than a default:
+   *
+   *   NONE IS REFUSED -- not tasks'/mail_threads' "any subset including the
+   *   empty one". An entry linked to nothing is in no report and findable only
+   *   by SQL, so the week's total is short and nothing says so.
+   *
+   *   ONE IS ENOUGH -- the ordinary row.
+   *
+   *   ALL FIVE AT ONCE IS VALID -- not notes'/files'/documents' exactly-one. An
+   *   hour on a project AND the deal it came from is the case the spec names,
+   *   and a schema that refused it would make one of those two reports wrong on
+   *   purpose.
+   */
+  it("enforces time_entries_has_link: none is rejected, one is enough, and all five at once are valid", async () => {
+    await expect(handle.db.insert(timeEntries).values(entryValues()))
+      .rejects.toMatchObject({ cause: { constraint_name: "time_entries_has_link" } });
+
+    const company = await createCompany(handle.db, userId, { name: "Acme" });
+    const [oneLink] = await handle.db.insert(timeEntries)
+      .values(entryValues({ companyId: company.id })).returning();
+    expect(oneLink).toMatchObject({ companyId: company.id, contactId: null, taskId: null });
+
+    const contact = await createContact(handle.db, userId, { firstName: "Bob", companyId: company.id });
+    const pipeline = await createPipeline(handle.db, userId, { name: "Sales", scope: "global" });
+    const stage = await createStage(handle.db, userId, pipeline.id, { name: "New" });
+    const deal = await createDeal(
+      handle.db, userId, { title: "Big Deal", pipelineId: pipeline.id, stageId: stage.id }, "EUR",
+    );
+    const project = await createProject(handle.db, userId, { name: "Rollout" });
+    const [task] = await handle.db.insert(tasks)
+      .values({ title: "Migrate the data", position: "a0", projectId: project.id }).returning();
+    const [everyLink] = await handle.db.insert(timeEntries).values(entryValues({
+      companyId: company.id, contactId: contact.id, dealId: deal.id,
+      projectId: project.id, taskId: task?.id,
+    })).returning();
+    expect(everyLink).toMatchObject({
+      companyId: company.id, contactId: contact.id, dealId: deal.id,
+      projectId: project.id, taskId: task?.id,
+    });
+  });
+
+  /**
+   * **EACH OF THE FIVE IS ENOUGH ON ITS OWN**, one at a time.
+   *
+   * The test above proves "one is enough" for `company_id` only, and a CHECK
+   * that had lost a column from its num_nonnulls list would still pass it. This
+   * is the loop that names which column went missing -- the same reason the
+   * documents drills iterate their types instead of spot-checking one.
+   */
+  it("accepts an entry attached to each one of the five records on its own", async () => {
+    const company = await createCompany(handle.db, userId, { name: "Acme" });
+    const contact = await createContact(handle.db, userId, { firstName: "Bob" });
+    const pipeline = await createPipeline(handle.db, userId, { name: "Sales", scope: "global" });
+    const stage = await createStage(handle.db, userId, pipeline.id, { name: "New" });
+    const deal = await createDeal(
+      handle.db, userId, { title: "Big Deal", pipelineId: pipeline.id, stageId: stage.id }, "EUR",
+    );
+    const project = await createProject(handle.db, userId, { name: "Rollout" });
+    const [task] = await handle.db.insert(tasks)
+      .values({ title: "Migrate the data", position: "a0", projectId: project.id }).returning();
+
+    const only = [
+      ["companyId", company.id], ["contactId", contact.id], ["dealId", deal.id],
+      ["projectId", project.id], ["taskId", task?.id ?? ""],
+    ] as const;
+    for (const [column, id] of only) {
+      const [row] = await handle.db.insert(timeEntries)
+        .values(entryValues({ [column]: id })).returning();
+      expect(row, `an entry attached only to ${column} was refused`).toMatchObject({ [column]: id });
+    }
+  });
+
+  /**
+   * **THE DOUBLE-COUNTING RULE, ALREADY STANDING, IN ITS STRONGEST FORM.**
+   *
+   * The spec's third decision is that a manual entry cannot be attached to a
+   * meeting, so a logged meeting's duration and a typed entry can never be the
+   * same hour twice -- and it asks for that to be IMPOSSIBLE rather than
+   * discouraged. There is no `meeting_id` column, so this INSERT does not
+   * violate a CHECK: it fails to resolve against the table at all (42703,
+   * `undefined_column`), which is a refusal no constraint can be dropped to get
+   * around.
+   *
+   * **TASK 2 CONFIRMED IT AND ADDED NOTHING.** The plan told that task to make
+   * the refusal "a CHECK, not a convention"; a CHECK needs a column to name, so
+   * following it literally would have made the impossible merely illegal. What
+   * Task 2 built instead is services/timesheet.ts, which sums the two tables
+   * together and closes the INDIRECT routes this absence does not close -- a
+   * join that fans a meeting out over its attendees or its links, a meeting in
+   * two buckets, an archived row still contributing. This test stays as the
+   * guard on the direct one.
+   */
+  it("cannot express a time entry that names a meeting, because there is no column to name one with", async () => {
+    const company = await createCompany(handle.db, userId, { name: "Acme" });
+    const [meeting] = await handle.db.insert(meetings).values({
+      title: "Kickoff", occurredAt: new Date("2026-09-01T09:00:00Z"),
+      durationMinutes: 60, ownerUserId: userId, companyId: company.id,
+    }).returning();
+    expect(meeting).toBeDefined();
+
+    await expect(handle.db.execute(sql`
+      INSERT INTO time_entries (work_date, minutes, billable, owner_user_id, company_id, meeting_id)
+      VALUES ('2026-09-01', 60, false, ${userId}::uuid, ${company.id}::uuid, ${meeting?.id ?? ""}::uuid)
+    `)).rejects.toMatchObject({ cause: { code: "42703" } });
+
+    // The premise: the identical INSERT without that column succeeds, so the
+    // failure above is the column and not the row.
+    await expect(handle.db.execute(sql`
+      INSERT INTO time_entries (work_date, minutes, billable, owner_user_id, company_id)
+      VALUES ('2026-09-01', 60, false, ${userId}::uuid, ${company.id}::uuid)
+    `)).resolves.toBeDefined();
+  });
+
+  /**
+   * **THE EXACT EDGES**, documents' totals CHECK's pattern, and the reason is
+   * that this column IS the week's total: a bound narrowed or widened by one is
+   * invisible to every test that inserts a plausible number.
+   *
+   * The upper edge is MAX_TIME_ENTRY_MINUTES, imported rather than restated, so
+   * the constant in @conduit/shared and the literal in the migration cannot
+   * drift into meaning different things -- the same arrangement
+   * documentTypeFreezes has with documents_frozen_matches_type.
+   */
+  it("enforces time_entries_minutes_range at the exact edges, and that edge is MAX_TIME_ENTRY_MINUTES", async () => {
+    const projectId = await seedProject();
+    expect(MAX_TIME_ENTRY_MINUTES).toBe(1440);
+
+    for (const minutes of [1, MAX_TIME_ENTRY_MINUTES]) {
+      const [row] = await handle.db.insert(timeEntries)
+        .values(entryValues({ minutes, projectId })).returning();
+      expect(row?.minutes, `${String(minutes)} minutes was refused`).toBe(minutes);
+    }
+    for (const minutes of [0, -1, MAX_TIME_ENTRY_MINUTES + 1]) {
+      await expect(
+        handle.db.insert(timeEntries).values(entryValues({ minutes, projectId })),
+        `${String(minutes)} minutes was accepted`,
+      ).rejects.toMatchObject({ cause: { constraint_name: "time_entries_minutes_range" } });
+    }
+  });
+
+  /**
+   * **`billable` HAS NO DEFAULT**, which is documents.frozen's arrangement and
+   * documents.frozen's test. Both values are ordinary, so a default would be a
+   * guess made silently on the row where it is hardest to notice -- and the
+   * guess that reads worst (non-billable) under-reports chargeable time in a
+   * product with no invoicing step to contradict it.
+   *
+   * READ OUT OF THE CATALOGUE as well as exercised: an INSERT proves the column
+   * is NOT NULL, and only `column_default` proves there is nothing standing
+   * behind it.
+   */
+  it("gives billable no default, so a writer that says nothing is refused", async () => {
+    const projectId = await seedProject();
+    const [column] = await handle.db.execute<{ column_default: string | null }>(sql`
+      SELECT column_default FROM information_schema.columns
+      WHERE table_name = 'time_entries' AND column_name = 'billable'
+    `);
+    expect(column?.column_default).toBeNull();
+
+    await expect(handle.db.execute(sql`
+      INSERT INTO time_entries (work_date, minutes, owner_user_id, project_id)
+      VALUES ('2026-09-01', 60, ${userId}::uuid, ${projectId}::uuid)
+    `)).rejects.toMatchObject({ cause: { code: "23502" } });
+  });
+
+  /**
+   * WORK_DATE IS A `date` AND NOT A TIMESTAMP, read out of the catalogue.
+   *
+   * Nothing else can see this: a `timestamptz` column would accept every value
+   * these tests insert and return something that formats identically in most of
+   * them. What it would change is the meaning -- an hour would acquire an
+   * instant, and which WEEK it fell in would depend on a time zone the operator
+   * never supplied.
+   */
+  it("stores the work date as a date, so an hour belongs to a day and not to an instant", async () => {
+    const [column] = await handle.db.execute<{ data_type: string }>(sql`
+      SELECT data_type FROM information_schema.columns
+      WHERE table_name = 'time_entries' AND column_name = 'work_date'
+    `);
+    expect(column?.data_type).toBe("date");
+
+    const projectId = await seedProject();
+    const [row] = await handle.db.insert(timeEntries)
+      .values(entryValues({ workDate: "2026-01-01", projectId })).returning();
+    // Comes back as the bare string it went in as -- never a Date, which is what
+    // services/time-entries.ts's toTimeEntry relies on.
+    expect(row?.workDate).toBe("2026-01-01");
+  });
+
+  /**
+   * ALL SIX FOREIGN KEYS, ONE AT A TIME. Six columns declared as references is
+   * six chances for one of them to be a bare uuid nobody notices, and a bare
+   * uuid accepts an id that does not exist -- which is a link the timesheet
+   * renders as a blank name for ever.
+   *
+   * Each row is otherwise valid (a real project keeps time_entries_has_link
+   * satisfied), so a 23503 can only have come from the column under test.
+   */
+  it("enforces every foreign key on time_entries", async () => {
+    const absent = randomUUID();
+    const projectId = await seedProject();
+    const columns = ["ownerUserId", "companyId", "contactId", "dealId", "projectId", "taskId"] as const;
+    for (const column of columns) {
+      await expect(
+        handle.db.insert(timeEntries).values(entryValues({ projectId, [column]: absent })),
+        `${column} accepted an id that does not exist`,
+      ).rejects.toMatchObject({ cause: { code: "23503" } });
+    }
+  });
+});
+
+/**
+ * **THE TASK ESTIMATE (0022): THE FIRST QUANTITY OF WORK `tasks` HAS EVER
+ * CARRIED.** Every column beside it is a date or a percentage, which is the
+ * spec's second reading of this file and the reason "booked versus estimated"
+ * -- usually the point of booking time against a task -- could not exist.
+ */
+describe("the task estimate (0022)", () => {
+  async function seedTask(estimateMinutes: number | null = null): Promise<string> {
+    const [row] = await handle.db.insert(tasks)
+      .values({ title: "Draft the plan", position: "a0", estimateMinutes }).returning();
+    if (row === undefined) throw new Error("insert returned no row");
+    return row.id;
+  }
+
+  /**
+   * **THE EXACT EDGES**, `time_entries_minutes_range`'s pattern and its reason: a
+   * bound narrowed or widened by one is invisible to every test that inserts a
+   * plausible number, and this is the number a whole comparison is read against.
+   *
+   * The upper edge is MAX_TASK_ESTIMATE_MINUTES, imported rather than restated,
+   * so the constant in @conduit/shared and the literal 525600 in the migration
+   * cannot drift into meaning different things.
+   */
+  it("enforces tasks_estimate_range at the exact edges, and that edge is MAX_TASK_ESTIMATE_MINUTES", async () => {
+    expect(MAX_TASK_ESTIMATE_MINUTES).toBe(525600);
+
+    for (const estimateMinutes of [1, MAX_TASK_ESTIMATE_MINUTES]) {
+      const [row] = await handle.db.insert(tasks)
+        .values({ title: "t", position: "a0", estimateMinutes }).returning();
+      expect(row?.estimateMinutes, `${String(estimateMinutes)} was refused`).toBe(estimateMinutes);
+    }
+    for (const estimateMinutes of [0, -1, MAX_TASK_ESTIMATE_MINUTES + 1]) {
+      await expect(
+        handle.db.insert(tasks).values({ title: "t", position: "a0", estimateMinutes }),
+        `${String(estimateMinutes)} was accepted`,
+      ).rejects.toMatchObject({ cause: { constraint_name: "tasks_estimate_range" } });
+    }
+  });
+
+  /**
+   * **NULL IS THE ONE SPELLING OF "NOT ESTIMATED", AND THE ZERO ABOVE IS WHAT
+   * MAKES THAT TRUE.** Two spellings of one absence is what
+   * `normaliseDescription` avoids by storing "" as null; here the second
+   * spelling would also be the one that reads as a claim rather than a gap.
+   */
+  it("takes a null, which is how a task with no estimate is stored", async () => {
+    const [row] = await handle.db.insert(tasks)
+      .values({ title: "t", position: "a0" }).returning();
+    expect(row?.estimateMinutes).toBeNull();
+  });
+
+  /**
+   * AN INTEGER OF MINUTES, READ OUT OF THE CATALOGUE, because nothing else can
+   * see it: a `numeric` column would accept every value these tests insert and
+   * hand back something that formats identically in most of them. What it would
+   * change is the unit's meaning -- 1.5 would become storable, and the booked
+   * half it is compared against (`time_entries.minutes`, `integer`) could never
+   * produce such a number.
+   */
+  it("stores the estimate as an integer of minutes, matching what it is compared with", async () => {
+    const [column] = await handle.db.execute<{ data_type: string; is_nullable: string }>(sql`
+      SELECT data_type, is_nullable FROM information_schema.columns
+      WHERE table_name = 'tasks' AND column_name = 'estimate_minutes'
+    `);
+    expect(column?.data_type).toBe("integer");
+    expect(column?.is_nullable).toBe("YES");
+
+    const [entry] = await handle.db.execute<{ data_type: string }>(sql`
+      SELECT data_type FROM information_schema.columns
+      WHERE table_name = 'time_entries' AND column_name = 'minutes'
+    `);
+    expect(entry?.data_type).toBe(column?.data_type);
+  });
+
+  /**
+   * **NO CROSS-COLUMN COUPLING TO THE TASK'S OWN DATES**, which is the CHECK
+   * somebody will eventually propose. Eight hours of work inside a two-day
+   * window is the normal case, not an error -- a span is elapsed time and an
+   * estimate is effort -- and a CHECK of that shape would also make an ordinary
+   * reschedule fail against an estimate already stored.
+   */
+  it("lets a task be estimated at more work than its own span holds", async () => {
+    const [row] = await handle.db.insert(tasks).values({
+      title: "Write the report", position: "a0",
+      startDate: "2026-09-07", dueDate: "2026-09-08", estimateMinutes: 40 * 60,
+    }).returning();
+    expect(row?.estimateMinutes).toBe(2400);
+  });
+
+  /**
+   * **THE UPGRADE DRILL.** 0022 alters a table that is populated on every real
+   * install, so unlike 0021 there IS something to lose: what has to be proved is
+   * that the migration arrives at all (the journal trap, six for six now), that
+   * the CHECK arrives VALIDATED rather than merely declared, and that the tasks
+   * already in the database survive it and read back as unestimated.
+   *
+   * THE PREMISE IS PINNED FIRST. Without the catalogue check below, every
+   * assertion here would pass just as happily against a database that had been
+   * fully migrated all along -- the exact shape a skipped migration produces.
+   */
+  it("applies migration 0022 to a real pre-0022 database -- the column and its CHECK arrive, and existing tasks survive unestimated", async () => {
+    await withPreMigrationDatabase("0022", async (scratch) => {
+      // RAW SQL, NOT `insert(tasks)`: schema.ts describes TODAY's shape, and a
+      // drizzle insert would name the very column this database has not got.
+      await scratch.db.execute(sql`
+        INSERT INTO users (id, username) VALUES (${userId}::uuid, 'chris')
+      `);
+      await scratch.db.execute(sql`
+        INSERT INTO tasks (title, position, progress_pct) VALUES ('Existing work', 'a0', 40)
+      `);
+
+      const before = await scratch.db.execute<{ column_name: string }>(sql`
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'tasks' AND column_name = 'estimate_minutes'
+      `);
+      expect(before).toEqual([]);
+
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      // THE COLUMN IS HERE, which is the half the journal trap would have taken:
+      // a skipped 0022 raises no error anywhere, it just leaves this empty.
+      const after = await scratch.db.execute<{ column_name: string }>(sql`
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'tasks' AND column_name = 'estimate_minutes'
+      `);
+      expect(after).toHaveLength(1);
+
+      // THE ROW THAT PREDATES THE COLUMN. Unestimated, not zero -- an
+      // ALTER TABLE ... ADD COLUMN with a DEFAULT would have claimed an estimate
+      // for every task on the install, which is 0018's backfill hazard in
+      // reverse.
+      const [existing] = await scratch.db.execute<{ title: string; estimate_minutes: number | null; progress_pct: number }>(sql`
+        SELECT title, estimate_minutes, progress_pct FROM tasks
+      `);
+      expect(existing?.title).toBe("Existing work");
+      expect(existing?.estimate_minutes).toBeNull();
+      expect(existing?.progress_pct).toBe(40);
+
+      // The CHECK arrived VALIDATED rather than merely declared, which is only
+      // provable by exercising it.
+      await expect(scratch.db.execute(sql`
+        INSERT INTO tasks (title, position, estimate_minutes) VALUES ('t', 'a1', 0)
+      `)).rejects.toMatchObject({ cause: { constraint_name: "tasks_estimate_range" } });
+      await expect(scratch.db.execute(sql`
+        INSERT INTO tasks (title, position, estimate_minutes) VALUES ('t', 'a1', 525601)
+      `)).rejects.toMatchObject({ cause: { constraint_name: "tasks_estimate_range" } });
+      await expect(scratch.db.execute(sql`
+        INSERT INTO tasks (title, position, estimate_minutes) VALUES ('t', 'a1', 240)
+      `)).resolves.toBeDefined();
+    });
+  });
+
+  /**
+   * **A MEETING STILL CANNOT BE BOOKED TO A TASK**, which is what makes the
+   * booked half of this comparison `time_entries` alone. Asserted against the
+   * catalogue rather than argued: if `meetings` ever gains a `task_id`, the
+   * aggregate in services/timesheet.ts's `taskEffort` silently starts answering
+   * a question about one table while the sentence claims both.
+   */
+  it("gives meetings no task_id, so no meeting minute can reach a task's booked total", async () => {
+    const columns = await handle.db.execute<{ column_name: string }>(sql`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_name = 'meetings' AND column_name = 'task_id'
+    `);
+    expect(columns).toEqual([]);
+
+    // The premise: this really read the meetings table.
+    const links = await handle.db.execute<{ column_name: string }>(sql`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_name = 'meetings' AND column_name = 'project_id'
+    `);
+    expect(links).toHaveLength(1);
+    expect(await seedTask(240)).toBeDefined();
+  });
+});
+
+/**
+ * **THE TIMER (0023): THE SECOND CAPTURE PATH, AND THE ONE CONSTRAINT THAT
+ * CLOSES A DOUBLE COUNT THE SPEC SAYS MUST BE IMPOSSIBLE.**
+ *
+ * Two capture paths can produce the same hour, and the spec asks for the
+ * treatment Task 2 gave meetings: impossible, not discouraged. Only part of that
+ * is available in the schema and this describe is where the available part is
+ * pinned -- one running timer per person, one entry per timer, and a running
+ * timer that cannot have produced anything.
+ */
+describe("the timer (0023)", () => {
+  async function seedProject(name = "Rollout"): Promise<string> {
+    return (await createProject(handle.db, userId, { name })).id;
+  }
+
+  function timerValues(
+    overrides: Partial<typeof timers.$inferInsert> = {},
+  ): typeof timers.$inferInsert {
+    return { ownerUserId: userId, ...overrides };
+  }
+
+  /**
+   * A timer that has already finished, with BOTH instants written from this
+   * process's clock.
+   *
+   * **AND THAT PAIRING IS A FINDING RATHER THAN A CONVENIENCE.** The first draft
+   * of these fixtures set only `stopped_at: new Date()` and let `started_at`
+   * take its `now()` DEFAULT, and three cases went red on
+   * `timers_stopped_after_start` -- because the JS instant is taken when the
+   * VALUES are built and the default when the statement RUNS, a few
+   * milliseconds later, so the row stopped before it started. Harmless here,
+   * and it is exactly the mistake services/timers.ts must not make on the real
+   * write path: a stop that stamped `new Date()` from Node against a
+   * `started_at` from Postgres would fail this CHECK for any timer stopped
+   * inside its first few milliseconds, and -- far worse -- would put the
+   * elapsed figure on two clocks. The service stops with SQL `now()`.
+   */
+  function finishedTimer(
+    overrides: Partial<typeof timers.$inferInsert> = {},
+  ): typeof timers.$inferInsert {
+    const stoppedAt = new Date();
+    return timerValues({
+      startedAt: new Date(stoppedAt.getTime() - 60_000), stoppedAt, ...overrides,
+    });
+  }
+
+  /**
+   * **THE UPGRADE DRILL.** 0021's question at a second table: does the migration
+   * ARRIVE on a database that is already migrated -- the journal trap, which has
+   * now fired eight times running and been disarmed by `npm run db:generate`
+   * three of them -- and does a populated install still have its rows.
+   *
+   * The premise is pinned first: without the `before` check every assertion here
+   * would pass against a database that had been fully migrated all along, which
+   * is exactly the shape a skipped migration produces.
+   */
+  it("applies migration 0023 to a real pre-0023 database -- the table, all three CHECKs, the unique constraint and the partial index arrive", async () => {
+    await withPreMigrationDatabase("0023", async (scratch) => {
+      await scratch.db.execute(sql`
+        INSERT INTO users (id, username) VALUES (${userId}::uuid, 'chris')
+      `);
+      await scratch.db.execute(sql`
+        INSERT INTO companies (id, name) VALUES (gen_random_uuid(), 'Acme')
+      `);
+
+      const before = await scratch.db.execute<{ tablename: string }>(sql`
+        SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = 'timers'
+      `);
+      expect(before).toEqual([]);
+
+      await migrate(scratch.db, { migrationsFolder: migrationsFolder() });
+
+      const after = await scratch.db.execute<{ tablename: string }>(sql`
+        SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = 'timers'
+      `);
+      expect(after).toHaveLength(1);
+
+      const [company] = await scratch.db.execute<{ id: string }>(sql`SELECT id FROM companies`);
+      const companyId = company?.id ?? "";
+
+      // Every CHECK arrived VALIDATED rather than merely declared, which is only
+      // provable by exercising it.
+      await expect(scratch.db.execute(sql`
+        INSERT INTO timers (owner_user_id) VALUES (${userId}::uuid)
+      `)).rejects.toMatchObject({ cause: { constraint_name: "timers_has_link" } });
+      await expect(scratch.db.execute(sql`
+        INSERT INTO timers (owner_user_id, company_id, started_at, stopped_at)
+        VALUES (${userId}::uuid, ${companyId}::uuid, '2026-09-07T10:00:00Z', '2026-09-07T09:00:00Z')
+      `)).rejects.toMatchObject({ cause: { constraint_name: "timers_stopped_after_start" } });
+      await scratch.db.execute(sql`
+        INSERT INTO time_entries (id, work_date, minutes, billable, owner_user_id, company_id)
+        VALUES ('11111111-1111-4111-8111-111111111111', '2026-09-07', 60, false,
+                ${userId}::uuid, ${companyId}::uuid)
+      `);
+      await expect(scratch.db.execute(sql`
+        INSERT INTO timers (owner_user_id, company_id, time_entry_id)
+        VALUES (${userId}::uuid, ${companyId}::uuid, '11111111-1111-4111-8111-111111111111')
+      `)).rejects.toMatchObject({ cause: { constraint_name: "timers_entry_needs_stop" } });
+
+      // The partial unique index is hand-written in the migration and cannot be
+      // declared in schema.ts at all (drizzle-kit has no partial-index syntax),
+      // so nothing else in this suite would notice its absence.
+      const [index] = await scratch.db.execute<{ indexdef: string }>(sql`
+        SELECT indexdef FROM pg_indexes
+        WHERE tablename = 'timers' AND indexname = 'timers_one_running_per_owner'
+      `);
+      expect(index?.indexdef).toContain("UNIQUE");
+      expect(index?.indexdef).toContain("stopped_at IS NULL");
+
+      // ...and the install that was already here still is.
+      const companies = await scratch.db.execute<{ name: string }>(sql`SELECT name FROM companies`);
+      expect(companies.map((row) => row.name)).toEqual(["Acme"]);
+    });
+  }, 30000);
+
+  /**
+   * **THE CONSTRAINT THIS TASK EXISTS FOR, AND IT IS THE ONE PIECE OF THE
+   * DOUBLE-COUNT PROBLEM THE SCHEMA CAN ACTUALLY CLOSE.**
+   *
+   * Two devices each starting a timer -- a laptop at a desk and a phone in a
+   * pocket, which is precisely what "must survive a second device" means -- would
+   * otherwise each stop into an entry and book one afternoon twice, with nothing
+   * anywhere saying so. The second start is a unique violation.
+   *
+   * AND ONLY THE RUNNING ONES ARE CONSTRAINED, which is what makes it usable at
+   * all: a plain UNIQUE(owner_user_id) would let each person start exactly one
+   * timer ever, and the third arm here is what proves the index really is
+   * partial rather than merely named as though it were.
+   */
+  it("allows one running timer per person, refuses a second, and does not count the finished ones", async () => {
+    const projectId = await seedProject();
+    const [first] = await handle.db.insert(timers).values(timerValues({ projectId })).returning();
+    expect(first?.stoppedAt).toBeNull();
+
+    await expect(
+      handle.db.insert(timers).values(timerValues({ projectId })),
+    ).rejects.toMatchObject({ cause: { constraint_name: "timers_one_running_per_owner" } });
+
+    // Stop the first, and a second start is fine -- twice over, so the index is
+    // provably indifferent to how many finished timers are behind it. Stopped
+    // with SQL `now()` for finishedTimer's reason: the row's `started_at` came
+    // from the database's clock and its `stopped_at` has to come from the same
+    // one, or timers_stopped_after_start refuses a timer stopped inside its own
+    // first few milliseconds.
+    const stopNow = (id: string) =>
+      handle.db.update(timers).set({ stoppedAt: sql`now()` }).where(eq(timers.id, id));
+    await stopNow(first?.id ?? "");
+    const [second] = await handle.db.insert(timers).values(timerValues({ projectId })).returning();
+    expect(second?.id).not.toBe(first?.id);
+    await stopNow(second?.id ?? "");
+    await expect(
+      handle.db.insert(timers).values(timerValues({ projectId })),
+    ).resolves.toBeDefined();
+
+    // A SECOND PERSON IS NOT BLOCKED BY THE FIRST. The index is on the owner, so
+    // a `WHERE stopped_at IS NULL` with the column left out of the key would
+    // pass every arm above and fail this one.
+    const other = await resolveUser(handle.db, { username: "sam", email: null, fullName: null });
+    await expect(
+      handle.db.insert(timers).values(timerValues({ projectId, ownerUserId: other.id })),
+    ).resolves.toBeDefined();
+  });
+
+  /**
+   * **ONE ENTRY, ONE TIMER.** A stop that arrives twice -- a double tap, a
+   * retried request, two tabs -- must not produce two entries; the service does
+   * that with a guarded UPDATE in a transaction, and this is the constraint
+   * underneath it that a caller reaching past the service still meets.
+   *
+   * NULLs stay distinct, which is what keeps every running and every discarded
+   * timer exempt: the rule is about the CLAIM, not about the column.
+   */
+  it("lets one entry be claimed by one timer, and leaves unclaimed timers alone", async () => {
+    const projectId = await seedProject();
+    const [entry] = await handle.db.insert(timeEntries).values({
+      workDate: "2026-09-07", minutes: 60, billable: false, ownerUserId: userId, projectId,
+    }).returning();
+    const claim = { projectId, timeEntryId: entry?.id };
+    await expect(handle.db.insert(timers).values(finishedTimer(claim))).resolves.toBeDefined();
+    await expect(handle.db.insert(timers).values(finishedTimer(claim)))
+      .rejects.toMatchObject({ cause: { constraint_name: "timers_time_entry_unique" } });
+
+    // Two DISCARDED timers -- stopped, claiming nothing -- are not a collision,
+    // which they would be under a unique constraint that treated NULLs as equal.
+    const discarded = { projectId, timeEntryId: null };
+    await expect(handle.db.insert(timers).values(finishedTimer(discarded))).resolves.toBeDefined();
+    await expect(handle.db.insert(timers).values(finishedTimer(discarded))).resolves.toBeDefined();
+  });
+
+  /**
+   * **THE SAME FIVE, THE SAME RULE**, and each one on its own -- 0021's loop, at
+   * the table that feeds it. A CHECK that had lost a column from its
+   * num_nonnulls list would pass a spot check on `company_id` and let a timer
+   * start that could never become an entry.
+   */
+  it("enforces timers_has_link, and each of the five is enough on its own", async () => {
+    await expect(handle.db.insert(timers).values(timerValues()))
+      .rejects.toMatchObject({ cause: { constraint_name: "timers_has_link" } });
+
+    const company = await createCompany(handle.db, userId, { name: "Acme" });
+    const contact = await createContact(handle.db, userId, { firstName: "Bob", companyId: company.id });
+    const pipeline = await createPipeline(handle.db, userId, { name: "Sales", scope: "global" });
+    const stage = await createStage(handle.db, userId, pipeline.id, { name: "New" });
+    const deal = await createDeal(
+      handle.db, userId, { title: "Big Deal", pipelineId: pipeline.id, stageId: stage.id }, "EUR",
+    );
+    const projectId = await seedProject();
+    const [task] = await handle.db.insert(tasks)
+      .values({ title: "Migrate the data", position: "a0", projectId }).returning();
+
+    const one: Record<string, string> = {
+      companyId: company.id, contactId: contact.id, dealId: deal.id,
+      projectId, taskId: task?.id ?? "",
+    };
+    for (const [column, id] of Object.entries(one)) {
+      // Each timer is stopped so the one-running-per-owner index does not refuse
+      // the next arm of the loop for an unrelated reason.
+      const [row] = await handle.db.insert(timers)
+        .values(finishedTimer({ [column]: id })).returning();
+      expect(row, `${column} alone was refused`).toBeDefined();
+    }
+  });
+
+  /**
+   * **A TIMER CANNOT NAME A MEETING EITHER, AND THAT IS THE POINT OF ASSERTING
+   * IT HERE.** Task 1 made the entry/meeting double count unspellable by leaving
+   * `meeting_id` off `time_entries`; this table is a SECOND front door to that
+   * table, and a `meeting_id` here would have walked straight round it -- the
+   * timer would carry the meeting, the stop would drop it, and nothing would
+   * ever have said the hour was already counted.
+   *
+   * 42703, not a constraint: the refusal is the absent column, which no
+   * `ALTER TABLE ... DROP CONSTRAINT` can get around. The premise -- the same
+   * INSERT without that column succeeding -- is pinned alongside it, exactly as
+   * the `time_entries` case is.
+   */
+  it("gives timers no meeting_id, so the second capture path cannot reopen the first one's double count", async () => {
+    const company = await createCompany(handle.db, userId, { name: "Acme" });
+    const [meeting] = await handle.db.insert(meetings)
+      .values({ title: "Kickoff", occurredAt: new Date(), ownerUserId: userId, companyId: company.id })
+      .returning();
+    expect(meeting).toBeDefined();
+
+    await expect(handle.db.execute(sql`
+      INSERT INTO timers (owner_user_id, company_id, meeting_id)
+      VALUES (${userId}::uuid, ${company.id}::uuid, ${meeting?.id ?? ""}::uuid)
+    `)).rejects.toMatchObject({ cause: { code: "42703" } });
+
+    await expect(handle.db.execute(sql`
+      INSERT INTO timers (owner_user_id, company_id)
+      VALUES (${userId}::uuid, ${company.id}::uuid)
+    `)).resolves.toBeDefined();
+  });
+
+  /**
+   * **`started_at` IS AN INSTANT WITH A ZONE, AND IT DEFAULTS TO THE DATABASE'S
+   * CLOCK.** Both halves are read out of the catalogue because nothing else can
+   * see either.
+   *
+   * The type is the contrast this whole phase turns on: `time_entries.work_date`
+   * is a `date` because an entry's truth is a day, and this is a `timestamptz`
+   * because a timer's truth is a moment. A `date` here could not survive a
+   * restart usefully -- "started some time on Tuesday" is not a stopwatch.
+   *
+   * The DEFAULT is what makes the instant the database's rather than whichever
+   * process took the request: with three tabs, a phone and an API client all
+   * able to start a timer, a caller-supplied instant would let the elapsed
+   * figure depend on whose clock was fast.
+   */
+  it("stores the start as an instant, defaulted to the database's own clock", async () => {
+    const [column] = await handle.db.execute<{ data_type: string; column_default: string | null }>(sql`
+      SELECT data_type, column_default FROM information_schema.columns
+      WHERE table_name = 'timers' AND column_name = 'started_at'
+    `);
+    expect(column?.data_type).toBe("timestamp with time zone");
+    expect(column?.column_default).toBe("now()");
+
+    // Inserted WITHOUT naming started_at, which is the point: the value comes
+    // from the DEFAULT. A minute of slack either way, because this asserts
+    // "roughly now, from a clock in step with this one" and not a tolerance.
+    const projectId = await seedProject();
+    const before = Date.now();
+    const [row] = await handle.db.insert(timers)
+      .values({ ownerUserId: userId, projectId }).returning();
+    expect(row?.startedAt.getTime()).toBeGreaterThanOrEqual(before - 60_000);
+    expect(row?.startedAt.getTime()).toBeLessThanOrEqual(Date.now() + 60_000);
+  });
+
+  /**
+   * ALL SEVEN FOREIGN KEYS, ONE AT A TIME -- 0021's loop, with an extra column.
+   * Seven columns declared as references is seven chances for one to be a bare
+   * uuid, and a bare uuid accepts an id that does not exist. `time_entry_id` is
+   * the one that would matter most: a timer claiming an entry that is not there
+   * would make the export's provenance column point at nothing for ever.
+   */
+  it("enforces every foreign key on timers", async () => {
+    const absent = randomUUID();
+    const projectId = await seedProject();
+    const columns = [
+      "ownerUserId", "companyId", "contactId", "dealId", "projectId", "taskId", "timeEntryId",
+    ] as const;
+    for (const column of columns) {
+      await expect(
+        handle.db.insert(timers).values(finishedTimer({ projectId, [column]: absent })),
+        `${column} accepted an id that does not exist`,
+      ).rejects.toMatchObject({ cause: { code: "23503" } });
+    }
   });
 });

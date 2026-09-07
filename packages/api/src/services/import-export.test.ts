@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { eq } from "drizzle-orm";
-import { plannedTotal } from "@conduit/shared";
+import { NOT_IMPORTED_MEMBERS, importedMembers, plannedTotal } from "@conduit/shared";
 import { buildApp } from "../app.js";
 import type { Config } from "../config.js";
 import { companies, contacts, users } from "../db/schema.js";
@@ -360,7 +360,13 @@ describe("importing a real export", () => {
     const { plan, payload } = await planFor(archive);
     expect(plan.effects.map((effect) => effect.sources?.length)).toEqual([1, 1]);
     const outcome = await applyImport({ plan, payload, db });
-    expect(outcome.opened).toEqual(["companies.csv", "contacts.csv"]);
+    // THE OTHER HALF OF THE SHARED DECLARATION, and the half no type can hold:
+    // @conduit/shared says these two members are `imported: true`, and this is
+    // what makes that a claim about behaviour rather than a label. A member
+    // declared imported that this importer never opens would leave an operator
+    // with a sheet that gets neither rows nor an explanation -- the same silence
+    // a missing NOT_IMPORTED entry used to produce, arriving from the other side.
+    expect(outcome.opened).toEqual([...importedMembers()]);
   });
 });
 
@@ -1058,16 +1064,27 @@ describe("findings", () => {
     const { plan } = await planFor(archive);
 
     const skipped = plan.findings.filter((f) => f.code === IMPORT_FINDINGS.sheetNotImported);
-    expect(skipped.map((f) => f.message.split(" ")[0])).toEqual([
-      "deals.csv", "projects.csv", "tasks.csv", "notes.csv",
-      "meetings.csv", "documents.csv", "files.csv",
-    ]);
+    // AN EXACT LIST, WHICH IS WHY THIS TEST DID ITS JOB: Phase 10 added a tenth
+    // sheet and this went red at the moment `time_entries.csv` reached the
+    // archive with no NOT_IMPORTED entry behind it -- the "a new sheet nobody
+    // told the other half about" failure, caught rather than shipped.
+    //
+    // THE EXPECTATION IS NOW THE DECLARATION, NOT A COPY OF IT (v1.9.0), and
+    // that does not make it vacuous: what it reads is the findings a REAL
+    // preview emitted over a REAL archive, so a member declared here that the
+    // export never wrote, or a note the engine never emitted, is still red. The
+    // ORDER is asserted too -- an operator reads these in the order the sheets
+    // sit in the archive.
+    expect(skipped.map((f) => f.message.split(" ")[0]))
+      .toEqual(NOT_IMPORTED_MEMBERS.map((m) => m.member));
     // THE REASONS ARE SPECIFIC, because they are the specification for the
     // formatVersion 2 that would close them.
     expect(skipped.find((f) => f.message.startsWith("deals.csv"))?.message)
       .toMatch(/no pipelines or stages/);
     expect(skipped.find((f) => f.message.startsWith("documents.csv"))?.message)
       .toMatch(/no line items/);
+    expect(skipped.find((f) => f.message.startsWith("time_entries.csv"))?.message)
+      .toMatch(/at least one record/);
     expect(findingCodes(plan)).toContain(IMPORT_FINDINGS.partialImport);
   });
 });

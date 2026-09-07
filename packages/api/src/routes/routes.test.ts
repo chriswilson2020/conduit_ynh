@@ -8,8 +8,12 @@ import {
   companySchema, contactSchema, noteSchema, fileMetaSchema, eventSchema,
   errorResponseSchema, listResponseSchema, searchResultsSchema,
   pipelineSchema, pipelineWithStagesSchema, stageSchema, dealSchema, funnelRowSchema,
-  projectSchema, taskSchema, taskDependencySchema, shiftResultSchema, ganttPayloadSchema,
-  meetingSchema, meetingDetailSchema, meetingSummarySchema, documentSchema, orgProfileSchema,
+  projectSchema, taskSchema, taskDependencySchema, taskEffortSchema,
+  shiftResultSchema, ganttPayloadSchema,
+  meetingSchema, meetingDetailSchema, meetingSummarySchema, timeEntrySchema,
+  timesheetBillableSummary, timesheetSummary, timesheetTotalsSchema, timesheetWeekSchema,
+  timerStateSchema, MAX_TIME_ENTRY_MINUTES, MAX_TIMESHEET_DAY_SPAN,
+  documentSchema, orgProfileSchema,
   agreementSchema, letterSchema, recordDocumentSchema, statusReportSchema,
   documentTemplateSchema, CONTACT_FIELD_CAPS, DEFAULT_TIME_ZONE,
   DOCUMENT_MAX_DESCRIPTION_CHARS, DOCUMENT_MAX_LINES, MAX_TEMPLATE_BYTES,
@@ -1392,6 +1396,79 @@ describe("tasks routes", () => {
     await a.close();
   });
 
+  /**
+   * **BOOKED VERSUS ESTIMATED, OVER HTTP.** The estimate goes in through the
+   * ordinary task PATCH; the comparison comes back from a second endpoint under
+   * the same `:id` -- deliberately not a field on the task, so the board and the
+   * Gantt do not each run an aggregate per rendered card (services/timesheet.ts).
+   */
+  it("answers a task's effort: the estimate patched in, and the hours booked against it", async () => {
+    const a = await app();
+    const task = await makeTask(a, { title: "Write the spec" });
+
+    const before = await a.inject({
+      method: "GET", url: `/api/tasks/${task.id}/effort`, headers: authHeaders,
+    });
+    expect(before.statusCode).toBe(200);
+    expect(taskEffortSchema.parse(before.json())).toEqual({
+      taskId: task.id, estimateMinutes: null, bookedMinutes: 0, entryCount: 0,
+    });
+
+    const patched = await a.inject({
+      method: "PATCH", url: `/api/tasks/${task.id}`,
+      headers: authHeaders, payload: { estimateMinutes: 240 },
+    });
+    expect(patched.statusCode).toBe(200);
+    expect(taskSchema.parse(patched.json()).estimateMinutes).toBe(240);
+
+    const booked = await a.inject({
+      method: "POST", url: "/api/time-entries", headers: authHeaders,
+      payload: { workDate: "2026-09-08", minutes: 90, billable: true, taskId: task.id },
+    });
+    expect(booked.statusCode).toBe(201);
+
+    const after = await a.inject({
+      method: "GET", url: `/api/tasks/${task.id}/effort`, headers: authHeaders,
+    });
+    expect(taskEffortSchema.parse(after.json())).toEqual({
+      taskId: task.id, estimateMinutes: 240, bookedMinutes: 90, entryCount: 1,
+    });
+    await a.close();
+  });
+
+  /** The bound is on the wire as well as in the database, so a figure that would
+   * dominate every comparison it appears in is a 400 naming the field rather
+   * than a 500 from a CHECK -- which is what `meetings.duration_minutes` has NOT
+   * got, and what Task 2 recorded the cost of. */
+  it("refuses an estimate outside the range, and a zero, with a 400", async () => {
+    const a = await app();
+    const task = await makeTask(a);
+    for (const estimateMinutes of [0, -1, 999999999, 90.5]) {
+      const response = await a.inject({
+        method: "PATCH", url: `/api/tasks/${task.id}`, headers: authHeaders, payload: { estimateMinutes },
+      });
+      expect(response.statusCode, String(estimateMinutes)).toBe(400);
+    }
+    // The premise: the exact edges of the same range go through.
+    for (const estimateMinutes of [1, 525600]) {
+      const ok = await a.inject({
+        method: "PATCH", url: `/api/tasks/${task.id}`, headers: authHeaders, payload: { estimateMinutes },
+      });
+      expect(ok.statusCode, String(estimateMinutes)).toBe(200);
+    }
+    await a.close();
+  });
+
+  it("returns 404 asking for the effort of a task that does not exist", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "GET", url: "/api/tasks/3f2504e0-4f89-41d3-9a0c-0305e82c3301/effort", headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(404);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("not_found");
+    await a.close();
+  });
+
   it("returns 404 for an unknown task id", async () => {
     const a = await app();
     const response = await a.inject({
@@ -2026,6 +2103,498 @@ describe("meetings routes", () => {
       expect(response.statusCode).toBe(401);
       expect(errorResponseSchema.parse(response.json()).error).toBe("unauthenticated");
     }
+    await a.close();
+  });
+});
+
+describe("time entries routes", () => {
+  const unknownId = "3f2504e0-4f89-41d3-9a0c-0305e82c3303";
+
+  async function makeProject(a: Awaited<ReturnType<typeof app>>, name = "Rollout") {
+    const response = await a.inject({
+      method: "POST", url: "/api/projects", headers: authHeaders, payload: { name },
+    });
+    return projectSchema.parse(response.json());
+  }
+
+  async function makeEntry(a: Awaited<ReturnType<typeof app>>, payload: Record<string, unknown>) {
+    const response = await a.inject({
+      method: "POST", url: "/api/time-entries", headers: authHeaders, payload,
+    });
+    expect(response.statusCode, response.body).toBe(201);
+    return timeEntrySchema.parse(response.json());
+  }
+
+  it("creates an entry and returns 201 with a contract-shaped body", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    const entry = await makeEntry(a, {
+      workDate: "2026-09-01", minutes: 90, billable: true,
+      description: "Data migration dry run", projectId: project.id,
+    });
+    expect(entry).toMatchObject({
+      workDate: "2026-09-01", minutes: 90, billable: true, projectId: project.id,
+    });
+    await a.close();
+  });
+
+  /**
+   * **THE LINK RULE ARRIVES AS A 400, NOT AS A 500.** The CHECK is the backstop;
+   * the wire refine is what a person filling in a form actually meets, and the
+   * whole reason both exist is that a 23514 escaping to a client is an
+   * unactionable server error for a form field somebody can fix.
+   */
+  it("400s an entry attached to nothing, naming what is missing", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "POST", url: "/api/time-entries", headers: authHeaders,
+      payload: { workDate: "2026-09-01", minutes: 60, billable: true },
+    });
+    expect(response.statusCode).toBe(400);
+    const body = errorResponseSchema.parse(response.json());
+    expect(body.error).toBe("validation");
+    expect(body.message).toContain("at least one of");
+    await a.close();
+  });
+
+  it("400s a create with no billable flag, rather than choosing one", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    const response = await a.inject({
+      method: "POST", url: "/api/time-entries", headers: authHeaders,
+      payload: { workDate: "2026-09-01", minutes: 60, projectId: project.id },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("validation");
+    await a.close();
+  });
+
+  it("400s a duration of zero, and one longer than a day", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    for (const minutes of [0, -30, 1441]) {
+      const response = await a.inject({
+        method: "POST", url: "/api/time-entries", headers: authHeaders,
+        payload: { workDate: "2026-09-01", minutes, billable: true, projectId: project.id },
+      });
+      expect(response.statusCode, `${String(minutes)} minutes`).toBe(400);
+    }
+    await a.close();
+  });
+
+  it("404s a link that names a record which does not exist", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "POST", url: "/api/time-entries", headers: authHeaders,
+      payload: { workDate: "2026-09-01", minutes: 60, billable: true, projectId: unknownId },
+    });
+    expect(response.statusCode).toBe(404);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("not_found");
+    await a.close();
+  });
+
+  it("lists by record and by an inclusive date range, newest day first", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    const other = await makeProject(a, "Something else");
+    for (const workDate of ["2026-08-31", "2026-09-01", "2026-09-02"]) {
+      await makeEntry(a, { workDate, minutes: 60, billable: true, projectId: project.id });
+    }
+    await makeEntry(a, { workDate: "2026-09-01", minutes: 15, billable: false, projectId: other.id });
+
+    const week = await a.inject({
+      method: "GET",
+      url: `/api/time-entries?project_id=${project.id}&from=2026-08-31&to=2026-09-01`,
+      headers: authHeaders,
+    });
+    expect(week.statusCode).toBe(200);
+    const body = listResponseSchema(timeEntrySchema).parse(week.json());
+    expect(body.items.map((e) => e.workDate)).toEqual(["2026-09-01", "2026-08-31"]);
+    await a.close();
+  });
+
+  it("400s a cursor minted by a different ordering", async () => {
+    const a = await app();
+    // A created_at cursor, which every Phase 1-3 list mints. Time entries page
+    // by (work_date, id), so accepting this would page from a value that is not
+    // even the same kind of thing.
+    const foreign = Buffer.from(
+      JSON.stringify({ createdAt: new Date().toISOString(), id: unknownId }), "utf8",
+    ).toString("base64url");
+    const response = await a.inject({
+      method: "GET", url: `/api/time-entries?cursor=${foreign}`, headers: authHeaders,
+    });
+    expect(response.statusCode).toBe(400);
+    expect(errorResponseSchema.parse(response.json()).message).toBe("invalid cursor");
+    await a.close();
+  });
+
+  it("patches an entry, and 409s the patch that would leave it linked to nothing", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    const entry = await makeEntry(a, {
+      workDate: "2026-09-01", minutes: 60, billable: true, projectId: project.id,
+    });
+
+    const patched = await a.inject({
+      method: "PATCH", url: `/api/time-entries/${entry.id}`, headers: authHeaders,
+      payload: { minutes: 75, billable: false },
+    });
+    expect(patched.statusCode).toBe(200);
+    expect(timeEntrySchema.parse(patched.json())).toMatchObject({ minutes: 75, billable: false });
+
+    const orphaned = await a.inject({
+      method: "PATCH", url: `/api/time-entries/${entry.id}`, headers: authHeaders,
+      payload: { projectId: null },
+    });
+    expect(orphaned.statusCode).toBe(409);
+    // `conflict`, not `archived`: the entry is fine, it is the submission that
+    // cannot stand against the stored row -- and the message says what would.
+    expect(errorResponseSchema.parse(orphaned.json()).error).toBe("conflict");
+    await a.close();
+  });
+
+  it("archives and unarchives, and 409s a patch against an archived entry", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    const entry = await makeEntry(a, {
+      workDate: "2026-09-01", minutes: 60, billable: true, projectId: project.id,
+    });
+
+    const archived = await a.inject({
+      method: "POST", url: `/api/time-entries/${entry.id}/archive`, headers: authHeaders,
+    });
+    expect(archived.statusCode).toBe(200);
+    expect(timeEntrySchema.parse(archived.json()).archivedAt).not.toBeNull();
+
+    const live = await a.inject({ method: "GET", url: "/api/time-entries", headers: authHeaders });
+    expect(listResponseSchema(timeEntrySchema).parse(live.json()).items).toEqual([]);
+    const onlyArchived = await a.inject({
+      method: "GET", url: "/api/time-entries?archived=true", headers: authHeaders,
+    });
+    expect(listResponseSchema(timeEntrySchema).parse(onlyArchived.json()).items.map((e) => e.id))
+      .toEqual([entry.id]);
+
+    const patched = await a.inject({
+      method: "PATCH", url: `/api/time-entries/${entry.id}`, headers: authHeaders,
+      payload: { minutes: 30 },
+    });
+    expect(patched.statusCode).toBe(409);
+    expect(errorResponseSchema.parse(patched.json()).error).toBe("archived");
+
+    const restored = await a.inject({
+      method: "POST", url: `/api/time-entries/${entry.id}/unarchive`, headers: authHeaders,
+    });
+    expect(timeEntrySchema.parse(restored.json()).archivedAt).toBeNull();
+    await a.close();
+  });
+
+  // "false" is a non-empty string, so z.coerce.boolean() would read it as TRUE
+  // and silently invert this filter -- the trap routes/companies.ts records.
+  it("reads archived=false as the live list, not as the archived one", async () => {
+    const a = await app();
+    const project = await makeProject(a);
+    const entry = await makeEntry(a, {
+      workDate: "2026-09-01", minutes: 60, billable: true, projectId: project.id,
+    });
+    const response = await a.inject({
+      method: "GET", url: "/api/time-entries?archived=false", headers: authHeaders,
+    });
+    expect(listResponseSchema(timeEntrySchema).parse(response.json()).items.map((e) => e.id))
+      .toEqual([entry.id]);
+    await a.close();
+  });
+
+  it("404s an entry that is not there", async () => {
+    const a = await app();
+    for (const call of [
+      { method: "GET" as const, url: `/api/time-entries/${unknownId}` },
+      { method: "POST" as const, url: `/api/time-entries/${unknownId}/archive` },
+      { method: "POST" as const, url: `/api/time-entries/${unknownId}/unarchive` },
+    ]) {
+      const response = await a.inject({ ...call, headers: authHeaders, payload: {} });
+      expect(response.statusCode, call.url).toBe(404);
+    }
+    await a.close();
+  });
+
+  it("returns 401 without an identity header on every time-entries route", async () => {
+    const a = await app();
+    const calls = [
+      { method: "GET" as const, url: "/api/time-entries" },
+      { method: "POST" as const, url: "/api/time-entries" },
+      { method: "GET" as const, url: `/api/time-entries/${unknownId}` },
+      { method: "PATCH" as const, url: `/api/time-entries/${unknownId}` },
+      { method: "POST" as const, url: `/api/time-entries/${unknownId}/archive` },
+      { method: "POST" as const, url: `/api/time-entries/${unknownId}/unarchive` },
+    ];
+    for (const call of calls) {
+      const response = await a.inject({ ...call, payload: {} });
+      expect(response.statusCode).toBe(401);
+      expect(errorResponseSchema.parse(response.json()).error).toBe("unauthenticated");
+    }
+    await a.close();
+  });
+});
+
+/**
+ * **THE TIMESHEET'S TOTALS OVER HTTP (Phase 10 Task 2).** The one endpoint that
+ * reads meetings and time entries together. Task 4's page renders what this
+ * answers and computes none of it.
+ */
+describe("timesheet route", () => {
+  /**
+   * **DATES RELATIVE TO THE SERVER'S OWN CLOCK, AND THIS IS THE ONE PLACE THEY
+   * HAVE TO BE.** `timesheetTotals` takes `now` and the service tests pin it, but
+   * the ROUTE deliberately does not offer a test override -- a report whose "has
+   * this meeting happened yet" could be told what time it is from a querystring
+   * would be a report that could be asked the wrong question. So the fixture
+   * moves instead: a hard-coded meeting date would sit in the future today and in
+   * the past next week, and this test would silently change what it proves.
+   * Caught by exactly that -- the first draft used 2026-09-08 and both meetings
+   * came back as not-yet-happened.
+   */
+  const today = todayDateOnly();
+  const yesterday = addDays(today, -1);
+
+  async function seedWeek(a: Awaited<ReturnType<typeof app>>): Promise<void> {
+    const project = projectSchema.parse((await a.inject({
+      method: "POST", url: "/api/projects", headers: authHeaders, payload: { name: "Rollout" },
+    })).json());
+    for (const payload of [
+      { workDate: yesterday, minutes: 120, billable: true, projectId: project.id },
+      { workDate: today, minutes: 45, billable: false, projectId: project.id },
+    ]) {
+      const created = await a.inject({
+        method: "POST", url: "/api/time-entries", headers: authHeaders, payload,
+      });
+      expect(created.statusCode, created.body).toBe(201);
+    }
+    for (const payload of [
+      // Counted: it has a duration and it is in the past.
+      { title: "Kickoff", occurredAt: `${yesterday}T09:00:00.000Z`, durationMinutes: 60, projectId: project.id },
+      // Unmeasured: nobody recorded how long it ran.
+      { title: "Corridor", occurredAt: `${yesterday}T15:00:00.000Z`, durationMinutes: null, projectId: project.id },
+    ]) {
+      const created = await a.inject({
+        method: "POST", url: "/api/meetings", headers: authHeaders, payload,
+      });
+      expect(created.statusCode, created.body).toBe(201);
+    }
+  }
+
+  it("answers a contract-shaped total over entries and meetings together", async () => {
+    const a = await app();
+    await seedWeek(a);
+    const response = await a.inject({
+      method: "GET", url: `/api/timesheet?from=${yesterday}&to=${today}`, headers: authHeaders,
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    // Parsed, which is where the invariants bite: the schema refuses a total that
+    // is not its own halves and meeting buckets that do not account for the
+    // range, so this is not merely a shape assertion.
+    const totals = timesheetTotalsSchema.parse(response.json());
+    expect(totals).toMatchObject({
+      from: yesterday, to: today, timeZone: DEFAULT_TIME_ZONE,
+      entryMinutes: 165, entryCount: 2,
+      meetingMinutes: 60, meetingsCounted: 1, meetingsUnmeasured: 1, meetingsNotYetOccurred: 0,
+      meetingsInRange: 2, countedMinutes: 225,
+    });
+    // The operator's sentence names the meeting nobody timed, in the same string
+    // as the figure -- which is the whole reason it is one string.
+    expect(timesheetSummary(totals))
+      .toBe(`3h 45m counted from ${yesterday} to ${today}: 2h 45m across 2 entries, `
+        + "and 1h across 1 meeting. Not counted: 1 meeting with no recorded length.");
+    await a.close();
+  });
+
+  /** Both bounds are required: a total over every hour ever logged is a different
+   * question from "where did the week go", and a caller that forgot the range
+   * would get the second answer looking like the first. */
+  it("400s a range with a missing, malformed or backwards bound", async () => {
+    const a = await app();
+    for (const query of [
+      "", "?from=2026-09-07", "?to=2026-09-13",
+      "?from=2026-09&to=2026-09-13",
+      "?from=2026-09-07T00:00:00.000Z&to=2026-09-13",
+      // Backwards: answered with zeroes it would look exactly like a quiet week.
+      "?from=2026-09-13&to=2026-09-07",
+    ]) {
+      const response = await a.inject({
+        method: "GET", url: `/api/timesheet${query}`, headers: authHeaders,
+      });
+      expect(response.statusCode, query).toBe(400);
+      expect(errorResponseSchema.parse(response.json()).error).toBe("validation");
+    }
+    await a.close();
+  });
+
+  it("answers an empty week with zero rather than with nothing", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "GET", url: `/api/timesheet?from=${yesterday}&to=${today}`, headers: authHeaders,
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    const totals = timesheetTotalsSchema.parse(response.json());
+    expect(totals.countedMinutes).toBe(0);
+    expect(timesheetSummary(totals)).toContain("0m counted");
+    await a.close();
+  });
+
+  it("returns 401 without an identity header", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "GET", url: `/api/timesheet?from=${yesterday}&to=${today}`,
+    });
+    expect(response.statusCode).toBe(401);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("unauthenticated");
+    await a.close();
+  });
+
+  /* ---------------------------------------------------------------------- *
+   *  Task 4: the record filters, the billable split, and the rows
+   * ---------------------------------------------------------------------- */
+
+  it("narrows the whole report to one record, on both halves at once", async () => {
+    const a = await app();
+    await seedWeek(a);
+    const other = projectSchema.parse((await a.inject({
+      method: "POST", url: "/api/projects", headers: authHeaders, payload: { name: "Elsewhere" },
+    })).json());
+    const query = `from=${yesterday}&to=${today}`;
+
+    const all = timesheetTotalsSchema.parse((await a.inject({
+      method: "GET", url: `/api/timesheet?${query}`, headers: authHeaders,
+    })).json());
+    const none = timesheetTotalsSchema.parse((await a.inject({
+      method: "GET", url: `/api/timesheet?${query}&project_id=${other.id}`, headers: authHeaders,
+    })).json());
+    expect(all.countedMinutes).toBe(225);
+    // Both halves narrowed: an entries-only filter would leave the meetings in.
+    expect(none.countedMinutes).toBe(0);
+    expect(none.meetingsInRange).toBe(0);
+    expect(none.entryCount).toBe(0);
+    await a.close();
+  });
+
+  /** The split rides the same payload and the same aggregate. `seedWeek` logs
+   * 120 billable minutes and 45 non-billable ones. */
+  it("carries the billable split, and a sentence that says what is in neither half", async () => {
+    const a = await app();
+    await seedWeek(a);
+    const totals = timesheetTotalsSchema.parse((await a.inject({
+      method: "GET", url: `/api/timesheet?from=${yesterday}&to=${today}`, headers: authHeaders,
+    })).json());
+    expect(totals.billableEntryMinutes).toBe(120);
+    expect(totals.billableEntryCount).toBe(1);
+    expect(timesheetBillableSummary(totals)).toBe(
+      "2h of the 2h 45m logged by hand is billable, across 1 entry. Meetings carry no billable "
+      + "flag, so the 1h from meetings is in neither figure.",
+    );
+    await a.close();
+  });
+
+  it("400s a record filter that is not an id", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "GET",
+      url: `/api/timesheet?from=${yesterday}&to=${today}&company_id=acme`,
+      headers: authHeaders,
+    });
+    expect(response.statusCode, response.body).toBe(400);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("validation");
+    await a.close();
+  });
+
+  /**
+   * **THE ROWS THE FIGURE IS MADE OF, OVER HTTP.** Parsed rather than
+   * shape-asserted: `timesheetWeekSchema` refuses a day whose figure is not its
+   * own rows, a row that is uncounted for no stated reason, and a row filed under
+   * a day the range does not contain -- so this is the contract biting rather
+   * than a spot check.
+   */
+  it("answers the week row by row, entries and meetings together", async () => {
+    const a = await app();
+    await seedWeek(a);
+    const response = await a.inject({
+      method: "GET", url: `/api/timesheet/days?from=${yesterday}&to=${today}`, headers: authHeaders,
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    const week = timesheetWeekSchema.parse(response.json());
+    expect(week.days.map((day) => day.day)).toEqual([yesterday, today]);
+    const rows = week.days.flatMap((day) => day.rows);
+    expect(rows.filter((row) => row.kind === "entry")).toHaveLength(2);
+    expect(rows.filter((row) => row.kind === "meeting")).toHaveLength(2);
+    // The meeting nobody timed is a ROW the operator can look at, not merely a
+    // number in the sentence above the list.
+    expect(rows.filter((row) => row.uncountedReason === "no-recorded-length"))
+      .toMatchObject([{ label: "Corridor", minutes: null, counted: false }]);
+    // Every row names the project it was booked to, already readable.
+    expect(rows.every((row) => row.links.some((link) => link.label === "Rollout"))).toBe(true);
+    // AND THE LIST ADDS UP TO THE HEADLINE, which is the property the whole
+    // surface rests on -- fetched over HTTP, from the two endpoints separately.
+    const totals = timesheetTotalsSchema.parse((await a.inject({
+      method: "GET", url: `/api/timesheet?from=${yesterday}&to=${today}`, headers: authHeaders,
+    })).json());
+    expect(week.days.reduce((sum, day) => sum + day.countedMinutes, 0))
+      .toBe(totals.countedMinutes);
+    await a.close();
+  });
+
+  /**
+   * **THE SPAN BOUND IS ON THE ROWS AND NOT ON THE AGGREGATE**, because only one
+   * of the two grows with the range. Refused rather than truncated: a short list
+   * under a full total is the one outcome this surface may not produce.
+   */
+  it("refuses to list more than a quarter at once, while the aggregate takes any range", async () => {
+    const a = await app();
+    const from = "2026-01-01";
+    const tooLong = addDays(from, MAX_TIMESHEET_DAY_SPAN);
+    const exactly = addDays(from, MAX_TIMESHEET_DAY_SPAN - 1);
+
+    const refused = await a.inject({
+      method: "GET", url: `/api/timesheet/days?from=${from}&to=${tooLong}`, headers: authHeaders,
+    });
+    expect(refused.statusCode, refused.body).toBe(400);
+    expect(errorResponseSchema.parse(refused.json()).error).toBe("validation");
+
+    const allowed = await a.inject({
+      method: "GET", url: `/api/timesheet/days?from=${from}&to=${exactly}`, headers: authHeaders,
+    });
+    expect(allowed.statusCode, allowed.body).toBe(200);
+    expect(timesheetWeekSchema.parse(allowed.json()).days).toHaveLength(MAX_TIMESHEET_DAY_SPAN);
+
+    // The same decade-long range is fine on the aggregate, whose answer is the
+    // same size whatever it is asked.
+    const totals = await a.inject({
+      method: "GET", url: `/api/timesheet?from=2020-01-01&to=2030-01-01`, headers: authHeaders,
+    });
+    expect(totals.statusCode, totals.body).toBe(200);
+    await a.close();
+  });
+
+  /** A BACKWARDS RANGE IS NAMED AS SUCH, not reported as too long: the span of an
+   * inverted range is negative, so a gate that checked the length first would
+   * blame the wrong thing. */
+  it("400s a backwards or malformed range on the rows endpoint too", async () => {
+    const a = await app();
+    for (const query of [
+      "", "?from=2026-09-07", "?from=2026-09-13&to=2026-09-07", "?from=2026-09&to=2026-09-13",
+    ]) {
+      const response = await a.inject({
+        method: "GET", url: `/api/timesheet/days${query}`, headers: authHeaders,
+      });
+      expect(response.statusCode, query).toBe(400);
+    }
+    await a.close();
+  });
+
+  it("returns 401 for the rows without an identity header", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "GET", url: `/api/timesheet/days?from=${yesterday}&to=${today}`,
+    });
+    expect(response.statusCode).toBe(401);
     await a.close();
   });
 });
@@ -2938,6 +3507,273 @@ describe("documents routes", () => {
     for (const call of calls) {
       const response = await a.inject({ ...call, payload: {} });
       expect(response.statusCode).toBe(401);
+      expect(errorResponseSchema.parse(response.json()).error).toBe("unauthenticated");
+    }
+    await a.close();
+  });
+});
+
+/**
+ * **THE TIMER OVER HTTP (Phase 10 Task 5).**
+ *
+ * The service tests hold the transaction, the constraints and the recovery
+ * rules; these hold the contract a browser meets -- the status codes, the
+ * parsed shapes, and the two refusals a client has to be able to tell apart (a
+ * timer already running, and a timer already stopped).
+ */
+describe("timer routes", () => {
+  const unknownId = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+
+  async function seedProject(a: Awaited<ReturnType<typeof app>>, name = "Rollout"): Promise<string> {
+    const response = await a.inject({
+      method: "POST", url: "/api/projects", headers: authHeaders, payload: { name },
+    });
+    return projectSchema.parse(response.json()).id;
+  }
+
+  async function start(
+    a: Awaited<ReturnType<typeof app>>, payload: Record<string, unknown>,
+  ) {
+    return a.inject({ method: "POST", url: "/api/timer", headers: authHeaders, payload });
+  }
+
+  it("answers no timer running, with the clock the days are decided in", async () => {
+    const a = await app();
+    const response = await a.inject({ method: "GET", url: "/api/timer", headers: authHeaders });
+    expect(response.statusCode, response.body).toBe(200);
+    const state = timerStateSchema.parse(response.json());
+    expect(state.timer).toBeNull();
+    expect(state.timeZone).toBe(DEFAULT_TIME_ZONE);
+    await a.close();
+  });
+
+  /**
+   * **THE CLOSED TAB, AS A REQUEST.** Everything a reopened tab, a second device
+   * and a restarted process need is in this one response: the instant, the
+   * links, and the day the hours will land on. Nothing in it is an elapsed
+   * figure -- that is computed from `startedAt` at render time, by the same
+   * function on both sides of the wire.
+   */
+  it("starts a timer, returns 201, and hands the same one back to a fresh request", async () => {
+    const a = await app();
+    const projectId = await seedProject(a);
+    const created = await start(a, { projectId, description: "Ingest rewrite" });
+    expect(created.statusCode, created.body).toBe(201);
+    const startedState = timerStateSchema.parse(created.json());
+    expect(startedState.timer?.projectId).toBe(projectId);
+
+    const fetched = timerStateSchema.parse((await a.inject({
+      method: "GET", url: "/api/timer", headers: authHeaders,
+    })).json());
+    expect(fetched.timer?.id).toBe(startedState.timer?.id);
+    expect(fetched.timer?.startedAt).toBe(startedState.timer?.startedAt);
+    expect(fetched.timer?.description).toBe("Ingest rewrite");
+    // NO DURATION ON THE WIRE, which is the decision that keeps one definition
+    // of "how long has this run" rather than two that agree at serialisation
+    // time and diverge a second later.
+    expect(fetched.timer).not.toHaveProperty("elapsedMinutes");
+    expect(fetched.timer).not.toHaveProperty("minutes");
+    await a.close();
+  });
+
+  it("400s a timer attached to nothing, naming the five links", async () => {
+    const a = await app();
+    const response = await start(a, { description: "Something" });
+    expect(response.statusCode, response.body).toBe(400);
+    const body = errorResponseSchema.parse(response.json());
+    expect(body.error).toBe("validation");
+    expect(body.message).toContain("projectId");
+    await a.close();
+  });
+
+  it("404s a timer whose record does not exist", async () => {
+    const a = await app();
+    const response = await start(a, { projectId: unknownId });
+    expect(response.statusCode, response.body).toBe(404);
+    expect(errorResponseSchema.parse(response.json()).error).toBe("not_found");
+    await a.close();
+  });
+
+  /**
+   * **THE SECOND DEVICE, AS A STATUS CODE.** 409 rather than a 500 out of the
+   * partial unique index, and the running timer's id is IN THE MESSAGE so a
+   * second tab can offer to stop that one rather than only refusing.
+   */
+  it("409s a second timer and names the one already running", async () => {
+    const a = await app();
+    const projectId = await seedProject(a);
+    const first = timerStateSchema.parse((await start(a, { projectId })).json());
+    const second = await start(a, { projectId });
+    expect(second.statusCode, second.body).toBe(409);
+    const body = errorResponseSchema.parse(second.json());
+    expect(body.error).toBe("conflict");
+    expect(body.message).toContain(first.timer?.id ?? "never");
+    await a.close();
+  });
+
+  /**
+   * **THE ORDINARY STOP.** 201 and a time entry, because that is what it
+   * creates -- and the entry is an ordinary one, indistinguishable from a
+   * hand-typed row to everything that reads `time_entries`, which is the whole
+   * reason the two capture paths cannot be told apart by a report.
+   */
+  it("stops a timer into a time entry, on the timer's own day", async () => {
+    const a = await app();
+    const projectId = await seedProject(a);
+    const state = timerStateSchema.parse((await start(a, { projectId })).json());
+
+    const response = await a.inject({
+      method: "POST", url: `/api/timer/${state.timer?.id ?? ""}/stop`,
+      headers: authHeaders, payload: { minutes: 95, billable: true },
+    });
+    expect(response.statusCode, response.body).toBe(201);
+    const entry = timeEntrySchema.parse(response.json());
+    expect(entry.minutes).toBe(95);
+    expect(entry.workDate).toBe(state.timer?.workDate);
+    expect(entry.projectId).toBe(projectId);
+
+    // The strip empties, and the entry is in the week.
+    expect(timerStateSchema.parse((await a.inject({
+      method: "GET", url: "/api/timer", headers: authHeaders,
+    })).json()).timer).toBeNull();
+    const list = listResponseSchema(timeEntrySchema).parse((await a.inject({
+      method: "GET", url: "/api/time-entries", headers: authHeaders,
+    })).json());
+    expect(list.items).toHaveLength(1);
+    await a.close();
+  });
+
+  /**
+   * **THE MINUTES ARE REQUIRED AND THE FLAG IS TOO**, and both refusals are the
+   * recovery interaction reaching the wire. An optional `minutes` defaulting to
+   * the elapsed time would be pleasant for the ordinary stop and would have NO
+   * LEGAL VALUE for the 62-hour weekend; a defaulted `billable` would put back
+   * the guess the column has no DEFAULT in order to refuse.
+   */
+  it("400s a stop that states no duration, no flag, or an impossible duration", async () => {
+    const a = await app();
+    const projectId = await seedProject(a);
+    const state = timerStateSchema.parse((await start(a, { projectId })).json());
+    const url = `/api/timer/${state.timer?.id ?? ""}/stop`;
+
+    for (const payload of [
+      {},
+      { billable: true },
+      { minutes: 30 },
+      { minutes: 0, billable: true },
+      { minutes: MAX_TIME_ENTRY_MINUTES + 1, billable: true },
+      { minutes: 62 * 60, billable: true },
+      { minutes: 1.5, billable: true },
+    ]) {
+      const response = await a.inject({ method: "POST", url, headers: authHeaders, payload });
+      expect(response.statusCode, JSON.stringify(payload)).toBe(400);
+      expect(errorResponseSchema.parse(response.json()).error).toBe("validation");
+    }
+    // AND THE TIMER IS STILL RUNNING after every one of them, which is what
+    // makes a rejected stop a retry rather than a loss.
+    expect(timerStateSchema.parse((await a.inject({
+      method: "GET", url: "/api/timer", headers: authHeaders,
+    })).json()).timer?.id).toBe(state.timer?.id);
+    await a.close();
+  });
+
+  /**
+   * **STOPPING A TIMER THAT IS ALREADY STOPPED IS A 409, NOT A SECOND ENTRY**,
+   * and the id in the path is what makes it answerable. At most one timer runs
+   * per person, so a stop with no id would have been enough -- and would have
+   * stopped whichever timer happened to be running when a stale tab's button
+   * fired, booking its minutes to the wrong record.
+   */
+  it("409s a stop for a timer that has already finished, and writes no second entry", async () => {
+    const a = await app();
+    const projectId = await seedProject(a);
+    const state = timerStateSchema.parse((await start(a, { projectId })).json());
+    const url = `/api/timer/${state.timer?.id ?? ""}/stop`;
+    const payload = { minutes: 30, billable: false };
+
+    expect((await a.inject({ method: "POST", url, headers: authHeaders, payload })).statusCode).toBe(201);
+    const again = await a.inject({ method: "POST", url, headers: authHeaders, payload });
+    expect(again.statusCode, again.body).toBe(409);
+    expect(errorResponseSchema.parse(again.json()).error).toBe("conflict");
+
+    const list = listResponseSchema(timeEntrySchema).parse((await a.inject({
+      method: "GET", url: "/api/time-entries", headers: authHeaders,
+    })).json());
+    expect(list.items).toHaveLength(1);
+    await a.close();
+  });
+
+  it("404s a stop or a discard for a timer that never existed", async () => {
+    const a = await app();
+    const stop = await a.inject({
+      method: "POST", url: `/api/timer/${unknownId}/stop`,
+      headers: authHeaders, payload: { minutes: 30, billable: false },
+    });
+    expect(stop.statusCode, stop.body).toBe(404);
+    const discard = await a.inject({
+      method: "POST", url: `/api/timer/${unknownId}/discard`, headers: authHeaders,
+    });
+    expect(discard.statusCode, discard.body).toBe(404);
+    await a.close();
+  });
+
+  it("400s an id that is not an id", async () => {
+    const a = await app();
+    const response = await a.inject({
+      method: "POST", url: "/api/timer/not-a-uuid/stop",
+      headers: authHeaders, payload: { minutes: 30, billable: false },
+    });
+    expect(response.statusCode, response.body).toBe(400);
+    await a.close();
+  });
+
+  /**
+   * **DISCARD IS THE OTHER WAY OUT OF THE WEEKEND**, and it has to write nothing
+   * -- the alternative for a timer that represents no work is an operator
+   * inventing a number to make the strip go away, which is worse than nothing
+   * because it is indistinguishable from a real hour afterwards.
+   */
+  it("discards a timer without writing an entry, and frees the operator to start another", async () => {
+    const a = await app();
+    const projectId = await seedProject(a);
+    const state = timerStateSchema.parse((await start(a, { projectId })).json());
+
+    const response = await a.inject({
+      method: "POST", url: `/api/timer/${state.timer?.id ?? ""}/discard`, headers: authHeaders,
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    expect(timerStateSchema.parse(response.json()).timer).toBeNull();
+
+    const list = listResponseSchema(timeEntrySchema).parse((await a.inject({
+      method: "GET", url: "/api/time-entries", headers: authHeaders,
+    })).json());
+    expect(list.items).toHaveLength(0);
+    expect((await start(a, { projectId })).statusCode).toBe(201);
+    await a.close();
+  });
+
+  it("409s a discard for a timer that has already finished", async () => {
+    const a = await app();
+    const projectId = await seedProject(a);
+    const state = timerStateSchema.parse((await start(a, { projectId })).json());
+    const url = `/api/timer/${state.timer?.id ?? ""}/discard`;
+    expect((await a.inject({ method: "POST", url, headers: authHeaders })).statusCode).toBe(200);
+    const again = await a.inject({ method: "POST", url, headers: authHeaders });
+    expect(again.statusCode, again.body).toBe(409);
+    await a.close();
+  });
+
+  it("returns 401 without an identity header on every timer route", async () => {
+    const a = await app();
+    const calls = [
+      { method: "GET" as const, url: "/api/timer" },
+      { method: "POST" as const, url: "/api/timer" },
+      { method: "POST" as const, url: `/api/timer/${unknownId}/stop` },
+      { method: "POST" as const, url: `/api/timer/${unknownId}/discard` },
+    ];
+    for (const call of calls) {
+      const response = await a.inject({ ...call, payload: {} });
+      expect(response.statusCode, call.url).toBe(401);
       expect(errorResponseSchema.parse(response.json()).error).toBe("unauthenticated");
     }
     await a.close();

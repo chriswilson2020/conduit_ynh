@@ -222,6 +222,58 @@ test.describe.serial("Tasks/Gantt journey", () => {
     await closeDrawer();
   });
 
+  /**
+   * **BOOKED VERSUS ESTIMATED, END TO END (Phase 10 Task 3).** Before v1.9.0
+   * `tasks` carried no quantity of work at all, so this comparison had nothing
+   * to be made of.
+   *
+   * THE SECOND HALF IS BOOKED THROUGH THE API ON PURPOSE. There is no web
+   * surface for logging time yet -- that is Task 4's page -- so the only way to
+   * exercise the booked half from here is `page.request.post`, which carries the
+   * session cookie (rail-live.spec.ts's arrangement). What that buys is the more
+   * valuable half of the test anyway: the write happens somewhere this tab did
+   * not do it, so the sentence can only update if the SSE hint arrived. That
+   * hint is the ripple this task had to add -- until v1.9.0 nothing on a task
+   * surface listened to a time-entry write at all (api:
+   * services/time-entries.ts's publishTimeEntryHint).
+   */
+  test("estimates Design, books an hour against it elsewhere, and the drawer says how it stands", async () => {
+    await page.goto(`/projects/${projectId}/board`);
+    await openDrawerFromCard(designId, designTitle);
+
+    const effort = page.getByTestId("task-effort");
+    await expect(effort).toHaveText("No time booked yet, and no estimate.");
+
+    // Commits on blur, like the progress field beside it.
+    const estimate = page.getByTestId("field-estimateMinutes").getByLabel("Estimate in minutes");
+
+    // A ZERO IS NOT "NO ESTIMATE", AND THE CONTROL SAYS SO IN FRONT OF THE
+    // OPERATOR. `null` is the one spelling of unestimated, so the field clamps a
+    // typed 0 up to the smallest real estimate rather than sending a value the
+    // CHECK would refuse -- and puts the clamped number back in the box, or it
+    // would go on showing one the task has not got. This is the only place that
+    // branch is exercised end to end: there is no DOM testing in the unit suite,
+    // so its unit-level guard reads the source rather than the rendering.
+    await estimate.fill("0");
+    await estimate.blur();
+    await expect(estimate).toHaveValue("1");
+    await expect(effort).toHaveText("No time booked yet, against an estimate of 1m: 1m left.");
+
+    await estimate.fill("240");
+    await estimate.blur();
+    await expect(effort).toHaveText("No time booked yet, against an estimate of 4h: 4h left.");
+
+    const booked = await page.request.post("/api/time-entries", {
+      data: { workDate: "2026-09-02", minutes: 90, billable: true, taskId: designId },
+    });
+    expect(booked.status()).toBe(201);
+
+    await expect(effort)
+      .toHaveText("1h 30m booked across 1 entry, against an estimate of 4h: 2h 30m left.");
+
+    await closeDrawer();
+  });
+
   test("Gantt shows both bars and the dependency arrow", async () => {
     await page.goto(`/projects/${projectId}/gantt`);
     await expect(page.getByTestId("gantt")).toBeVisible();

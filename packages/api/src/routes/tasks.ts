@@ -11,6 +11,7 @@ import {
   setTaskStatus, moveTaskOnBoard, addDependency, removeDependency, listDependencies,
 } from "../services/tasks.js";
 import { shiftTask } from "../services/scheduling.js";
+import { taskEffort } from "../services/timesheet.js";
 
 // archived/dated/standalone are the same tri-state wire flag companies.ts's
 // listQuerySchema documents: "true"/"false"/absent, not a free-form boolean
@@ -177,6 +178,31 @@ export function registerTaskRoutes(app: FastifyInstance, { db }: CrmRouteDeps): 
     if (params === undefined) return;
     await removeDependency(db, user.id, params.predecessorId, params.id);
     return reply.code(204).send();
+  });
+
+  /**
+   * **BOOKED VERSUS ESTIMATED FOR ONE TASK** -- what `tasks.estimate_minutes`
+   * (0022) says the work should take, and what `time_entries` says it has taken.
+   *
+   * A SECOND ENDPOINT UNDER `:id` RATHER THAN A FIELD ON THE TASK, which is the
+   * dependency list's arrangement one route above and services/timesheet.ts's
+   * `taskEffort` argues at length: the booked half is an aggregate, and putting
+   * it on `taskSchema` would make the board, the Gantt, My Tasks and search each
+   * run one per rendered task.
+   *
+   * ANSWERS FOR AN ARCHIVED TASK, unlike this file's mutating routes: the drawer
+   * opens on one, and the hours booked to it are exactly what somebody looking
+   * at an archived task wants accounted for.
+   */
+  app.get("/api/tasks/:id/effort", async (request, reply) => {
+    if (requireUser(request, reply) === null) return;
+    const params = parseOrReject(idParamSchema, request.params, reply);
+    if (params === undefined) return;
+    try {
+      return await taskEffort(db, params.id);
+    } catch (error) {
+      mapDomainError(reply, error);
+    }
   });
 
   // This task's predecessors (edges where :id is the successor) -- the task

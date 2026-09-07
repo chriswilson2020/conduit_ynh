@@ -3,6 +3,27 @@ import { randomUUID } from "node:crypto";
 import {
   CSV_IMPORT_FIELDS,
   DEFAULT_TIME_ZONE,
+  MAX_TASK_ESTIMATE_MINUTES,
+  MAX_TIME_ENTRY_MINUTES,
+  MAX_TIMESHEET_DAY_SPAN,
+  formatMinutes,
+  taskEffortSchema,
+  taskEffortSummary,
+  timesheetBillableSummary,
+  timesheetFiltersSchema,
+  timesheetRowSchema,
+  timesheetSummary,
+  timesheetTotalsSchema,
+  timesheetWeekSchema,
+  timeEntryAtLeastOneLink,
+  timeEntryCreateInputSchema,
+  timeEntryUpdateInputSchema,
+  timerElapsedMinutes,
+  timerProposedMinutes,
+  timerStartInputSchema,
+  timerStateSchema,
+  timerStopInputSchema,
+  timerSummary,
   csvImportFieldSchema,
   formatDocumentInstant,
   userSchema,
@@ -641,7 +662,7 @@ describe("taskSchema / createTaskInputSchema date pairing", () => {
   const base = {
     id: uuid1, title: "Draft proposal", description: null, type: "task" as const,
     status: "todo" as const, assigneeUserId: null, startDate: null, dueDate: null,
-    completedAt: null, progressPct: null, parentTaskId: null, position: "a0",
+    completedAt: null, progressPct: null, estimateMinutes: null, parentTaskId: null, position: "a0",
     companyId: null, contactId: null, dealId: null, projectId: null,
     archivedAt: null, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
   };
@@ -778,7 +799,7 @@ describe("ganttPayloadSchema", () => {
   const projectTask = {
     id: uuid1, title: "Design phase", description: null, type: "task" as const, status: "todo" as const,
     assigneeUserId: null, startDate: "2026-09-01", dueDate: "2026-09-05",
-    completedAt: null, progressPct: null, parentTaskId: null, position: "a0",
+    completedAt: null, progressPct: null, estimateMinutes: null, parentTaskId: null, position: "a0",
     companyId: null, contactId: null, dealId: null, projectId: uuid1,
     archivedAt: null, createdAt: now, updatedAt: now,
     projectName: "Website relaunch", projectColor: "#1a2b3c",
@@ -2727,6 +2748,968 @@ describe("formatDocumentInstant", () => {
     for (const bad of ["", "not a date", "2026-13-45T99:99:99Z"]) {
       expect(formatDocumentInstant(bad, "UTC"), bad).toBe("");
       expect(formatDocumentInstant(bad, "Factory"), bad).toBe("");
+    }
+  });
+});
+
+describe("time entries (Phase 10)", () => {
+  const id = randomUUID();
+
+  /**
+   * THE PREDICATE'S TRUTH TABLE, over all 32 subsets of the five links.
+   *
+   * `!= null` rather than truthiness, which is the trap this is really pinning:
+   * a `== null` written as `=== null` would count `undefined` as a link, and an
+   * absent key is precisely how a wire payload says "not this one". The api-side
+   * test in services/time-entries.test.ts runs the same 32 cases against the
+   * database, so the predicate and the CHECK are compared rather than trusted.
+   */
+  it("says at-least-one for every subset of the five links except the empty one", () => {
+    const links = ["companyId", "contactId", "dealId", "projectId", "taskId"] as const;
+    for (let mask = 0; mask < 32; mask += 1) {
+      const value: Record<string, string | null> = {};
+      for (const [i, link] of links.entries()) {
+        value[link] = (mask & (1 << i)) === 0 ? null : id;
+      }
+      expect(timeEntryAtLeastOneLink(value), `mask ${String(mask)}`).toBe(mask !== 0);
+    }
+    // An ABSENT key is not a link either -- the shape a create payload naming one
+    // record actually has.
+    expect(timeEntryAtLeastOneLink({})).toBe(false);
+    expect(timeEntryAtLeastOneLink({ projectId: id })).toBe(true);
+    expect(timeEntryAtLeastOneLink({ projectId: undefined })).toBe(false);
+  });
+
+  it("refuses a create with no link, naming all five in the message", () => {
+    const result = timeEntryCreateInputSchema.safeParse({
+      workDate: "2026-09-01", minutes: 60, billable: true,
+    });
+    expect(result.success).toBe(false);
+    const message = result.error?.issues[0]?.message ?? "";
+    for (const field of ["companyId", "contactId", "dealId", "projectId", "taskId"]) {
+      expect(message, `the refusal does not name ${field}`).toContain(field);
+    }
+  });
+
+  it("requires billable on create and leaves it optional on a patch", () => {
+    const withoutFlag = { workDate: "2026-09-01", minutes: 60, projectId: id };
+    expect(timeEntryCreateInputSchema.safeParse(withoutFlag).success).toBe(false);
+    expect(timeEntryCreateInputSchema.safeParse({ ...withoutFlag, billable: false }).success).toBe(true);
+    // A patch that does not mention it leaves it alone, which is what makes
+    // "required" a statement about CREATING an entry rather than about editing.
+    expect(timeEntryUpdateInputSchema.safeParse({ minutes: 30 }).success).toBe(true);
+  });
+
+  it("bounds minutes at one day, at the exact edge, and refuses a fraction", () => {
+    const base = { workDate: "2026-09-01", billable: true, projectId: id };
+    expect(MAX_TIME_ENTRY_MINUTES).toBe(1440);
+    expect(timeEntryCreateInputSchema.safeParse({ ...base, minutes: 1 }).success).toBe(true);
+    expect(timeEntryCreateInputSchema.safeParse({ ...base, minutes: MAX_TIME_ENTRY_MINUTES }).success)
+      .toBe(true);
+    expect(timeEntryCreateInputSchema.safeParse({ ...base, minutes: MAX_TIME_ENTRY_MINUTES + 1 }).success)
+      .toBe(false);
+    for (const minutes of [0, -1, 1.5]) {
+      expect(timeEntryCreateInputSchema.safeParse({ ...base, minutes }).success, String(minutes))
+        .toBe(false);
+    }
+  });
+
+  // A BARE DATE, and nothing that is merely date-shaped: an instant here would
+  // sail through and then be stored as whatever Postgres cast it to.
+  it("takes a date for the work date, not a timestamp", () => {
+    const base = { minutes: 60, billable: true, projectId: id };
+    expect(timeEntryCreateInputSchema.safeParse({ ...base, workDate: "2026-09-01" }).success).toBe(true);
+    for (const workDate of ["2026-09-01T09:00:00.000Z", "2026-9-1", "2026-09", "01/09/2026", ""]) {
+      expect(timeEntryCreateInputSchema.safeParse({ ...base, workDate }).success, workDate).toBe(false);
+    }
+  });
+
+  it("treats an empty description as no description at all", () => {
+    const base = { workDate: "2026-09-01", minutes: 60, billable: true, projectId: id };
+    // nullableString: null is a value, "" is not. The service trims and nulls a
+    // whitespace-only one; the schema is what refuses the empty string outright.
+    expect(timeEntryCreateInputSchema.safeParse({ ...base, description: null }).success).toBe(true);
+    expect(timeEntryCreateInputSchema.safeParse({ ...base, description: "" }).success).toBe(false);
+  });
+});
+
+describe("formatMinutes", () => {
+  it("writes a quantity of work the way the meetings rail already writes one", () => {
+    expect(formatMinutes(45)).toBe("45m");
+    expect(formatMinutes(60)).toBe("1h");
+    expect(formatMinutes(90)).toBe("1h 30m");
+    expect(formatMinutes(1440)).toBe("24h");
+  });
+
+  /**
+   * **ZERO IS "0m", AND IT IS NOT NOTHING.** `durationLabel` in the meetings rail
+   * answers null here, because a meeting nobody timed renders as no duration at
+   * all rather than as a zero-length meeting. A TIMESHEET's zero is the opposite:
+   * an empty week is a real answer and has to print as one, or the page that
+   * cannot decide between "no hours" and "no data" is the failure this phase is
+   * about. The two contracts differ, which is exactly why the rail's function
+   * keeps its own null branch and delegates only the formatting.
+   */
+  it("prints an empty total rather than nothing at all", () => {
+    expect(formatMinutes(0)).toBe("0m");
+  });
+});
+
+/**
+ * **THE READING LAYER'S ANSWER, AND THE SENTENCE THAT CANNOT LEAVE THE CAVEAT
+ * OUT.** Phase 10 Task 2. The spec's rule is that a meeting with no recorded
+ * length contributes nothing and that this must be VISIBLE -- "a report that
+ * silently treats unknown length as zero is the same failure in a smaller
+ * costume".
+ */
+describe("timesheetTotalsSchema", () => {
+  const totals = {
+    from: "2026-09-07", to: "2026-09-13", timeZone: "Europe/Amsterdam",
+    entryMinutes: 300, entryCount: 4, billableEntryMinutes: 180, billableEntryCount: 2,
+    meetingMinutes: 150, meetingsCounted: 3, meetingsUnmeasured: 2, meetingsNotYetOccurred: 1,
+    meetingsInRange: 6,
+    countedMinutes: 450,
+  };
+
+  it("parses a consistent answer", () => {
+    expect(timesheetTotalsSchema.parse(totals)).toEqual(totals);
+  });
+
+  /**
+   * **THE TOTAL IS REFUSED IF IT IS NOT THE SUM OF ITS HALVES.** A client that
+   * parses this shape cannot be handed a headline figure that disagrees with the
+   * two numbers printed underneath it -- the disagreement is a shape error rather
+   * than a page. This is the one number the whole phase exists to produce, so a
+   * wrong one arriving quietly is worse than no answer.
+   */
+  it("refuses a total that is not the entries plus the meetings", () => {
+    expect(timesheetTotalsSchema.safeParse({ ...totals, countedMinutes: 451 }).success).toBe(false);
+    expect(timesheetTotalsSchema.safeParse({ ...totals, entryMinutes: 299 }).success).toBe(false);
+    expect(timesheetTotalsSchema.safeParse({ ...totals, meetingMinutes: 0 }).success).toBe(false);
+  });
+
+  /**
+   * EVERY MEETING IN THE RANGE IS IN EXACTLY ONE BUCKET. Counted, unmeasured, or
+   * not yet happened -- and the three add up to the meetings the range contains.
+   * A meeting that fell out of all three would be an hour that vanished with
+   * nothing saying so, and one in two would be the double count this task exists
+   * to make impossible, arriving inside a single query.
+   */
+  it("refuses meeting buckets that do not account for every meeting in the range", () => {
+    expect(timesheetTotalsSchema.safeParse({ ...totals, meetingsInRange: 7 }).success).toBe(false);
+    expect(timesheetTotalsSchema.safeParse({ ...totals, meetingsUnmeasured: 1 }).success).toBe(false);
+    expect(timesheetTotalsSchema.safeParse({ ...totals, meetingsNotYetOccurred: 0 }).success).toBe(false);
+  });
+
+  it("refuses a range that runs backwards, and negative counts", () => {
+    expect(timesheetTotalsSchema.safeParse({ ...totals, from: "2026-09-20" }).success).toBe(false);
+    expect(timesheetTotalsSchema.safeParse({ ...totals, entryCount: -1 }).success).toBe(false);
+  });
+
+  it("accepts an empty week, which is zero hours rather than no answer", () => {
+    const empty = {
+      from: "2026-09-07", to: "2026-09-13", timeZone: "UTC",
+      entryMinutes: 0, entryCount: 0, billableEntryMinutes: 0, billableEntryCount: 0,
+      meetingMinutes: 0, meetingsCounted: 0, meetingsUnmeasured: 0, meetingsNotYetOccurred: 0,
+      meetingsInRange: 0, countedMinutes: 0,
+    };
+    expect(timesheetTotalsSchema.parse(empty)).toEqual(empty);
+  });
+});
+
+describe("timesheetSummary", () => {
+  const base = {
+    from: "2026-09-07", to: "2026-09-13", timeZone: "Europe/Amsterdam",
+    entryMinutes: 300, entryCount: 4, billableEntryMinutes: 180, billableEntryCount: 2,
+    meetingMinutes: 150, meetingsCounted: 3, meetingsUnmeasured: 0, meetingsNotYetOccurred: 0,
+    meetingsInRange: 3,
+    countedMinutes: 450,
+  };
+
+  it("says what was counted and where it came from", () => {
+    expect(timesheetSummary(base)).toBe(
+      "7h 30m counted from 2026-09-07 to 2026-09-13: 5h across 4 entries, "
+      + "and 2h 30m across 3 meetings.",
+    );
+  });
+
+  /**
+   * **THIS IS THE WHOLE POINT OF THE FUNCTION.** The uncounted meetings are part
+   * of the same string as the total, so there is no way to render the figure
+   * without them: a page cannot drop a clause it never had. Task 4 renders this
+   * sentence -- a page that prints `countedMinutes` on its own is the failure the
+   * spec names, and the field is called `countedMinutes` rather than
+   * `totalMinutes` so that such a page reads as a lie in its own source.
+   */
+  it("names the meetings it could not count, in the same sentence as the total", () => {
+    expect(timesheetSummary({
+      ...base, meetingsUnmeasured: 2, meetingsNotYetOccurred: 1, meetingsInRange: 6,
+    })).toBe(
+      "7h 30m counted from 2026-09-07 to 2026-09-13: 5h across 4 entries, "
+      + "and 2h 30m across 3 meetings. Not counted: 2 meetings with no recorded length, "
+      + "and 1 meeting that has not happened yet.",
+    );
+  });
+
+  it("names only the kind of uncounted meeting it actually has", () => {
+    expect(timesheetSummary({ ...base, meetingsUnmeasured: 1, meetingsInRange: 4 }))
+      .toMatch(/Not counted: 1 meeting with no recorded length\.$/);
+    expect(timesheetSummary({ ...base, meetingsNotYetOccurred: 2, meetingsInRange: 5 }))
+      .toMatch(/Not counted: 2 meetings that have not happened yet\.$/);
+  });
+
+  it("reads as a real sentence when a week is empty", () => {
+    expect(timesheetSummary({
+      from: "2026-09-07", to: "2026-09-13", timeZone: "UTC",
+      entryMinutes: 0, entryCount: 0, billableEntryMinutes: 0, billableEntryCount: 0,
+      meetingMinutes: 0, meetingsCounted: 0, meetingsUnmeasured: 0, meetingsNotYetOccurred: 0,
+      meetingsInRange: 0, countedMinutes: 0,
+    })).toBe(
+      "0m counted from 2026-09-07 to 2026-09-13: 0m across 0 entries, and 0m across 0 meetings.",
+    );
+  });
+
+  /**
+   * DERIVED FROM THE VALUE, NOT FROM A SECOND COPY OF IT: every figure in the
+   * sentence has to move when the totals move, or the prose becomes the stale
+   * half of a pair. Walked rather than asserted case by case, on the export
+   * summary's precedent.
+   */
+  it("carries every figure it was given", () => {
+    const totals = {
+      ...base, entryMinutes: 65, entryCount: 1, meetingMinutes: 25, meetingsCounted: 1,
+      meetingsUnmeasured: 3, meetingsNotYetOccurred: 4, meetingsInRange: 8, countedMinutes: 90,
+    };
+    const sentence = timesheetSummary(totals);
+    for (const fragment of ["1h 30m", "1h 5m", "1 entry", "25m", "1 meeting", "3 meetings", "4 meetings"]) {
+      expect(sentence, fragment).toContain(fragment);
+    }
+  });
+});
+
+/* ========================================================================== *
+ *  The billable split, the filters and the rows (Phase 10 Task 4)
+ * ========================================================================== */
+
+describe("timesheetTotalsSchema: the billable split", () => {
+  const totals = {
+    from: "2026-09-07", to: "2026-09-13", timeZone: "Europe/Amsterdam",
+    entryMinutes: 300, entryCount: 4, billableEntryMinutes: 180, billableEntryCount: 2,
+    meetingMinutes: 150, meetingsCounted: 3, meetingsUnmeasured: 0, meetingsNotYetOccurred: 0,
+    meetingsInRange: 3,
+    countedMinutes: 450,
+  };
+
+  /**
+   * **A SPLIT CANNOT EXCEED THE THING IT SPLITS**, on either axis. The mistake
+   * this catches is a FILTER over the wrong population -- the billable figure
+   * summed before the range or the record filter was applied -- and it is wrong
+   * in the direction nobody checks, because with invoicing out of the product
+   * nothing downstream ever contradicts a chargeable-hours figure.
+   */
+  it("refuses a billable half larger than the entries it is a half of", () => {
+    expect(timesheetTotalsSchema.safeParse({ ...totals, billableEntryMinutes: 301 }).success)
+      .toBe(false);
+    expect(timesheetTotalsSchema.safeParse({ ...totals, billableEntryCount: 5 }).success).toBe(false);
+    // The edges are legal: a week where everything, or nothing, was billable.
+    expect(timesheetTotalsSchema.safeParse({
+      ...totals, billableEntryMinutes: 300, billableEntryCount: 4,
+    }).success).toBe(true);
+    expect(timesheetTotalsSchema.safeParse({
+      ...totals, billableEntryMinutes: 0, billableEntryCount: 0,
+    }).success).toBe(true);
+  });
+
+  /** The billable minutes are NOT part of the headline's arithmetic: the total
+   * is entries plus meetings, and the split is a reading of one of those halves.
+   * A schema that added it in would refuse every honest week. */
+  it("leaves the headline's arithmetic alone", () => {
+    expect(timesheetTotalsSchema.parse(totals).countedMinutes).toBe(450);
+  });
+});
+
+describe("timesheetBillableSummary", () => {
+  const base = {
+    from: "2026-09-07", to: "2026-09-13", timeZone: "Europe/Amsterdam",
+    entryMinutes: 300, entryCount: 4, billableEntryMinutes: 180, billableEntryCount: 2,
+    meetingMinutes: 150, meetingsCounted: 3, meetingsUnmeasured: 0, meetingsNotYetOccurred: 0,
+    meetingsInRange: 3,
+    countedMinutes: 450,
+  };
+
+  /**
+   * **THE MEETINGS CLAUSE IS THE POINT.** "3h billable" printed beside a 7h 30m
+   * week invites `7h 30m - 3h = 4h 30m non-billable`, which is wrong by exactly
+   * the meetings -- they have no billable column and are in neither half. One
+   * string is what stops a page rendering the figure without the reason it does
+   * not subtract, which is `timesheetSummary`'s arrangement and its reason.
+   */
+  it("says what is billable and what is in neither figure", () => {
+    expect(timesheetBillableSummary(base)).toBe(
+      "3h of the 5h logged by hand is billable, across 2 entries. Meetings carry no billable "
+      + "flag, so the 2h 30m from meetings is in neither figure.",
+    );
+  });
+
+  it("drops the meetings clause on a week with no meetings in it", () => {
+    expect(timesheetBillableSummary({
+      ...base, meetingMinutes: 0, meetingsCounted: 0, meetingsInRange: 0, countedMinutes: 300,
+    })).toBe("3h of the 5h logged by hand is billable, across 2 entries.");
+  });
+
+  /** NOT "0m of 0m is billable", which reads as a finding about the week rather
+   * than as there being nothing to split. `formatMinutes`' own rule one level up:
+   * an empty week is a real answer and has to read like one. */
+  it("says there is nothing to split rather than splitting nothing", () => {
+    const quiet = {
+      ...base, entryMinutes: 0, entryCount: 0, billableEntryMinutes: 0, billableEntryCount: 0,
+      countedMinutes: 150,
+    };
+    expect(timesheetBillableSummary(quiet)).toBe(
+      "Nothing was logged by hand, so there is no billable split. Meetings carry no billable "
+      + "flag, so the 2h 30m from meetings is in neither figure.",
+    );
+  });
+
+  it("says 1 entry rather than 1 entries", () => {
+    expect(timesheetBillableSummary({ ...base, billableEntryMinutes: 60, billableEntryCount: 1 }))
+      .toContain("across 1 entry.");
+  });
+
+  /** DERIVED FROM THE VALUE, not from a second copy of it: every figure moves
+   * when the totals move, or the prose becomes the stale half of a pair. */
+  it("carries every figure it was given", () => {
+    const sentence = timesheetBillableSummary({
+      ...base, entryMinutes: 125, entryCount: 3, billableEntryMinutes: 65, billableEntryCount: 2,
+      meetingMinutes: 90, countedMinutes: 215,
+    });
+    for (const fragment of ["1h 5m", "2h 5m", "2 entries", "1h 30m"]) {
+      expect(sentence, fragment).toContain(fragment);
+    }
+  });
+});
+
+/**
+ * **THE FILTER CONTRACT, AND THE FIFTH LINK THAT IS DELIBERATELY NOT IN IT.**
+ *
+ * `time_entries` carries five record links and this carries four. That is a
+ * decision with a reason -- `meetings` has no `task_id`, so a task-filtered
+ * report would answer "0m across 0 meetings" for structural reasons a page could
+ * not explain, and `GET /api/tasks/:id/effort` already answers the question
+ * against the task's estimate. This test is the pin: adding `taskId` should cost
+ * a failing test and an argument, not pass unnoticed.
+ */
+describe("timesheetFiltersSchema", () => {
+  it("takes the four records both halves of the report have in common", () => {
+    const id = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+    expect(timesheetFiltersSchema.parse({ projectId: id })).toEqual({ projectId: id });
+    expect(Object.keys(timesheetFiltersSchema.shape).sort())
+      .toEqual(["companyId", "contactId", "dealId", "projectId"]);
+  });
+
+  it("accepts no filter at all -- an unfiltered week is the ordinary case", () => {
+    expect(timesheetFiltersSchema.parse({})).toEqual({});
+  });
+
+  it("refuses an id that is not one", () => {
+    expect(timesheetFiltersSchema.safeParse({ companyId: "acme" }).success).toBe(false);
+  });
+});
+
+describe("MAX_TIMESHEET_DAY_SPAN", () => {
+  /** Pinned because routes/timesheet.ts refuses a longer span with a 400 whose
+   * message quotes it, and because the bound exists on the ROWS endpoint alone
+   * -- the aggregate's answer is the same size for a decade as for a day. */
+  it("is a quarter, and bounds the rows endpoint rather than the aggregate", () => {
+    expect(MAX_TIMESHEET_DAY_SPAN).toBe(92);
+  });
+});
+
+describe("timesheetRowSchema", () => {
+  const entryRow = {
+    kind: "entry" as const, id: "3f2504e0-4f89-41d3-9a0c-0305e82c3301", day: "2026-09-08",
+    minutes: 90, label: "Wrote the thing", billable: true, counted: true,
+    uncountedReason: null, links: [],
+  };
+  const meetingRow = {
+    kind: "meeting" as const, id: "3f2504e0-4f89-41d3-9a0c-0305e82c3302", day: "2026-09-08",
+    minutes: null, label: "Corridor", billable: null, counted: false,
+    uncountedReason: "no-recorded-length" as const, links: [],
+  };
+
+  it("parses an entry and a meeting", () => {
+    expect(timesheetRowSchema.parse(entryRow)).toEqual(entryRow);
+    expect(timesheetRowSchema.parse(meetingRow)).toEqual(meetingRow);
+    expect(timesheetRowSchema.parse({ ...meetingRow, minutes: 45, counted: true, uncountedReason: null }))
+      .toMatchObject({ counted: true });
+  });
+
+  /**
+   * **A ROW EITHER COUNTED OR SAYS WHY NOT.** A row that did neither would be
+   * rendered as counted while the headline excluded it -- a list disagreeing with
+   * the total above it, which is the one outcome this surface may not produce.
+   */
+  it("refuses a row that is uncounted for no stated reason, or counted with one", () => {
+    expect(timesheetRowSchema.safeParse({ ...meetingRow, uncountedReason: null }).success)
+      .toBe(false);
+    expect(timesheetRowSchema.safeParse({ ...entryRow, uncountedReason: "not-yet-happened" }).success)
+      .toBe(false);
+  });
+
+  /** An entry always has minutes and a flag: `minutes` is NOT NULL and forbidden
+   * to be zero, and `billable` has no default. A meeting never has the flag --
+   * `false` there would be a claim nobody made. */
+  it("keeps the two kinds' fields apart", () => {
+    expect(timesheetRowSchema.safeParse({ ...entryRow, minutes: null }).success).toBe(false);
+    expect(timesheetRowSchema.safeParse({ ...entryRow, billable: null }).success).toBe(false);
+    expect(timesheetRowSchema.safeParse({ ...meetingRow, billable: false }).success).toBe(false);
+    expect(timesheetRowSchema.safeParse({ ...entryRow, minutes: 0 }).success).toBe(false);
+  });
+
+  /** THE BUCKET MUST MATCH THE VALUE IT DESCRIBES. A meeting with a duration
+   * claiming "no recorded length" is a bucket that has drifted from the column;
+   * a future meeting WITH a duration is ordinary and stays legal. */
+  it("only lets a meeting with no minutes be uncounted for having none", () => {
+    expect(timesheetRowSchema.safeParse({
+      ...meetingRow, minutes: 45, uncountedReason: "no-recorded-length",
+    }).success).toBe(false);
+    expect(timesheetRowSchema.safeParse({
+      ...meetingRow, minutes: 45, uncountedReason: "not-yet-happened",
+    }).success).toBe(true);
+    expect(timesheetRowSchema.safeParse({
+      ...meetingRow, minutes: null, uncountedReason: "not-yet-happened",
+    }).success).toBe(true);
+  });
+
+  it("carries the records a row names, already readable", () => {
+    const links = [
+      { kind: "project" as const, id: "3f2504e0-4f89-41d3-9a0c-0305e82c3303", label: "Rollout" },
+    ];
+    expect(timesheetRowSchema.parse({ ...entryRow, links }).links).toEqual(links);
+  });
+});
+
+describe("timesheetWeekSchema", () => {
+  const row = {
+    kind: "entry" as const, id: "3f2504e0-4f89-41d3-9a0c-0305e82c3301", day: "2026-09-08",
+    minutes: 90, label: null, billable: true, counted: true, uncountedReason: null, links: [],
+  };
+  const week = {
+    from: "2026-09-07", to: "2026-09-13", timeZone: "Europe/Amsterdam",
+    days: [
+      { day: "2026-09-07", countedMinutes: 0, rows: [] },
+      { day: "2026-09-08", countedMinutes: 90, rows: [row] },
+    ],
+  };
+
+  it("parses a week whose days add up", () => {
+    expect(timesheetWeekSchema.parse(week)).toEqual(week);
+  });
+
+  /**
+   * **A DAY'S FIGURE IS ITS OWN ROWS, AND THE SCHEMA IS WHERE THAT IS HELD.**
+   * The service sums it; this refuses the payload if it stopped agreeing. An
+   * uncounted row contributes nothing, which is the whole reason a day figure and
+   * a row count are different questions.
+   */
+  it("refuses a day whose figure is not the rows it holds", () => {
+    expect(timesheetWeekSchema.safeParse({
+      ...week, days: [week.days[0], { day: "2026-09-08", countedMinutes: 120, rows: [row] }],
+    }).success).toBe(false);
+    // An unmeasured meeting adds nothing, so a day of one is 0 minutes and not
+    // an inconsistency.
+    expect(timesheetWeekSchema.safeParse({
+      ...week,
+      days: [{
+        day: "2026-09-08", countedMinutes: 0,
+        rows: [{
+          kind: "meeting", id: "3f2504e0-4f89-41d3-9a0c-0305e82c3302", day: "2026-09-08",
+          minutes: null, label: "Corridor", billable: null, counted: false,
+          uncountedReason: "no-recorded-length", links: [],
+        }],
+      }],
+    }).success).toBe(true);
+  });
+
+  /** A ROW ON A DAY THE WEEK DOES NOT CONTAIN is the shape a time-zone slip
+   * produces: a meeting counted by the aggregate and rendered under a heading
+   * nobody asked for. */
+  it("refuses a day outside its own range, days out of order, and a misfiled row", () => {
+    expect(timesheetWeekSchema.safeParse({
+      ...week, days: [...week.days, { day: "2026-09-20", countedMinutes: 0, rows: [] }],
+    }).success).toBe(false);
+    expect(timesheetWeekSchema.safeParse({
+      ...week, days: [week.days[1], week.days[0]],
+    }).success).toBe(false);
+    expect(timesheetWeekSchema.safeParse({
+      ...week,
+      days: [
+        week.days[0],
+        { day: "2026-09-08", countedMinutes: 90, rows: [{ ...row, day: "2026-09-09" }] },
+      ],
+    }).success).toBe(false);
+  });
+
+  it("refuses a range that runs backwards", () => {
+    expect(timesheetWeekSchema.safeParse({ ...week, from: "2026-09-20" }).success).toBe(false);
+  });
+});
+
+/* ========================================================================== *
+ *  The estimate, and booked versus estimated (Phase 10 Task 3)
+ * ========================================================================== */
+
+describe("MAX_TASK_ESTIMATE_MINUTES", () => {
+  /**
+   * **THE VALUE, PINNED, BECAUSE THE MIGRATION CARRIES THE LITERAL.**
+   * `tasks_estimate_range` in 0022 says 525600 in SQL and this constant says
+   * `365 * 24 * 60`; nothing makes them the same number except this assertion and
+   * the schema test that probes the CHECK's own edges. MAX_TIME_ENTRY_MINUTES'
+   * arrangement.
+   */
+  it("is one year of wall-clock minutes, the number the CHECK carries", () => {
+    expect(MAX_TASK_ESTIMATE_MINUTES).toBe(525600);
+  });
+
+  /**
+   * **IT IS NOT `MAX_TIME_ENTRY_MINUTES`, AND THE DIFFERENCE IS THE ARGUMENT.**
+   * An entry's day-long bound is definitional -- `work_date` is one day. A task
+   * has no such day: its dates are a span, and the Gantt draws a bar across it,
+   * so the same bound here would refuse true rows in bulk. If somebody ever
+   * "tidies" these into one constant, this is what says no.
+   */
+  it("is not the entry bound, because a task is not a day", () => {
+    expect(MAX_TASK_ESTIMATE_MINUTES).toBeGreaterThan(MAX_TIME_ENTRY_MINUTES);
+    expect(MAX_TASK_ESTIMATE_MINUTES % MAX_TIME_ENTRY_MINUTES).toBe(0);
+    expect(MAX_TASK_ESTIMATE_MINUTES / MAX_TIME_ENTRY_MINUTES).toBe(365);
+  });
+});
+
+describe("taskSchema's estimate", () => {
+  const base = {
+    id: uuid1, title: "Draft proposal", description: null, type: "task" as const,
+    status: "todo" as const, assigneeUserId: null, startDate: null, dueDate: null,
+    completedAt: null, progressPct: null, estimateMinutes: null, parentTaskId: null, position: "a0",
+    companyId: null, contactId: null, dealId: null, projectId: null,
+    archivedAt: null, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+  };
+
+  it("accepts the exact edges of the range the database enforces", () => {
+    for (const estimateMinutes of [1, MAX_TASK_ESTIMATE_MINUTES]) {
+      expect(taskSchema.parse({ ...base, estimateMinutes }).estimateMinutes).toBe(estimateMinutes);
+    }
+  });
+
+  /**
+   * **ZERO IS REFUSED, AND THAT IS THE HALF PEOPLE ASSUME IS PERMISSIVE.** `null`
+   * already spells "nobody has estimated this"; a zero would be a second spelling
+   * of one absence, and the one that reads as a CLAIM -- an estimate of no work,
+   * against which the first minute booked is infinitely over.
+   */
+  it("refuses a zero, a negative and a fraction, because null is the only 'not estimated'", () => {
+    for (const estimateMinutes of [0, -1, 90.5]) {
+      expect(() => taskSchema.parse({ ...base, estimateMinutes }), String(estimateMinutes)).toThrow();
+    }
+    expect(taskSchema.parse({ ...base, estimateMinutes: null }).estimateMinutes).toBeNull();
+  });
+
+  /**
+   * **THE CEILING IS THE ONE `meetings.duration_minutes` HAS NOT GOT.** Task 2
+   * recorded what that costs: `z.number().int().positive()` accepts 999,999,999
+   * and one such row dominates a week. It cannot be tightened there without
+   * making the client refuse to parse rows that already exist; it is bounded here
+   * because this column shipped empty.
+   */
+  it("refuses the figure that dominates a total, on the wire and not only in the database", () => {
+    expect(() => taskSchema.parse({ ...base, estimateMinutes: 999999999 })).toThrow();
+    expect(() => createTaskInputSchema.parse({ title: "x", estimateMinutes: 999999999 })).toThrow();
+    expect(() => updateTaskInputSchema.parse({ estimateMinutes: MAX_TASK_ESTIMATE_MINUTES + 1 })).toThrow();
+  });
+
+  it("takes an estimate on create, and lets a patch clear one", () => {
+    expect(createTaskInputSchema.parse({ title: "x", estimateMinutes: 240 }).estimateMinutes).toBe(240);
+    expect(updateTaskInputSchema.parse({ estimateMinutes: null }).estimateMinutes).toBeNull();
+    // Absent means "leave it alone", which must stay distinguishable from null.
+    expect("estimateMinutes" in updateTaskInputSchema.parse({ title: "x" })).toBe(false);
+  });
+});
+
+describe("taskEffortSchema", () => {
+  const base = { taskId: uuid1, estimateMinutes: 240, bookedMinutes: 90, entryCount: 2 };
+
+  it("accepts a task with an estimate and hours booked against it", () => {
+    expect(taskEffortSchema.parse(base)).toEqual(base);
+  });
+
+  it("accepts nothing booked and no estimate, which is every task before v1.9.0", () => {
+    const empty = { taskId: uuid1, estimateMinutes: null, bookedMinutes: 0, entryCount: 0 };
+    expect(taskEffortSchema.parse(empty)).toEqual(empty);
+  });
+
+  /**
+   * **THE MINUTES AND THEIR COUNT MUST BE THE SAME POPULATION.** Every live entry
+   * has `minutes > 0` (`time_entries_minutes_range`), so minutes without entries
+   * or entries without minutes means the sum and the count came out of different
+   * queries -- which is exactly the drift Task 2 wrote one predicate to make
+   * unspellable in the timesheet's aggregate.
+   */
+  it("refuses minutes with no entries, and entries with no minutes", () => {
+    expect(() => taskEffortSchema.parse({ ...base, entryCount: 0 })).toThrow(/same population|zero together/);
+    expect(() => taskEffortSchema.parse({ ...base, bookedMinutes: 0 })).toThrow(/zero together/);
+  });
+
+  it("refuses an estimate the database would refuse", () => {
+    expect(() => taskEffortSchema.parse({ ...base, estimateMinutes: 0 })).toThrow();
+    expect(() => taskEffortSchema.parse({ ...base, estimateMinutes: 999999999 })).toThrow();
+  });
+});
+
+describe("taskEffortSummary", () => {
+  const base = { taskId: uuid1, estimateMinutes: 240, bookedMinutes: 90, entryCount: 2 };
+
+  it("puts the booked total, the estimate and the gap in one sentence", () => {
+    expect(taskEffortSummary(base)).toBe(
+      "1h 30m booked across 2 entries, against an estimate of 4h: 2h 30m left.",
+    );
+  });
+
+  it("says how far over, rather than going quiet once the estimate is passed", () => {
+    expect(taskEffortSummary({ ...base, bookedMinutes: 300, entryCount: 5 })).toBe(
+      "5h booked across 5 entries, against an estimate of 4h: 1h over.",
+    );
+  });
+
+  it("says so when the two are equal, rather than reading as 0m of something", () => {
+    expect(taskEffortSummary({ ...base, bookedMinutes: 240, entryCount: 3 })).toBe(
+      "4h booked across 3 entries, against an estimate of 4h: exactly on the estimate.",
+    );
+  });
+
+  /**
+   * **AN ESTIMATE ON A TASK NOBODY HAS STARTED IS REPORTED IN FULL, AND THIS IS
+   * THE TEST THAT SAYS SO.** Nothing in this function asks about status, dates or
+   * progress. Task 2 excluded meetings that have not happened because the
+   * timesheet sums time that HAPPENED and an arranged meeting is a plan -- but an
+   * estimate never claims anything happened, so "has it started" is not a
+   * question it has to answer. And a task estimated at four hours with nothing
+   * booked is the most informative row this comparison produces.
+   */
+  it("reports an estimate with nothing booked against it, and names the whole gap", () => {
+    expect(taskEffortSummary({ ...base, bookedMinutes: 0, entryCount: 0 })).toBe(
+      "No time booked yet, against an estimate of 4h: 4h left.",
+    );
+  });
+
+  it("is still a sentence for a task with neither an estimate nor an hour", () => {
+    expect(taskEffortSummary({
+      taskId: uuid1, estimateMinutes: null, bookedMinutes: 0, entryCount: 0,
+    })).toBe("No time booked yet, and no estimate.");
+  });
+
+  it("reports hours booked against no estimate without inventing one", () => {
+    const sentence = taskEffortSummary({
+      taskId: uuid1, estimateMinutes: null, bookedMinutes: 65, entryCount: 1,
+    });
+    expect(sentence).toBe("1h 5m booked across 1 entry, and no estimate.");
+    expect(sentence).not.toContain("0");
+  });
+
+  /**
+   * DERIVED FROM THE VALUE RATHER THAN FROM A SECOND COPY OF IT -- timesheetSummary's
+   * own guard, walked the same way: every figure has to move when the numbers move,
+   * or the prose is the stale half of a pair.
+   */
+  it("carries every figure it was given", () => {
+    const sentence = taskEffortSummary({
+      taskId: uuid1, estimateMinutes: 61, bookedMinutes: 1, entryCount: 1,
+    });
+    for (const fragment of ["1m booked", "1 entry", "1h 1m", "1h left"]) {
+      expect(sentence, fragment).toContain(fragment);
+    }
+  });
+});
+
+/* -------------------------------------------------------------------------- *
+ *  The timer (Phase 10 Task 5)
+ * -------------------------------------------------------------------------- */
+
+describe("timerElapsedMinutes", () => {
+  const start = new Date("2026-09-07T09:00:00.000Z");
+  const at = (ms: number) => new Date(start.getTime() + ms);
+
+  // FLOORED, NEVER ROUNDED, which is `formatMinutes`' own rule one function
+  // over: a timer stopped at 1m59s has not produced two minutes of work, and a
+  // proposal an operator accepts without reading must never be larger than the
+  // clock actually ran.
+  it("floors to whole minutes rather than rounding", () => {
+    expect(timerElapsedMinutes(start, at(0))).toBe(0);
+    expect(timerElapsedMinutes(start, at(59_999))).toBe(0);
+    expect(timerElapsedMinutes(start, at(60_000))).toBe(1);
+    expect(timerElapsedMinutes(start, at(119_999))).toBe(1);
+    expect(timerElapsedMinutes(start, at(90 * 60_000))).toBe(90);
+  });
+
+  // A DEVICE CLOCK THAT DISAGREES WITH THE SERVER'S IS THE ORDINARY CASE, not a
+  // fault: `started_at` is stamped by Postgres and the strip ticks against the
+  // browser, so a phone a few seconds behind would otherwise render a negative
+  // duration -- `formatMinutes(-1)` reads "-1h 59m".
+  it("clamps a clock that is behind the start to nought", () => {
+    expect(timerElapsedMinutes(start, at(-1))).toBe(0);
+    expect(timerElapsedMinutes(start, at(-86_400_000))).toBe(0);
+  });
+
+  it("counts a weekend in minutes without saturating", () => {
+    expect(timerElapsedMinutes(start, at(62 * 60 * 60_000))).toBe(62 * 60);
+  });
+});
+
+describe("timerProposedMinutes", () => {
+  /**
+   * **ONE RULE, AND IT COVERS BOTH ENDS OF THE FEATURE'S RISK.** The proposal is
+   * withheld exactly when the elapsed figure is not a storable number of
+   * minutes -- under one (`time_entries_minutes_range` forbids zero) and over a
+   * day (MAX_TIME_ENTRY_MINUTES, which is one day because `work_date` is one
+   * day). The weekend the spec is about and the mis-tap that ran for nine
+   * seconds are the same refusal seen from two sides, which is why this is one
+   * function rather than a threshold each.
+   */
+  it("offers the elapsed figure only while it is a storable number of minutes", () => {
+    expect(timerProposedMinutes(0)).toBeNull();
+    expect(timerProposedMinutes(1)).toBe(1);
+    expect(timerProposedMinutes(125)).toBe(125);
+    expect(timerProposedMinutes(MAX_TIME_ENTRY_MINUTES)).toBe(MAX_TIME_ENTRY_MINUTES);
+    expect(timerProposedMinutes(MAX_TIME_ENTRY_MINUTES + 1)).toBeNull();
+    expect(timerProposedMinutes(62 * 60)).toBeNull();
+  });
+});
+
+describe("timerSummary", () => {
+  const startedAt = "2026-09-04T07:00:00.000Z";
+  const projectId = randomUUID();
+  const timer = {
+    id: randomUUID(),
+    startedAt,
+    description: "Rewrite the ingest",
+    companyId: null, contactId: null, dealId: null,
+    projectId, taskId: null,
+    workDate: "2026-09-04",
+    links: [{ kind: "project" as const, id: projectId, label: "Rollout" }],
+    createdAt: startedAt, updatedAt: startedAt,
+  };
+  const after = (minutes: number) =>
+    new Date(new Date(startedAt).getTime() + minutes * 60_000);
+
+  it("says how long it has run and that nothing is counted yet", () => {
+    const sentence = timerSummary(timer, after(126));
+    expect(sentence).toContain("2h 6m");
+    expect(sentence).toContain("nothing is counted");
+  });
+
+  /**
+   * **THE WEEKEND, WHICH THE SPEC CALLS THE COMMON FAILURE RATHER THAN AN EDGE
+   * CASE.** The sentence has to do three things at once: say the figure, say why
+   * it cannot be logged, and say what the operator's two ways out are. A page
+   * that printed the elapsed time on its own would be offering a number the
+   * database will refuse.
+   */
+  it("withdraws the figure as a proposal once it is longer than one entry can hold", () => {
+    const sentence = timerSummary(timer, after(62 * 60 + 14));
+    expect(sentence).toContain("62h 14m");
+    expect(sentence).toContain(formatMinutes(MAX_TIME_ENTRY_MINUTES));
+    expect(sentence).toMatch(/how long you actually worked/);
+    expect(sentence).toMatch(/discard/);
+    // And it must NOT read as an offer to save what the clock says.
+    expect(sentence).not.toMatch(/Stopping it logs/);
+  });
+
+  it("says there is nothing to log yet under a minute", () => {
+    const sentence = timerSummary(timer, after(0));
+    expect(sentence).toMatch(/less than a minute/);
+    expect(sentence).toMatch(/at least one minute/);
+    expect(sentence).not.toContain("0m");
+  });
+
+  /**
+   * **THE ONE CLAUSE ALL THREE BRANCHES HAVE TO CARRY, AND THE E2E IS WHAT
+   * CAUGHT IT MISSING.**
+   *
+   * "Nothing is counted until you stop it" is true regardless of how long the
+   * clock has run, and the strip sits on /timesheet as well as on every other
+   * route -- so a branch without it leaves a screen reading "0m counted" beside a
+   * running stopwatch with nothing saying why, which is Task 2's "excluded in
+   * silence" at a new cause.
+   *
+   * **THE UNDER-A-MINUTE BRANCH SHIPPED WITHOUT IT.** The three tests above each
+   * assert their own branch's own words and not one of them asserted the thing
+   * all three must say, so the whole file was green; `e2e/timer.spec.ts` reads
+   * the strip a second after starting a timer, which is the only place that
+   * branch is on a screen, and it failed there. This is the invariant, tested as
+   * an invariant.
+   */
+  it("says nothing is counted, in every branch, however long the clock has run", () => {
+    for (const minutes of [0, 1, 126, MAX_TIME_ENTRY_MINUTES, MAX_TIME_ENTRY_MINUTES + 1, 62 * 60]) {
+      expect(timerSummary(timer, after(minutes)), `after ${String(minutes)} minutes`)
+        .toMatch(/othing is counted/);
+    }
+  });
+
+  // THE EXACT EDGES, because "longer than a day" is the whole recovery branch
+  // and an off-by-one here either refuses a legal 24h entry or offers an illegal
+  // one.
+  it("changes its mind at exactly the bound and nowhere else", () => {
+    expect(timerSummary(timer, after(MAX_TIME_ENTRY_MINUTES))).toContain("Stopping it logs");
+    expect(timerSummary(timer, after(MAX_TIME_ENTRY_MINUTES + 1))).not.toContain("Stopping it logs");
+    expect(timerSummary(timer, after(1))).toContain("Stopping it logs");
+    expect(timerSummary(timer, after(0))).not.toContain("Stopping it logs");
+  });
+});
+
+describe("timerStartInputSchema", () => {
+  const id = randomUUID();
+
+  /**
+   * **A TIMER THAT COULD NOT BECOME AN ENTRY CANNOT BE STARTED**, which is where
+   * the at-least-one rule has to bite for the timer path. Refusing it at STOP
+   * would put the refusal in front of an operator already recovering from a
+   * forgotten weekend, holding hours they cannot save; refusing it at START
+   * costs them one tap while they are looking at the picker.
+   */
+  it("refuses a timer attached to nothing, naming all five links", () => {
+    const result = timerStartInputSchema.safeParse({});
+    expect(result.success).toBe(false);
+    const message = result.error?.issues[0]?.message ?? "";
+    for (const field of ["companyId", "contactId", "dealId", "projectId", "taskId"]) {
+      expect(message, `the refusal does not name ${field}`).toContain(field);
+    }
+    expect(timerStartInputSchema.safeParse({ projectId: id }).success).toBe(true);
+  });
+
+  // NO `billable`, NO `minutes` AND NO `workDate` ON THE WIRE. Each is answered
+  // somewhere else and by somebody else: the flag at stop (it has no default
+  // anywhere in this phase), the minutes at stop (the clock proposes, the
+  // operator states), and the day by the server out of `started_at`.
+  it("takes no duration, no day and no billable flag", () => {
+    const parsed = timerStartInputSchema.parse({
+      projectId: id, minutes: 60, billable: true, workDate: "2026-09-01",
+    });
+    expect(parsed).not.toHaveProperty("minutes");
+    expect(parsed).not.toHaveProperty("billable");
+    expect(parsed).not.toHaveProperty("workDate");
+  });
+
+  it("treats an empty description as no description at all", () => {
+    expect(timerStartInputSchema.safeParse({ projectId: id, description: null }).success).toBe(true);
+    expect(timerStartInputSchema.safeParse({ projectId: id, description: "" }).success).toBe(false);
+  });
+});
+
+describe("timerStopInputSchema", () => {
+  /**
+   * **THE OPERATOR STATES THE MINUTES; THE CLOCK ONLY PROPOSED THEM.** The field
+   * is required rather than defaulted to the elapsed time, and that is the
+   * recovery interaction expressed as a schema: a default would have to be
+   * computed on the server, and for the 62-hour timer the only figure it could
+   * compute is one the database refuses.
+   */
+  it("requires the minutes and the billable flag, and bounds the minutes like an entry", () => {
+    expect(timerStopInputSchema.safeParse({ billable: true }).success).toBe(false);
+    expect(timerStopInputSchema.safeParse({ minutes: 30 }).success).toBe(false);
+    expect(timerStopInputSchema.safeParse({ minutes: 30, billable: false }).success).toBe(true);
+    expect(timerStopInputSchema.safeParse({ minutes: 0, billable: false }).success).toBe(false);
+    expect(
+      timerStopInputSchema.safeParse({ minutes: MAX_TIME_ENTRY_MINUTES, billable: false }).success,
+    ).toBe(true);
+    expect(
+      timerStopInputSchema.safeParse({ minutes: MAX_TIME_ENTRY_MINUTES + 1, billable: false }).success,
+    ).toBe(false);
+    expect(timerStopInputSchema.safeParse({ minutes: 1.5, billable: false }).success).toBe(false);
+  });
+
+  // The links are the TIMER'S and are not re-stated at stop: they were chosen
+  // when the operator started the clock, and they are corrected on the entry
+  // afterwards, on the page that already edits entries.
+  it("carries no links", () => {
+    const parsed = timerStopInputSchema.parse({
+      minutes: 30, billable: true, projectId: randomUUID(),
+    });
+    expect(parsed).not.toHaveProperty("projectId");
+  });
+});
+
+describe("timerStateSchema", () => {
+  const linkedProject = randomUUID();
+  const base = {
+    id: randomUUID(), startedAt: "2026-09-04T07:00:00.000Z", description: null,
+    companyId: null, contactId: null, dealId: null, projectId: linkedProject, taskId: null,
+    links: [{ kind: "project" as const, id: linkedProject, label: "Rollout" }],
+    createdAt: "2026-09-04T07:00:00.000Z", updatedAt: "2026-09-04T07:00:00.000Z",
+  };
+
+  it("admits an install with no timer running", () => {
+    expect(timerStateSchema.parse({ timer: null, timeZone: "Europe/Amsterdam" }).timer).toBeNull();
+  });
+
+  // `workDate` IS A DAY THE SERVER DECIDED, not one the client derives: it comes
+  // out of `started_at` read in the ORGANISATION's calendar, so a phone in
+  // another zone cannot put one running timer on two different days.
+  it("carries the day the hours will land on, as a bare date", () => {
+    expect(timerStateSchema.safeParse({
+      timer: { ...base, workDate: "2026-09-04" }, timeZone: "UTC",
+    }).success).toBe(true);
+    expect(timerStateSchema.safeParse({
+      timer: { ...base, workDate: "2026-09-04T07:00:00.000Z" }, timeZone: "UTC",
+    }).success).toBe(false);
+  });
+
+  it("refuses a running timer attached to nothing", () => {
+    expect(timerStateSchema.safeParse({
+      timer: { ...base, projectId: null, links: [], workDate: "2026-09-04" }, timeZone: "UTC",
+    }).success).toBe(false);
+  });
+
+  /**
+   * **THE RESOLVED LINKS AND THE ID COLUMNS ARE ONE SET COUNTED TWICE**, so a
+   * payload where they disagree is a service that joined the wrong rows -- and
+   * the strip would then say the hours are going somewhere they are not.
+   */
+  it("refuses a timer whose resolved links are not the records it names", () => {
+    expect(timerStateSchema.safeParse({
+      timer: { ...base, links: [], workDate: "2026-09-04" }, timeZone: "UTC",
+    }).success).toBe(false);
+    expect(timerStateSchema.safeParse({
+      timer: {
+        ...base, workDate: "2026-09-04",
+        links: [...base.links, { kind: "deal" as const, id: randomUUID(), label: "Ghost" }],
+      },
+      timeZone: "UTC",
+    }).success).toBe(false);
+  });
+
+  /**
+   * **A MALFORMED `links` IS A REFUSAL RATHER THAN A THROW**, which is the
+   * property a route needs: an exception escaping `safeParse` is a 500 where a
+   * 400 belongs.
+   *
+   * **AND WHAT SATISFIES IT IS ZOD, NOT THE GUARD IN THE REFINE, WHICH IS SAID
+   * HERE RATHER THAN LEFT TO BE DISCOVERED.** Deleting that `Array.isArray`
+   * check is a GREEN mutation, and probing zod 4.4.3 directly says why: a
+   * refine runs after a field failure only for a FORMAT failure on a value of
+   * the right type, and never for a wrong type, a missing key or a bad array
+   * element. Task 4's finding is sound for the case it met and its
+   * generalisation to "any refine can be handed rubbish" is too broad. This test
+   * is the contract; the guard is belt to its braces.
+   */
+  it("refuses a links field that is not an array without throwing out of safeParse", () => {
+    for (const links of ["project", 3, null, { kind: "project" }]) {
+      expect(
+        () => timerStateSchema.safeParse({
+          timer: { ...base, workDate: "2026-09-04", links }, timeZone: "UTC",
+        }),
+        JSON.stringify(links),
+      ).not.toThrow();
+      expect(timerStateSchema.safeParse({
+        timer: { ...base, workDate: "2026-09-04", links }, timeZone: "UTC",
+      }).success).toBe(false);
     }
   });
 });

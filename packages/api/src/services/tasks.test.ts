@@ -182,6 +182,61 @@ describe("tasks service: create", () => {
   });
 });
 
+/**
+ * **THE ESTIMATE (Phase 10 Task 3).** `tasks` carried no quantity of work at all
+ * before v1.9.0, so these are the service's half of the column that makes
+ * "booked versus estimated" possible. The comparison itself is
+ * services/timesheet.ts's `taskEffort`; this is only that an estimate can be
+ * set, changed, and taken back.
+ */
+describe("tasks service: the estimate", () => {
+  it("stores an estimate given on create, and null when none was given", async () => {
+    expect((await makeTask({ estimateMinutes: 240 })).estimateMinutes).toBe(240);
+    expect((await makeTask()).estimateMinutes).toBeNull();
+  });
+
+  it("patches an estimate onto a task that had none, and records it as changed", async () => {
+    const task = await makeTask();
+    const updated = await updateTask(handle.db, actorId, task.id, { estimateMinutes: 90 });
+    expect(updated.estimateMinutes).toBe(90);
+    const evs = await handle.db.select().from(events).where(eq(events.taskId, task.id));
+    expect(evs.find((e) => e.verb === "updated")?.payload).toEqual({ changed: ["estimateMinutes"] });
+  });
+
+  /**
+   * **AN EXPLICIT NULL CLEARS IT, WHICH IS THE ONLY WAY TO WITHDRAW ONE.** The
+   * column has no zero to fall back on -- `tasks_estimate_range` refuses it,
+   * deliberately, so that "not estimated" has exactly one spelling. If the patch
+   * path ever stopped distinguishing an explicit null from an absent key, a
+   * mis-typed estimate would be permanent.
+   */
+  it("clears an estimate with an explicit null, and leaves it alone when the key is absent", async () => {
+    const task = await makeTask({ estimateMinutes: 240 });
+    expect((await updateTask(handle.db, actorId, task.id, { title: "Renamed" })).estimateMinutes).toBe(240);
+    expect((await updateTask(handle.db, actorId, task.id, { estimateMinutes: null })).estimateMinutes).toBeNull();
+  });
+
+  it("is a true no-op when the patch names the estimate it already has", async () => {
+    const task = await makeTask({ estimateMinutes: 240 });
+    const result = await updateTask(handle.db, actorId, task.id, { estimateMinutes: 240 });
+    expect(result.updatedAt).toBe(task.updatedAt);
+    const evs = await handle.db.select().from(events).where(eq(events.taskId, task.id));
+    expect(evs.filter((e) => e.verb === "updated")).toHaveLength(0);
+  });
+
+  /**
+   * A DIRECT SERVICE CALLER BYPASSES ZOD ENTIRELY, and the database is the
+   * backstop that catches it -- the standing split every invariant here is held
+   * by. Task 5's timer will be exactly such a caller.
+   */
+  it("lets the database refuse an estimate no wire schema would have passed", async () => {
+    await expect(createTask(handle.db, actorId, { title: "T", estimateMinutes: 0 } as never))
+      .rejects.toMatchObject({ cause: { constraint_name: "tasks_estimate_range" } });
+    await expect(createTask(handle.db, actorId, { title: "T", estimateMinutes: 525601 } as never))
+      .rejects.toMatchObject({ cause: { constraint_name: "tasks_estimate_range" } });
+  });
+});
+
 describe("tasks service: update", () => {
   it("applies a diff-based patch and records only the changed fields", async () => {
     const task = await makeTask({ progressPct: 10 });
@@ -736,6 +791,22 @@ describe("SSE invalidation hints", () => {
       await addDependency(handle.db, actorId, a.id, b.id);
       const flat = hints[hints.length - 1]?.map((k) => k.join(":")) ?? [];
       expect(flat).toContain(`task:${b.id}`);
+    } finally {
+      unsub();
+    }
+  });
+
+  it("publishes the task's own key on an estimate patch, which is what refreshes the effort reading", async () => {
+    const task = await createTask(handle.db, actorId, { title: "T" });
+
+    const hints: string[][][] = [];
+    const unsub = subscribe((hint) => hints.push(hint.keys));
+    try {
+      await updateTask(handle.db, actorId, task.id, { estimateMinutes: 240 });
+      const flat = hints[hints.length - 1]?.map((k) => k.join(":")) ?? [];
+      // ["task", id] is what web's useTaskEffort nests under, so TanStack's
+      // prefix match reaches ["task", id, "effort"] without a key of its own.
+      expect(flat).toContain(`task:${task.id}`);
     } finally {
       unsub();
     }

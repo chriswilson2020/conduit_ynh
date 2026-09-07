@@ -1,0 +1,2 @@
+ALTER TABLE "tasks" ADD COLUMN "estimate_minutes" integer;--> statement-breakpoint
+ALTER TABLE "tasks" ADD CONSTRAINT "tasks_estimate_range" CHECK (estimate_minutes IS NULL OR (estimate_minutes > 0 AND estimate_minutes <= 525600));

@@ -215,6 +215,26 @@ export const tasks = pgTable("tasks", {
   dueDate: date("due_date"),
   completedAt: timestamp("completed_at", { withTimezone: true }),
   progressPct: integer("progress_pct"),
+  // **THE QUANTITY OF WORK, ADDED IN v1.9.0 (Phase 10 Task 3), AND THE FIRST ONE
+  // THIS TABLE HAS EVER CARRIED.** Every column above it is a date or a
+  // percentage: start_date/due_date are elapsed time, progress_pct is a
+  // fraction of something whose size nobody wrote down. "Booked versus
+  // estimated" is the usual point of booking time against a task and it could
+  // not exist until this column did (spec).
+  //
+  // MINUTES, BECAUSE THE THING IT IS COMPARED WITH IS MINUTES. The booked half
+  // is SUM(time_entries.minutes) (integer minutes, bounded here and on the
+  // wire) and meetings.duration_minutes is the same unit -- so an estimate in
+  // hours would put a conversion, and a rounding, between a number and the
+  // number it exists to be read against. Hours-as-numeric was rejected for the
+  // reason time_entries.csv has no `hours` column: @conduit/shared's
+  // formatMinutes already renders 90 as "1h 30m", so a second stored
+  // representation buys nothing at the display end and costs correctness at the
+  // comparison end.
+  //
+  // NULL IS "NOT ESTIMATED", AND IT IS THE ONLY SPELLING OF IT -- which is what
+  // the `> 0` half of the CHECK below is for. See it for the bound's argument.
+  estimateMinutes: integer("estimate_minutes"),
   // One level of subtask grouping only -- the service rejects a parent that
   // itself already has a parent. Self-reference needs the explicit
   // AnyPgColumn return type (TypeScript can't infer a self-referential
@@ -242,6 +262,47 @@ export const tasks = pgTable("tasks", {
   ),
   check("tasks_completed_at_paired", sql`(completed_at IS NOT NULL) = (status = 'done')`),
   check("tasks_progress_range", sql`progress_pct IS NULL OR (progress_pct >= 0 AND progress_pct <= 100)`),
+  // **AN ESTIMATE IS AT LEAST A MINUTE AND AT MOST A YEAR, AND BOTH ENDS ARE
+  // ARGUED RATHER THAN ROUND.** Belt-and-braces with @conduit/shared's
+  // MAX_TASK_ESTIMATE_MINUTES, which schema.test.ts pins against this literal
+  // so the two cannot drift -- projects.color's and tasks_progress_range's
+  // arrangement, NOT meetings.duration_minutes' zod-only one.
+  //
+  //   `> 0`: NULL already says "nobody has estimated this". A zero would be a
+  //   SECOND spelling of it, and the one that reads as a claim rather than an
+  //   absence -- an estimate of no work, against which the first minute booked
+  //   is infinitely over. Two spellings of one absence is the mistake
+  //   normaliseDescription (services/time-entries.ts) avoids by storing "" as
+  //   null, and time_entries.minutes > 0 avoids for the same reason.
+  //
+  //   `<= 525600`, one year of wall clock, and DELIBERATELY NOT 1440. That
+  //   bound is definitional for time_entries.minutes because work_date is one
+  //   day; a task's dates are a SPAN (tasks_dates_paired, and the Gantt draws a
+  //   bar across it), so a task honestly holds more work than a day. The line
+  //   this bound actually draws is the one between the two entities this schema
+  //   already has: a work item estimated at more than a person-year is a
+  //   PROJECT, and project_id is the column that says so. Wall clock rather
+  //   than an eight-hour working day for MAX_TIME_ENTRY_MINUTES' reason --
+  //   Conduit does not know the operator's working day, and the one time this
+  //   schema would have had to guess at it (time_entries.billable) it refused.
+  //
+  // **WHY THERE IS A BOUND HERE WHEN meetings.duration_minutes HAS NONE.** That
+  // column's exposure is real and recorded (see it, and the Phase 10 plan):
+  // z.number().int().positive() accepts 999999999, which now dominates a week's
+  // total. It cannot be tightened, because a `.max()` would make the CLIENT
+  // refuse to parse rows that already exist. THIS COLUMN IS BEING CREATED WITH
+  // NO ROWS IN IT, which is the one moment a bound costs nothing -- and the
+  // only one. It is taken now precisely because Task 2 watched what the
+  // alternative costs later.
+  //
+  // REJECTED, so it is not revisited: bounding the estimate by the task's own
+  // start_date..due_date span. It is the tempting cross-column CHECK and it is
+  // wrong twice. A span is elapsed time and an estimate is effort -- different
+  // quantities, and eight hours of work inside a two-week window is the normal
+  // case, not an error. And it would make an ordinary reschedule that narrows
+  // the dates fail against an estimate already stored, leaving a row that
+  // cannot be patched out of its state one field at a time.
+  check("tasks_estimate_range", sql`estimate_minutes IS NULL OR (estimate_minutes > 0 AND estimate_minutes <= 525600)`),
 ]);
 export type TaskRow = typeof tasks.$inferSelect;
 
@@ -736,6 +797,34 @@ export const meetings = pgTable("meetings", {
   occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
   // NULL is honest, not missing data: not every logged meeting has a known
   // length (spec's data model).
+  //
+  // **SINCE v1.9.0 THIS COLUMN IS SUMMED**, by services/timesheet.ts, which is
+  // Phase 10's decision that the timesheet reads meetings and time entries
+  // together -- a logged meeting with a duration is a recorded hour, and it had
+  // held one since Phase 5 with nothing ever adding it up. Two consequences
+  // that are decisions rather than side effects:
+  //
+  //   THE NULL IS STILL NOT A ZERO, AND IS REPORTED AS ITSELF. The timesheet
+  //   answers a count of meetings with no recorded length beside its total,
+  //   because a report that silently treats "unknown" as "none" is the spec's
+  //   own named failure. That count is in the operator's sentence
+  //   (`timesheetSummary`), not merely in the payload.
+  //
+  //   **THERE IS STILL NO CHECK ON THE VALUE, AND THE REASON HAS CHANGED.** The
+  //   old reason was "nothing sums it", which this release made false;
+  //   time_entries.minutes cites that contrast and has been corrected too. The
+  //   reason now is that a meeting has no definitional bound to CHECK against.
+  //   `time_entries.minutes <= 1440` follows from `work_date` being one day; a
+  //   meeting's `occurred_at` is a START, and an offsite logged as one meeting
+  //   can legitimately run longer than a day. A 1440 here would refuse a true
+  //   row to catch a mistyped one, and it would not catch the mistype that
+  //   actually happens (60 typed as 600 passes any bound this column could
+  //   carry). WHAT IS GENUINELY EXPOSED is that the zod shape has no upper bound
+  //   either -- `z.number().int().positive()` accepts 999999999, which is now a
+  //   number that can dominate a week's total. Adding a max to `meetingSchema`
+  //   would make the CLIENT refuse to parse any meeting already carrying such a
+  //   value, turning a silly figure into a broken page, so it is written down
+  //   here and in the plan rather than changed in passing.
   durationMinutes: integer("duration_minutes"),
   // Rich-text HTML, sanitized on write by services/meetings.ts (Task 2)
   // through the system's ONE shared sanitizer profile -- sanitizeMailHtml in
@@ -1624,3 +1713,240 @@ export const documentTemplates = pgTable("document_templates", {
   ),
 ]);
 export type DocumentTemplateRow = typeof documentTemplates.$inferSelect;
+
+// --- Time tracking (Phase 10) ---------------------------------------------
+//
+// ONE ROW IS ONE QUANTITY OF WORK ATTRIBUTED TO ONE DAY. A duration, that day,
+// the person who did it, whether it is chargeable, and the records it belongs
+// to. Nothing here is an instant: see work_date below.
+//
+// **THE LINK SET IS A FIFTH SET, NOT A COPY OF A FOURTH OR A FIFTH ALREADY
+// HERE**, and this is the one place the plan's instruction has to be read
+// carefully. The plan says Phase 9 "established the pattern for a five-way link
+// set with a per-type CHECK -- documents_entity_matches_type in 0020 -- read it
+// before inventing one". It was read, and only half of it transfers:
+//
+//   THE COUNT PATTERN TRANSFERS. `num_nonnulls(...)` over the record columns is
+//   how every one of these rules is spelled in this file (notes = 1, files = 1,
+//   documents = 1, meetings >= 1), and this is the same rule at a fifth column
+//   and the meetings count. Spelled the same way for the same reason: at-least-
+//   one and exactly-one are then visibly one rule at two counts.
+//
+//   THE PER-TYPE PATTERN DOES NOT, AND CANNOT. `documents_entity_matches_type`
+//   answers "which record does a document of THIS TYPE belong to", and it needs
+//   `documents.type` to ask the question. A time entry has no type and no
+//   discriminator of any kind: an hour is an hour, and which record it belongs
+//   to is the operator's answer, not a consequence of what kind of thing it is.
+//   A CHECK of that shape here would have to invent a type column to hang
+//   itself on, which is 0016's mistake -- generalising from the one example that
+//   had been built -- in the other direction.
+//
+//   AND THE FIVE ARE NOT THE SAME FIVE. documents' are company, contact, deal,
+//   project, MEETING. These are company, contact, deal, project, TASK. So even
+//   the column list could not have been copied.
+//
+// **A MEETING IS DELIBERATELY NOT A SIXTH LINK, AND THE ABSENCE IS THE
+// ENFORCEMENT.** The spec's third decision is that a manual entry cannot be
+// attached to a meeting, so the same hour cannot be counted twice -- and it asks
+// for that to be impossible rather than discouraged. There is no meeting_id
+// column here, so an INSERT naming one does not violate a CHECK, it fails to
+// parse against the table at all (42703, "column meeting_id does not exist").
+//
+// **TASK 2 CONFIRMED IT AND ADDED NOTHING**, which is the outcome this note was
+// written for. The plan's instruction to Task 2 was "a CHECK, not a convention";
+// a CHECK needs a column to name, and adding one so that an error message could
+// name it would have traded impossible for illegal. What Task 2 built instead is
+// services/timesheet.ts, whose header enumerates the INDIRECT routes to a double
+// count that the absent column does not close -- a join that fans a meeting out
+// over its attendees or its links, a meeting counted in two buckets, and an
+// archived row still contributing -- and closes each of them with a test.
+export const timeEntries = pgTable("time_entries", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  // THE DAY, NOT AN INSTANT. `date`, like tasks.start_date and
+  // deals.expected_close_date, and deliberately not the timestamptz every
+  // "when did this happen" column in this file otherwise uses (meetings.
+  // occurred_at, mail_messages.sent_at). A timesheet asks which DAY an hour
+  // belongs to; a timestamptz cannot answer that without also answering "in
+  // whose time zone", and for a row typed by hand there is no true answer --
+  // the operator recorded a day, not a moment. Storing an instant would make
+  // org_profile.time_zone (0018) load-bearing on every read, so the same stored
+  // row would move between weeks when somebody changed a setting.
+  //
+  // Task 5's timer will need real instants (a start that survives a restart is
+  // an instant or it is nothing). Those belong to the TIMER's own state, and
+  // what it produces when it stops is a row here: a day and a number of
+  // minutes.
+  workDate: date("work_date").notNull(),
+  // Minutes, matching meetings.duration_minutes, so the two things the
+  // timesheet sums are counted in one unit and no conversion sits between them.
+  // NOT NULL, unlike that column: a meeting whose length nobody recorded is
+  // honest (spec), while an ENTRY with no duration is not an entry at all.
+  minutes: integer("minutes").notNull(),
+  description: text("description"),
+  // NO DEFAULT, which is documents.frozen's arrangement and documents.frozen's
+  // reason. Both values are ordinary, so any default is a guess, and a guess
+  // made by the schema is made silently on the row nobody re-reads. An INSERT
+  // that says nothing about it is refused; @conduit/shared's
+  // timeEntryCreateInputSchema requires it on the wire for the same reason.
+  //
+  // AND NO RATE COLUMN ANYWHERE NEAR IT. Invoicing is out of Conduit, so this
+  // flag feeds reporting and the export; a rate without a rate card is a number
+  // somebody re-types for ever (spec).
+  billable: boolean("billable").notNull(),
+  // NOT NULL, matching meetings.owner_user_id rather than the nullable
+  // owner_user_id on companies/contacts/deals/projects: an hour was worked BY
+  // somebody, and the actor is stamped server-side, never sent by the caller.
+  ownerUserId: uuid("owner_user_id").notNull().references(() => users.id),
+  companyId: uuid("company_id").references(() => companies.id),
+  contactId: uuid("contact_id").references(() => contacts.id),
+  dealId: uuid("deal_id").references(() => deals.id),
+  projectId: uuid("project_id").references(() => projects.id),
+  taskId: uuid("task_id").references(() => tasks.id),
+  // ARCHIVE, NOT DELETE, this file's rule everywhere -- and here it is the only
+  // way to take an hour back out of a total. An entry cannot be corrected to
+  // nothing, because `time_entries_minutes_range` forbids zero, so without this
+  // column a duplicated afternoon would stay in the week's total for ever.
+  archivedAt: timestamp("archived_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, () => [
+  // AT LEAST ONE OF FIVE. Its twin lives on @conduit/shared's
+  // timeEntryAtLeastOneLink, which the create schema refines with and
+  // updateTimeEntry re-asserts against the merged row, so a 4xx never arrives
+  // as a 500 -- the same two-place arrangement meetings_has_link has.
+  //
+  // NOT `= 1`, which is notes'/files'/documents' rule: an hour can legitimately
+  // belong to a project AND the deal it came from, and forcing a choice would
+  // make one of those two reports wrong on purpose.
+  //
+  // NOT ABSENT, which is tasks'/mail_threads' rule: a row linked to nothing
+  // appears in no report and can be found only by SQL, so the week's total
+  // comes out short with nothing anywhere saying so. That is the whole reason
+  // this constraint is `>= 1` and not merely a convention in the form.
+  check(
+    "time_entries_has_link",
+    sql`num_nonnulls(company_id, contact_id, deal_id, project_id, task_id) >= 1`,
+  ),
+  // BELT AND BRACES, unlike meetings.duration_minutes, which carries no bound in
+  // the database at all.
+  //
+  // **THE CONTRAST IS NO LONGER "NOTHING SUMS A MEETING'S DURATION".** That was
+  // the reason when this was written and v1.9.0's timesheet made it false: both
+  // columns are now summed, by services/timesheet.ts, into one number. What
+  // still differs is that THIS column has a definitional bound and that one has
+  // not. An entry is a quantity of work attributed to a calendar date and no
+  // date holds more than 24 hours, so 1440 follows from what the row IS. A
+  // meeting's `occurred_at` is a start instant, and an offsite logged as one
+  // meeting can honestly run longer than a day -- so the same number there would
+  // refuse a true row, and would still not catch the mistype that happens (60
+  // typed as 600 passes any bound). See that column for the exposure this leaves.
+  //
+  // The upper bound is one DAY because work_date is one day, and it is
+  // MAX_TIME_ENTRY_MINUTES in @conduit/shared spelled a second time;
+  // db/schema.test.ts probes 1, 1440, 1441, 0 and -1 so the two cannot drift.
+  check("time_entries_minutes_range", sql`minutes > 0 AND minutes <= 1440`),
+]);
+export type TimeEntryRow = typeof timeEntries.$inferSelect;
+
+// --- The timer (Phase 10 Task 5) -------------------------------------------
+//
+// ONE ROW IS ONE RUN OF THE CLOCK. It starts, it stops, and if it produced
+// anything it names the `time_entries` row it produced. A timer is NOT a time
+// entry in progress, and this table exists because it cannot be one:
+// `time_entries.minutes` is NOT NULL and `> 0`, so the schema has no way to
+// spell a duration that is still accruing -- which is a property worth having
+// rather than an obstacle, because it means a running timer can never be summed
+// by anything. `timesheetTotals` reads `time_entries` and `meetings`; nothing
+// in this table is reachable from either.
+//
+// **THE STATE IS `started_at` AND NOTHING ELSE, AND THAT IS THE POINT.** The
+// spec: "running state that must survive a restart, a closed tab, and a second
+// device. Conduit is one process with no swap; a timer held in memory dies with
+// a deploy." There is no in-memory half of this: the elapsed figure on any
+// screen is `now - started_at` computed at render time by the SAME function on
+// both sides of the wire (@conduit/shared's timerElapsedMinutes), and the wire
+// payload carries no duration at all, so there is nothing to go stale, nothing
+// to resume and nothing to lose. `started_at` DEFAULTs to now() so the instant
+// is the DATABASE's clock rather than whichever process took the request.
+//
+// **AT MOST ONE RUNNING TIMER PER PERSON, ENFORCED BY A PARTIAL UNIQUE INDEX**
+// (`timers_one_running_per_owner`, in drizzle/0023, hand-written there with
+// every other index in this codebase). It is the double-count the two capture
+// paths make available that CAN be closed in the schema: two devices each
+// starting a timer would otherwise each stop into an entry, and the same
+// afternoon would be booked twice by one person who did nothing wrong. The
+// second start is a unique violation, which the service turns into a 409 naming
+// the timer already running rather than a 500.
+//
+// **AND ONE ENTRY PER TIMER, ENFORCED BY `timers_time_entry_unique`.** A stop
+// claims the timer and inserts the entry in ONE transaction, so a stop that
+// arrives twice -- a double tap, a retried request, two devices -- finds
+// `stopped_at` already set and writes nothing. The unique constraint is the
+// belt to that braces: even a caller reaching past the service cannot point two
+// timers at one entry, and a timer cannot come to name two.
+export const timers = pgTable("timers", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  // NOT NULL, like time_entries.owner_user_id: a clock is running for somebody.
+  // It is also the column the partial unique index is on, so "whose timer is
+  // running" and "only one may be" are the same fact.
+  ownerUserId: uuid("owner_user_id").notNull().references(() => users.id),
+  // THE ONE PIECE OF STATE. An instant, unlike time_entries.work_date -- and the
+  // contrast is the whole reason both columns exist. A timer's truth IS a
+  // moment; an entry's truth is a day and a quantity. What a stop does is turn
+  // the first into the second, and the day it picks is this instant read in
+  // `org_profile.time_zone` (services/timers.ts).
+  startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
+  // NULL means running. Set by a stop AND by a discard, so "has this timer
+  // finished" is one column rather than a state machine: what tells the two
+  // apart is whether it produced an entry.
+  stoppedAt: timestamp("stopped_at", { withTimezone: true }),
+  // What it became, or NULL for a timer that was discarded (or that has not
+  // stopped yet). NOT a duplicate of the entry's own data: the entry is the
+  // hours, this is the provenance -- the wall-clock interval the entry's
+  // `work_date` cannot hold.
+  //
+  // A DISCARDED TIMER IS KEPT, because Conduit never expunges and because it is
+  // the only record that the clock ever ran. `timers.csv` carries it into the
+  // export for that reason.
+  timeEntryId: uuid("time_entry_id").references(() => timeEntries.id),
+  // What the operator said they were starting, so the strip on every page says
+  // something better than "a timer is running". It seeds the entry's own
+  // description at stop and can be corrected there.
+  description: text("description"),
+  companyId: uuid("company_id").references(() => companies.id),
+  contactId: uuid("contact_id").references(() => contacts.id),
+  dealId: uuid("deal_id").references(() => deals.id),
+  projectId: uuid("project_id").references(() => projects.id),
+  taskId: uuid("task_id").references(() => tasks.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  // THE SAME FIVE, THE SAME RULE, AND DELIBERATELY THE SAME SPELLING as
+  // `time_entries_has_link` -- because a timer that could not become an entry
+  // must not be startable. Enforcing it here means the refusal reaches the
+  // operator while the record picker is still on the screen; enforcing it only
+  // at stop would hand it to somebody recovering from a forgotten weekend, with
+  // hours they cannot save and no way to attach them.
+  //
+  // NO `meeting_id` HERE EITHER, for Task 1's reason exactly: a timer is a
+  // second front door to `time_entries`, and a door that could name a meeting
+  // would put back the double count the missing column makes unspellable.
+  check(
+    "timers_has_link",
+    sql`num_nonnulls(company_id, contact_id, deal_id, project_id, task_id) >= 1`,
+  ),
+  // A timer cannot stop before it started. Cheap, and it is what stops a bad
+  // clock or a hand-written row producing a negative elapsed time that
+  // timerElapsedMinutes would then clamp to nought in silence.
+  check("timers_stopped_after_start", sql`stopped_at IS NULL OR stopped_at >= started_at`),
+  // AND A RUNNING TIMER CANNOT HAVE PRODUCED ANYTHING. Without this, a row with
+  // an entry and no `stopped_at` would be counted by the timesheet (through the
+  // entry) AND still be running on the strip -- the double count arriving as an
+  // inconsistency rather than as a second row.
+  check("timers_entry_needs_stop", sql`time_entry_id IS NULL OR stopped_at IS NOT NULL`),
+  // ONE ENTRY, ONE TIMER. Postgres treats NULLs as distinct in a UNIQUE
+  // constraint, so every running and every discarded timer is exempt and only
+  // the claim itself is unique -- which is exactly the rule wanted.
+  unique("timers_time_entry_unique").on(t.timeEntryId),
+]);
+export type TimerRow = typeof timers.$inferSelect;

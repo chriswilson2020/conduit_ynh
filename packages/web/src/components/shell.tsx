@@ -6,6 +6,7 @@ import { useIsMobile } from "../use-is-mobile";
 import { BottomNav, MobileSearch } from "./bottom-nav";
 import { GlobalSearch } from "./search";
 import { TaskDrawerFocusProvider } from "./task-drawer-focus";
+import { TimerStrip } from "./timer-strip";
 import { useSseInvalidation } from "./sse";
 
 // activeProps.className replaces (rather than merges with) the base className
@@ -144,6 +145,9 @@ export function Shell({ children }: { children: ReactNode }) {
             <Link to="/gantt" className={navLinkClass} activeProps={{ className: activeNavLinkClass }}>
               Gantt
             </Link>
+            <Link to="/timesheet" className={navLinkClass} activeProps={{ className: activeNavLinkClass }}>
+              Timesheet
+            </Link>
             <Link to="/settings/mail" className={inSettings ? activeNavLinkClass : navLinkClass}>
               Settings
             </Link>
@@ -163,6 +167,35 @@ export function Shell({ children }: { children: ReactNode }) {
             </div>
           )}
         </header>
+        {/*
+          THE RUNNING TIMER, BETWEEN THE HEADER AND THE CONTENT, ON EVERY ROUTE.
+
+          It is here rather than on /timesheet because the spec's second risk is
+          "you left this running for 62 hours", and a timer visible only on the
+          page an operator opens once a week is a timer that is always left
+          running.
+
+          IT RENDERS NULL WHEN NOTHING IS RUNNING, so no route gains a pixel or
+          a DOM node until a clock is going -- and its ticking interval is torn
+          down with it, so the eighteen routes without a timer pay no timer for
+          it either. WHAT THEY DO PAY, said rather than glossed: one
+          `GET /api/timer` per app load. It is one query mounted once here
+          (not per route, like useUnreadMailCount above), served by the same
+          partial unique index that enforces one running timer per person, and
+          refetched only on the `["timer"]` SSE hint. That is the price of the
+          strip being on every page, and it is the point.
+
+          IT COSTS NO NAVIGATION SLOT, which is the reason it is a row rather
+          than a tab: Task 4 declined a fifth bottom-bar tab and a sixth record
+          rail tab against measurements, and this needed neither. It is inside
+          the column that already holds the header, so it sits above <main>'s
+          scroll region on a desk and above the document's on a phone.
+
+          OUTSIDE <main> DELIBERATELY. A strip inside it would scroll away with
+          the content -- on the one surface whose whole job is to be seen while
+          the operator is looking at something else.
+        */}
+        <TimerStrip />
         {/*
           The bottom bar is `fixed`, so it overlays the end of a scrolled page;
           the extra bottom padding below the breakpoint is what keeps the last

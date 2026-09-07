@@ -5,18 +5,28 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { eq } from "drizzle-orm";
 import yazl from "yazl";
-import { decimalFromCents } from "@conduit/shared";
+import { EXPORT_MEMBERS, decimalFromCents } from "@conduit/shared";
+import type { ExportMemberName } from "@conduit/shared";
 import type { Database } from "../db/client.js";
 import { readMigrationJournal } from "./migration-journal.js";
 import {
   companies, contacts, deals, documentAgreements, documentLetters, documentQuotes, documents,
   files, meetingAttendees, meetings,
-  notes, pipelines, projects, stages, tasks, users,
+  notes, pipelines, projects, stages, tasks, timeEntries, timers, users,
 } from "../db/schema.js";
 import { csvDocument } from "./csv.js";
 
 // THE READABLE HALF (7.6 Task 1). A plain ZIP the operator opens in Excel: one
 // CSV per entity, the stored files under files/, and a manifest.json.
+//
+// WHICH SHEETS IT HAS IS NO LONGER DECIDED HERE (v1.9.0). @conduit/shared's
+// EXPORT_MEMBERS is the list, and this module supplies the QUERIES -- one
+// builder per member, in SHEET_BUILDERS, which the compiler holds against that
+// list. Everything below still writes the archive; nothing below gets to decide
+// on its own what is in it. The reason is in that module's header: a new sheet
+// used to have to be told to TEN separate hand-written places, three of them in
+// the product, and Phase 9 shipped an export missing three tables in a row with
+// the obligation written down in three documents.
 //
 // IT IS NOT RESTORABLE, AND THAT IS THE POINT. The backup (Task 2) is the exact
 // artefact; this one is the legible one, and Task 3's Settings page says so in
@@ -50,13 +60,16 @@ import { csvDocument } from "./csv.js";
 //   Restore. The two refusals are a matched pair and neither is a default.
 //
 //   THE EXPORT IS NOT A COMPLETE DESCRIPTION OF THE DATA, and the importer is
-//   what made that concrete. It reads TWO of the nine sheets. The other seven
+//   what made that concrete. It reads TWO of the ten sheets. The other eight
 //   name rows whose NOT NULL columns or foreign keys are not in this archive at
 //   all -- there is no pipelines.csv, no stages.csv, no users, no fractional
 //   `position`, no document_line_items, and meeting attendees are flattened to
 //   display names. That is a gap in this format rather than in the reader; the
 //   list is in services/import-export.ts's header and in the backlog, and
-//   closing it is a formatVersion 2.
+//   closing it is a formatVersion 2. (Nine until Phase 10; time_entries.csv is
+//   the tenth, and it is in the importer's NOT_IMPORTED list for the same
+//   reason notes.csv is -- an entry's owner is a Conduit user the archive does
+//   not carry.)
 //
 // The page draws the same line in words, because the failure being designed
 // against is somebody reaching for the wrong artefact at the moment they most
@@ -96,6 +109,16 @@ import { csvDocument } from "./csv.js";
  *
  * Recorded in manifest.json so 7.7's exact importer has something to branch on
  * that is not "guess from the column headers".
+ *
+ * **PHASE 10 ADDED A MEMBER AND DID NOT BUMP THIS, WHICH THE RULE ABOVE DID NOT
+ * QUITE COVER.** `time_entries.csv` is a new sheet, and a new sheet is additive
+ * in exactly the way a new column is: every existing reader finds every member
+ * it knew about, unchanged, and ignores the one it does not. Bumping would have
+ * cost something real -- services/import-export.ts refuses any archive whose
+ * formatVersion exceeds the running build's, so a version 2 export could not be
+ * read back by a v1.8.0 install for no benefit at all, since nothing branches on
+ * the difference. The version moves when an old reader would be WRONG about what
+ * it is holding, not when it merely knows less than a new one.
  */
 export const EXPORT_FORMAT_VERSION = 1;
 
@@ -417,9 +440,13 @@ function contactName(firstName: string | null, lastName: string | null): string 
 // below filters on archived_at, and a test asserts that for every table that
 // has the column.
 
+/**
+ * A sheet's CONTENTS. It does not carry its own name any more: the member it is
+ * written as comes from `EXPORT_MEMBERS`, which is the key it was fetched under
+ * (see `SHEET_BUILDERS`). A `name` field here would have been a second place per
+ * sheet where a member's filename is spelled, and the two could differ.
+ */
 interface Sheet {
-  /** The member name, e.g. "companies.csv". */
-  name: string;
   header: readonly string[];
   rows: readonly (readonly string[])[];
 }
@@ -431,7 +458,6 @@ async function companiesSheet(db: Database): Promise<Sheet> {
     .leftJoin(users, eq(companies.ownerUserId, users.id))
     .orderBy(companies.createdAt, companies.id);
   return {
-    name: "companies.csv",
     header: [
       "id", "name", "domain", "website", "phone", "address", "industry",
       "owner_user_id", "owner_username", "custom", "archived_at", "created_at", "updated_at",
@@ -452,7 +478,6 @@ async function contactsSheet(db: Database): Promise<Sheet> {
     .leftJoin(users, eq(contacts.ownerUserId, users.id))
     .orderBy(contacts.createdAt, contacts.id);
   return {
-    name: "contacts.csv",
     header: [
       "id", "first_name", "last_name", "salutation", "pronouns", "job_title",
       "company_id", "company_name", "emails", "phones",
@@ -482,7 +507,6 @@ async function dealsSheet(db: Database): Promise<Sheet> {
     .leftJoin(users, eq(deals.ownerUserId, users.id))
     .orderBy(deals.createdAt, deals.id);
   return {
-    name: "deals.csv",
     header: [
       "id", "title", "pipeline_id", "pipeline_name", "stage_id", "stage_name",
       "value", "currency", "expected_close_date", "status", "lost_reason", "closed_at",
@@ -509,7 +533,6 @@ async function projectsSheet(db: Database): Promise<Sheet> {
     .leftJoin(users, eq(projects.ownerUserId, users.id))
     .orderBy(projects.createdAt, projects.id);
   return {
-    name: "projects.csv",
     header: [
       "id", "name", "company_id", "company_name", "deal_id", "deal_title",
       "owner_user_id", "owner_username", "status", "start_date", "due_date", "color",
@@ -539,10 +562,14 @@ async function tasksSheet(db: Database): Promise<Sheet> {
     .leftJoin(projects, eq(tasks.projectId, projects.id))
     .orderBy(tasks.createdAt, tasks.id);
   return {
-    name: "tasks.csv",
     header: [
       "id", "title", "description", "type", "status",
       "assignee_user_id", "assignee_username", "start_date", "due_date", "completed_at", "progress_pct",
+      // v1.9.0's new column (0022). MINUTES, spelled as the column is: an
+      // `estimate_hours` here would be a second representation of one number,
+      // which is why time_entries.csv has no `hours` column either -- and the
+      // two sheets are read side by side precisely to compare them.
+      "estimate_minutes",
       "parent_task_id", "company_id", "company_name", "contact_id", "contact_name",
       "deal_id", "deal_title", "project_id", "project_name",
       "archived_at", "created_at", "updated_at",
@@ -552,6 +579,7 @@ async function tasksSheet(db: Database): Promise<Sheet> {
       text(r.t.assigneeUserId), text(r.assigneeUsername),
       text(r.t.startDate), text(r.t.dueDate), timestamp(r.t.completedAt),
       r.t.progressPct === null ? "" : String(r.t.progressPct),
+      r.t.estimateMinutes === null ? "" : String(r.t.estimateMinutes),
       text(r.t.parentTaskId), text(r.t.companyId), text(r.companyName),
       text(r.t.contactId), contactName(r.contactFirstName, r.contactLastName),
       text(r.t.dealId), text(r.dealTitle), text(r.t.projectId), text(r.projectName),
@@ -575,7 +603,6 @@ async function notesSheet(db: Database): Promise<Sheet> {
     .leftJoin(projects, eq(notes.projectId, projects.id))
     .orderBy(notes.createdAt, notes.id);
   return {
-    name: "notes.csv",
     header: [
       "id", "body", "author_user_id", "author_username",
       "company_id", "company_name", "contact_id", "contact_name",
@@ -629,7 +656,6 @@ async function meetingsSheet(db: Database): Promise<Sheet> {
   }
 
   return {
-    name: "meetings.csv",
     header: [
       "id", "title", "occurred_at", "duration_minutes", "notes_html", "attendees",
       "owner_user_id", "owner_username", "company_id", "company_name", "contact_id", "contact_name",
@@ -647,6 +673,168 @@ async function meetingsSheet(db: Database): Promise<Sheet> {
       text(r.m.contactId), contactName(r.contactFirstName, r.contactLastName),
       text(r.m.dealId), text(r.dealTitle), text(r.m.projectId), text(r.projectName),
       timestamp(r.m.archivedAt), timestamp(r.m.createdAt), timestamp(r.m.updatedAt),
+    ]),
+  };
+}
+
+/**
+ * THE TIMESHEET, IN THE SAME CHANGE THAT CREATES THE TABLE.
+ *
+ * This function is Phase 10 Task 1's stated obligation and it is why the
+ * obligation was written at the top of the plan rather than left to the
+ * definition of done. The backup is a `pg_dump`, so `time_entries` is in it the
+ * day it exists; this half walks no schema and has one hand-written function per
+ * entity, so a table added without one of these is simply absent from the only
+ * artefact an operator can read. **Phase 9's export was missed by three tasks
+ * running** -- an INNER JOIN that silently dropped every meeting summary, a
+ * letter exported with no body, and a status report naming no project -- and
+ * "a timesheet trapped in the app" is the failure the whole export exists
+ * against.
+ *
+ * EVERY COLUMN OF THE TABLE IS HERE, and export.test.ts asserts that against
+ * `information_schema` rather than against this list, so Task 5's timer columns
+ * cannot ship unexported the way Phase 9's did.
+ *
+ * THERE IS NO `hours` COLUMN, and that is a decision. Minutes are already
+ * human-readable and a spreadsheet's own `=SUM(minutes)/60` is one keystroke; a
+ * second stored representation of one number is how a CSV starts disagreeing
+ * with itself the first time somebody edits one cell and not the other. The
+ * money columns are the counter-example that proves the rule -- cents are stored
+ * and are NOT readable, so they are converted, once, by the same arithmetic the
+ * quote form uses.
+ *
+ * `billable` IS SPELLED "true"/"false", which is exactly how documents.csv
+ * spells `frozen`, so the archive has one spelling for a boolean rather than a
+ * second dialect in its tenth file.
+ */
+async function timeEntriesSheet(db: Database): Promise<Sheet> {
+  const rows = await db
+    .select({
+      te: timeEntries, ownerUsername: users.username, companyName: companies.name,
+      contactFirstName: contacts.firstName, contactLastName: contacts.lastName,
+      dealTitle: deals.title, projectName: projects.name, taskTitle: tasks.title,
+    })
+    .from(timeEntries)
+    .leftJoin(users, eq(timeEntries.ownerUserId, users.id))
+    // ALL FIVE RECORD JOINS, PRESENT FROM THE FIRST VERSION. Phase 9's third
+    // miss was a status report exported with `project_id` in a column that did
+    // not exist, so nothing in the archive said which project the report was
+    // about; an entry booked to a task, with no `task_title` here, would be the
+    // identical failure on a table whose entire purpose is saying what the time
+    // went on. LEFT, every one, because at-least-one means four of the five are
+    // null on an ordinary row -- an INNER JOIN anywhere here would drop most of
+    // the sheet, which is Phase 9's FIRST miss on the same file.
+    .leftJoin(companies, eq(timeEntries.companyId, companies.id))
+    .leftJoin(contacts, eq(timeEntries.contactId, contacts.id))
+    .leftJoin(deals, eq(timeEntries.dealId, deals.id))
+    .leftJoin(projects, eq(timeEntries.projectId, projects.id))
+    .leftJoin(tasks, eq(timeEntries.taskId, tasks.id))
+    // BY THE DAY THE WORK WAS DONE, not by created_at: this file is a timesheet,
+    // and a reader scrolling it wants the days in order rather than the order
+    // somebody happened to type them in. `id` is the tiebreaker that makes it
+    // deterministic, exactly as everywhere else here.
+    .orderBy(timeEntries.workDate, timeEntries.id);
+  return {
+    header: [
+      "id", "work_date", "minutes", "billable", "description",
+      "owner_user_id", "owner_username",
+      "company_id", "company_name", "contact_id", "contact_name",
+      "deal_id", "deal_title", "project_id", "project_name", "task_id", "task_title",
+      "archived_at", "created_at", "updated_at",
+    ],
+    rows: rows.map((r) => [
+      // work_date is a bare `date`, so it arrives as the string Postgres stored
+      // and goes out unchanged -- like issue_date and due_date elsewhere in this
+      // file, and deliberately NOT through timestamp(), which would need a Date
+      // and would turn a day into an instant in some time zone.
+      r.te.id, r.te.workDate, String(r.te.minutes), r.te.billable ? "true" : "false",
+      text(r.te.description),
+      r.te.ownerUserId, text(r.ownerUsername),
+      text(r.te.companyId), text(r.companyName),
+      text(r.te.contactId), contactName(r.contactFirstName, r.contactLastName),
+      text(r.te.dealId), text(r.dealTitle),
+      text(r.te.projectId), text(r.projectName),
+      text(r.te.taskId), text(r.taskTitle),
+      timestamp(r.te.archivedAt), timestamp(r.te.createdAt), timestamp(r.te.updatedAt),
+    ]),
+  };
+}
+
+/**
+ * **THE CLOCK'S OWN RECORD, IN THE SAME CHANGE THAT CREATES ITS TABLE.**
+ *
+ * Task 1's obligation applied to Task 5's table, and it is the fourth time this
+ * phase has had to be said: the backup is a `pg_dump` and gets `timers` the day
+ * it exists; this half has one hand-written function per entity and walks no
+ * schema, so a table with no function here is simply absent from the only
+ * artefact an operator can read.
+ *
+ * **IT CARRIES SOMETHING `time_entries.csv` CANNOT, WHICH IS WHY IT IS A SHEET
+ * AND NOT A DECLARED ABSENCE.** An entry records a DAY and a QUANTITY -- that is
+ * `work_date`'s whole argument -- so nowhere in the archive does it say WHEN in
+ * the day an hour was worked. This is the only place those two instants exist.
+ * It is also the only record of a timer that was DISCARDED: the clock ran, the
+ * operator decided it represented nothing, and no entry was ever written. A row
+ * with a `stopped_at` and no `time_entry_id` is exactly that, and it is the one
+ * thing a `time_entries`-shaped export could never show.
+ *
+ * **NO `elapsed_minutes` COLUMN**, for `time_entries.csv`'s no-`hours` reason
+ * exactly: both instants are here and a spreadsheet's own subtraction is one
+ * keystroke, while a second stored representation of one figure is how a CSV
+ * starts disagreeing with itself the first time somebody edits one cell and not
+ * the other. And here it would be worse than redundant -- the elapsed time and
+ * the minutes the operator actually logged are DELIBERATELY allowed to differ
+ * (that is the recovery interaction), so a derived column would look like a
+ * contradiction of `time_entries.csv` rather than the two true numbers they are.
+ *
+ * EVERY COLUMN OF THE TABLE IS HERE, under its own name -- no renames, so this
+ * sheet needs no line in export.test.ts's `COLUMNS_NOT_NAMED_IN_A_HEADER` -- and
+ * the `information_schema` guard asserts that against the catalogue rather than
+ * against this list. All six record joins are LEFT, for the reason
+ * `timeEntriesSheet` gives at length: at-least-one means four of the five record
+ * columns are null on an ordinary row, and `time_entry_id` is null on every
+ * running and every discarded one.
+ */
+async function timersSheet(db: Database): Promise<Sheet> {
+  const rows = await db
+    .select({
+      t: timers, ownerUsername: users.username, companyName: companies.name,
+      contactFirstName: contacts.firstName, contactLastName: contacts.lastName,
+      dealTitle: deals.title, projectName: projects.name, taskTitle: tasks.title,
+    })
+    .from(timers)
+    .leftJoin(users, eq(timers.ownerUserId, users.id))
+    .leftJoin(companies, eq(timers.companyId, companies.id))
+    .leftJoin(contacts, eq(timers.contactId, contacts.id))
+    .leftJoin(deals, eq(timers.dealId, deals.id))
+    .leftJoin(projects, eq(timers.projectId, projects.id))
+    .leftJoin(tasks, eq(timers.taskId, tasks.id))
+    // BY THE MOMENT THE CLOCK STARTED, which is this table's own chronology --
+    // `created_at` is the same instant by construction and would read as a
+    // second answer to one question. `id` is the tiebreaker that makes it
+    // deterministic, as everywhere else here.
+    .orderBy(timers.startedAt, timers.id);
+  return {
+    header: [
+      "id", "started_at", "stopped_at", "description",
+      "owner_user_id", "owner_username", "time_entry_id",
+      "company_id", "company_name", "contact_id", "contact_name",
+      "deal_id", "deal_title", "project_id", "project_name", "task_id", "task_title",
+      "created_at", "updated_at",
+    ],
+    rows: rows.map((r) => [
+      r.t.id, timestamp(r.t.startedAt), timestamp(r.t.stoppedAt), text(r.t.description),
+      r.t.ownerUserId, text(r.ownerUsername),
+      // Empty for a timer that is STILL RUNNING and for one that was DISCARDED,
+      // and the difference between those two is `stopped_at` -- which is why
+      // both columns are here and neither is derived from the other.
+      text(r.t.timeEntryId),
+      text(r.t.companyId), text(r.companyName),
+      text(r.t.contactId), contactName(r.contactFirstName, r.contactLastName),
+      text(r.t.dealId), text(r.dealTitle),
+      text(r.t.projectId), text(r.projectName),
+      text(r.t.taskId), text(r.taskTitle),
+      timestamp(r.t.createdAt), timestamp(r.t.updatedAt),
     ]),
   };
 }
@@ -739,7 +927,6 @@ async function documentsSheet(db: Database, archivePathByFileId: ReadonlyMap<str
     // than whatever the plan produced.
     .orderBy(documents.number, documents.createdAt, documents.id);
   return {
-    name: "documents.csv",
     header: [
       "id", "number", "type",
       "company_id", "company_name", "contact_id", "contact_name",
@@ -942,7 +1129,6 @@ async function collectFiles(db: Database, dataDir: string): Promise<ExportFile[]
  */
 function filesSheet(exportFiles: readonly ExportFile[]): Sheet {
   return {
-    name: "files.csv",
     header: [
       "id", "original_name", "archive_path", "mime", "size_bytes", "sha256",
       "uploader_user_id", "uploader_username",
@@ -960,6 +1146,52 @@ function filesSheet(exportFiles: readonly ExportFile[]): Sheet {
     ]),
   };
 }
+
+/** Everything a sheet builder may need that is not the transaction itself. */
+interface SheetContext {
+  tx: Database;
+  /** Every stored file, already collected once for files/ and for files.csv. */
+  files: readonly ExportFile[];
+  /** file id -> its member path, so documents.csv can point at the PDF. */
+  archivePathByFileId: ReadonlyMap<string, string>;
+}
+
+/**
+ * **ONE BUILDER PER MEMBER, KEYED BY THE MEMBER IT WRITES.**
+ *
+ * THE LIST OF MEMBERS IS NOT HERE. It is `EXPORT_MEMBERS` in @conduit/shared,
+ * because nine other places have to know it too -- the importer's "not
+ * imported, because" notes, the sentence Settings shows the operator, and the
+ * tests and journey that check the archive is what it says it is. What used to
+ * stand here was an array of thunks, and it was the first of those ten lists,
+ * which agreed only by somebody remembering to edit all ten. Phase 9's export
+ * was missed by three tasks running.
+ *
+ * WHAT A `Record<ExportMemberName, ...>` BUYS, and it is the reason for the
+ * `as const` on the list rather than a style preference: a member added to
+ * EXPORT_MEMBERS with no builder here does not compile, and a builder here for a
+ * member that is not in the list does not compile either. Neither failure needs a
+ * test, a reviewer or a memory -- and "you cannot forget it" is a different kind
+ * of guarantee from "something fails if you do".
+ *
+ * The archive's member ORDER is EXPORT_MEMBERS' order, not this object's; see
+ * the loop in buildExport.
+ */
+const SHEET_BUILDERS: Record<ExportMemberName, (context: SheetContext) => Promise<Sheet>> = {
+  "companies.csv": ({ tx }) => companiesSheet(tx),
+  "contacts.csv": ({ tx }) => contactsSheet(tx),
+  "deals.csv": ({ tx }) => dealsSheet(tx),
+  "projects.csv": ({ tx }) => projectsSheet(tx),
+  "tasks.csv": ({ tx }) => tasksSheet(tx),
+  "notes.csv": ({ tx }) => notesSheet(tx),
+  "meetings.csv": ({ tx }) => meetingsSheet(tx),
+  "time_entries.csv": ({ tx }) => timeEntriesSheet(tx),
+  "timers.csv": ({ tx }) => timersSheet(tx),
+  "documents.csv": ({ tx, archivePathByFileId }) => documentsSheet(tx, archivePathByFileId),
+  // The only one that queries nothing: collectFiles has already run, because
+  // files/ and documents.csv both need its result.
+  "files.csv": ({ files }) => Promise.resolve(filesSheet(files)),
+};
 
 /**
  * The migration journal position, read from the same folder runMigrations
@@ -980,7 +1212,7 @@ async function schemaVersion(): Promise<string> {
  *
  * REPEATABLE READ, because an export is supposed to be a picture of the database
  * at a moment. Postgres defaults to READ COMMITTED, where each statement takes a
- * fresh snapshot -- so with nine sheets and a file listing read one after
+ * fresh snapshot -- so with ten sheets and a file listing read one after
  * another, a deal created between the companies query and the deals query lands
  * in deals.csv naming a company_id that appears nowhere in companies.csv. That
  * is a torn picture, and it misrepresents the data in the same way dropping the
@@ -1040,19 +1272,24 @@ export interface ExportArchive {
  * member and a digest is only known once the whole member exists. So each CSV
  * is materialised -- but ONE AT A TIME, and its rows are released before the
  * next query runs. That makes the peak the largest single sheet rather than the
- * sum of nine, which on a large install is the difference that matters: 200,000
- * notes rows of 400 characters hold 409MB for 103MB of CSV, a ~4x steady-state
- * multiplier, and nine of those summed is the whole box.
+ * sum of them all, which on a large install is the difference that matters:
+ * 200,000 notes rows of 400 characters hold 409MB for 103MB of CSV, a ~4x
+ * steady-state multiplier, and ten of those summed is the whole box.
+ *
+ * WRITTEN WITHOUT A COUNT IN IT SINCE PHASE 10, deliberately: the sentence said
+ * "nine" in four places and a tenth sheet made every one of them a small lie
+ * that nothing could catch. The property is "the peak is the largest sheet, not
+ * the sum", and it is true at any number.
  *
  * export.test.ts asserts a ceiling on each half separately, and each was proved
  * to fail against the shape it forbids. The blob bound sat over the wrong
  * moment in its first version and passed against a buffering implementation;
- * the row bound did not exist at all, which is how the sum-of-nine shape got as
- * far as review.
+ * the row bound did not exist at all, which is how the sum-of-every-sheet shape
+ * got as far as review.
  *
  * WHAT IS NOT BOUNDED is the time to the FIRST byte. The pre-flight -- the read
- * transaction, one stat per stored file, nine CSV builds and nine SHA-256
- * passes, plus the journal read -- all happens before the response begins, and
+ * transaction, one stat per stored file, one CSV build and one SHA-256 pass per
+ * sheet, plus the journal read -- all happens before the response begins, and
  * it grows with row and file count. The 15-20ms first-byte figure measured for
  * the format decision is yazl's, not this route's. The comparison it informed
  * stays fair because a 7z build pays the same pre-flight and then the whole
@@ -1142,12 +1379,12 @@ export async function buildExport(options: BuildExportOptions): Promise<ExportAr
   // as long as the operator's connection lasts.
   //
   // ONE SHEET IS MATERIALISED AT A TIME, and that is a memory bound rather than
-  // a tidiness preference. The first version built all nine Sheet objects, then
-  // all nine CSV buffers, then handed all nine to yazl -- three live copies of
+  // a tidiness preference. The first version built every Sheet object, then
+  // every CSV buffer, then handed them all to yazl -- three live copies of
   // every row at once. Measured on 200,000 notes rows of 400 characters: one
   // sheet's mapped rows and its finished 103.0 MB CSV together held 409.2 MB
   // after a forced GC, a ~4x steady-state multiplier over the CSV text. Summed
-  // across nine sheets that is the ceiling on a 3.8 GB no-swap box, reached by
+  // summed across every sheet that is the ceiling on a 3.8 GB no-swap box, reached by
   // the half the blob-streaming bound never touched. Building and handing off
   // one sheet at a time makes the peak the LARGEST sheet rather than the sum,
   // and lets each sheet's rows go before the next query runs -- yazl deflates a
@@ -1159,28 +1396,18 @@ export async function buildExport(options: BuildExportOptions): Promise<ExportAr
       if (f.archivePath !== "") archivePathByFileId.set(f.id, f.archivePath);
     }
 
-    // Thunks, not sheets: nothing is queried until its turn, and nothing
-    // survives past it.
-    const build: (() => Promise<Sheet>)[] = [
-      () => companiesSheet(tx),
-      () => contactsSheet(tx),
-      () => dealsSheet(tx),
-      () => projectsSheet(tx),
-      () => tasksSheet(tx),
-      () => notesSheet(tx),
-      () => meetingsSheet(tx),
-      () => documentsSheet(tx, archivePathByFileId),
-      () => Promise.resolve(filesSheet(collected)),
-    ];
-    for (const buildSheet of build) {
-      const sheet = await buildSheet();
+    // THE MEMBERS AND THEIR ORDER COME FROM THE SHARED LIST; only the building
+    // is here. Nothing is queried until its turn, and nothing survives past it.
+    const context: SheetContext = { tx, files: collected, archivePathByFileId };
+    for (const { member } of EXPORT_MEMBERS) {
+      const sheet = await SHEET_BUILDERS[member](context);
       const bytes = csvDocument(sheet.header, sheet.rows);
       members.push({
-        path: sheet.name,
+        path: member,
         bytes: bytes.byteLength,
         sha256: createHash("sha256").update(bytes).digest("hex"),
       });
-      zip.addBuffer(bytes, sheet.name);
+      zip.addBuffer(bytes, member);
     }
     return collected;
   });
