@@ -169,6 +169,13 @@
       "when": 1789300000003,
       "tag": "0023_timers",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1789300000004,
+      "tag": "0024_meeting_duration",
+      "breakpoints": true
     }
   ]
 }

@@ -266,7 +266,8 @@ export const tasks = pgTable("tasks", {
   // ARGUED RATHER THAN ROUND.** Belt-and-braces with @conduit/shared's
   // MAX_TASK_ESTIMATE_MINUTES, which schema.test.ts pins against this literal
   // so the two cannot drift -- projects.color's and tasks_progress_range's
-  // arrangement, NOT meetings.duration_minutes' zod-only one.
+  // arrangement, which meetings.duration_minutes joined in v1.9.1 (it was this
+  // file's one zod-only bound when this was written).
   //
   //   `> 0`: NULL already says "nobody has estimated this". A zero would be a
   //   SECOND spelling of it, and the one that reads as a claim rather than an
@@ -286,14 +287,15 @@ export const tasks = pgTable("tasks", {
   //   Conduit does not know the operator's working day, and the one time this
   //   schema would have had to guess at it (time_entries.billable) it refused.
   //
-  // **WHY THERE IS A BOUND HERE WHEN meetings.duration_minutes HAS NONE.** That
-  // column's exposure is real and recorded (see it, and the Phase 10 plan):
-  // z.number().int().positive() accepts 999999999, which now dominates a week's
-  // total. It cannot be tightened, because a `.max()` would make the CLIENT
-  // refuse to parse rows that already exist. THIS COLUMN IS BEING CREATED WITH
-  // NO ROWS IN IT, which is the one moment a bound costs nothing -- and the
-  // only one. It is taken now precisely because Task 2 watched what the
-  // alternative costs later.
+  // **"A BOUND IS FREE EXACTLY ONCE" WAS THE ARGUMENT FOR TAKING IT HERE, AND
+  // v1.9.1 SHOWED THE SECOND HALF OF IT WAS WRONG.** This column was bounded on
+  // the day it was created empty, which is right. What was also written down --
+  // that meetings.duration_minutes "cannot be tightened" because a `.max()`
+  // would stop the client parsing existing rows -- turned out to be an argument
+  // about the READ schema mistaken for an argument about the bound. The bound
+  // went on the input shape and on a CHECK; only the read schema stayed open.
+  // And the premise underneath it was never measured: that column was empty too.
+  // Both halves are recorded on meetings_duration_range.
   //
   // REJECTED, so it is not revisited: bounding the estimate by the task's own
   // start_date..due_date span. It is the tempting cross-column CHECK and it is
@@ -810,21 +812,8 @@ export const meetings = pgTable("meetings", {
   //   own named failure. That count is in the operator's sentence
   //   (`timesheetSummary`), not merely in the payload.
   //
-  //   **THERE IS STILL NO CHECK ON THE VALUE, AND THE REASON HAS CHANGED.** The
-  //   old reason was "nothing sums it", which this release made false;
-  //   time_entries.minutes cites that contrast and has been corrected too. The
-  //   reason now is that a meeting has no definitional bound to CHECK against.
-  //   `time_entries.minutes <= 1440` follows from `work_date` being one day; a
-  //   meeting's `occurred_at` is a START, and an offsite logged as one meeting
-  //   can legitimately run longer than a day. A 1440 here would refuse a true
-  //   row to catch a mistyped one, and it would not catch the mistype that
-  //   actually happens (60 typed as 600 passes any bound this column could
-  //   carry). WHAT IS GENUINELY EXPOSED is that the zod shape has no upper bound
-  //   either -- `z.number().int().positive()` accepts 999999999, which is now a
-  //   number that can dominate a week's total. Adding a max to `meetingSchema`
-  //   would make the CLIENT refuse to parse any meeting already carrying such a
-  //   value, turning a silly figure into a broken page, so it is written down
-  //   here and in the plan rather than changed in passing.
+  //   **THERE IS A CHECK ON THE VALUE SINCE v1.9.1, AND WHAT CHANGED WAS A
+  //   MEASUREMENT, NOT AN OPINION.** See `meetings_duration_range` below.
   durationMinutes: integer("duration_minutes"),
   // Rich-text HTML, sanitized on write by services/meetings.ts (Task 2)
   // through the system's ONE shared sanitizer profile -- sanitizeMailHtml in
@@ -863,6 +852,52 @@ export const meetings = pgTable("meetings", {
   // exactly-one are then visibly the same rule at two different counts,
   // rather than one written as arithmetic and the other as a chain of ORs.
   check("meetings_has_link", sql`num_nonnulls(company_id, contact_id, deal_id, project_id) >= 1`),
+  // **A MEETING IS AT LEAST A MINUTE AND AT MOST A WEEK (v1.9.1).**
+  // Belt-and-braces with @conduit/shared's MAX_MEETING_DURATION_MINUTES, which
+  // schema.test.ts pins against this literal so the two cannot drift. That
+  // constant carries the argument for the NUMBER; what belongs here is why this
+  // constraint exists at all when the comment on the column above spent v1.9.0
+  // arguing it could not.
+  //
+  // **THE OLD ARGUMENT HAD TWO HALVES AND ONLY ONE OF THEM WAS ABOUT THE
+  // DATABASE.** "A `.max()` would make the client refuse to parse rows that
+  // already exist" is true and is answered by putting the bound on the INPUT
+  // shape and not the read shape (@conduit/shared's meetingInputShape). "A
+  // meeting has no definitional bound available to it" was the other half, and
+  // it was arguing against 1440 -- which is still refused here, for the reason
+  // it gave: `occurred_at` is a start, and an offsite logged as one meeting
+  // legitimately runs longer than a day. One week clears that objection with six
+  // days to spare and still excludes the harm; a year does not exclude the harm
+  // at all.
+  //
+  // **AND THE THING THAT ACTUALLY DECIDED IT WAS THE LIVE DATA.** A CHECK cannot
+  // be added to a column that already violates it -- the migration would fail at
+  // boot (db/client.ts runs migrate() there) on the one install that exists. So
+  // that install was measured rather than guessed at, on 7 Sep 2026, read-only
+  // from the catalogue that needs no privilege on the table itself:
+  //
+  //     pg_stat_all_tables  n_tup_ins = 0, n_tup_upd = 0, n_tup_del = 0
+  //     pg_class            relpages = 0, and pg_relation_size = 0 BYTES
+  //     pg_stat_database    stats_reset IS NULL, postmaster up since install
+  //
+  // Zero heap pages is the conclusive one: a table that ever held a row has at
+  // least one 8KB page, and nothing releases pages but VACUUM FULL or TRUNCATE,
+  // neither of which has run (no autovacuum, no deletes). `meetings` has never
+  // held a row. The bound is therefore free EXACTLY AS IT WAS FOR
+  // tasks.estimate_minutes -- the column is empty -- and this is the last moment
+  // it will be.
+  //
+  // REJECTED, so it is not revisited: adding it NOT VALID, which is the standard
+  // way to bound a column whose legacy rows might not comply. Two reasons, and
+  // the second is the one that settles it. The measurement above leaves nothing
+  // for it to insure against. And drizzle's `check()` cannot express NOT VALID,
+  // so this file would describe a constraint the database does not have from the
+  // day it landed -- which is precisely the drift db/schema-drift.test.ts was
+  // written in the same release to catch.
+  check(
+    "meetings_duration_range",
+    sql`duration_minutes IS NULL OR (duration_minutes > 0 AND duration_minutes <= 10080)`,
+  ),
 ]);
 export type MeetingRow = typeof meetings.$inferSelect;
 
@@ -1827,19 +1862,17 @@ export const timeEntries = pgTable("time_entries", {
     "time_entries_has_link",
     sql`num_nonnulls(company_id, contact_id, deal_id, project_id, task_id) >= 1`,
   ),
-  // BELT AND BRACES, unlike meetings.duration_minutes, which carries no bound in
-  // the database at all.
+  // BELT AND BRACES -- and since v1.9.1 meetings.duration_minutes is too, so
+  // this is no longer the contrast it was written as.
   //
-  // **THE CONTRAST IS NO LONGER "NOTHING SUMS A MEETING'S DURATION".** That was
-  // the reason when this was written and v1.9.0's timesheet made it false: both
-  // columns are now summed, by services/timesheet.ts, into one number. What
-  // still differs is that THIS column has a definitional bound and that one has
-  // not. An entry is a quantity of work attributed to a calendar date and no
-  // date holds more than 24 hours, so 1440 follows from what the row IS. A
-  // meeting's `occurred_at` is a start instant, and an offsite logged as one
-  // meeting can honestly run longer than a day -- so the same number there would
-  // refuse a true row, and would still not catch the mistype that happens (60
-  // typed as 600 passes any bound). See that column for the exposure this leaves.
+  // **WHAT STILL DIFFERS IS THE NUMBER AND WHERE IT COMES FROM.** 1440 here is
+  // definitional: an entry is a quantity of work attributed to a calendar date
+  // and no date holds more than 24 hours, so the bound follows from what the row
+  // IS. A meeting's `occurred_at` is a start instant, not a day, so that
+  // sentence is unavailable there and 10080 is argued from the unit the value is
+  // REPORTED in instead (see MAX_MEETING_DURATION_MINUTES). Neither bound
+  // catches the mistype that actually happens -- 60 typed as 600 passes both --
+  // and neither is aimed at it.
   //
   // The upper bound is one DAY because work_date is one day, and it is
   // MAX_TIME_ENTRY_MINUTES in @conduit/shared spelled a second time;
